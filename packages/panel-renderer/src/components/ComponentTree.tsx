@@ -192,6 +192,7 @@ import {
   formatCount,
   formatDurationCompact,
   formatRenderTriggerLabel,
+  formatUntrustedText,
   truncate,
 } from '../utils/format';
 import { SourceLink } from './SourceLink';
@@ -2395,9 +2396,14 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
           </span>
         </Toolbar>
 
+        {/* The node's title is authored text, and this raw element names the
+            widget with it, so its direction controls are revealed here, as a
+            primitive would reveal them (`formatUntrustedText`). */}
         <div
           role={hierarchical ? 'tree' : 'list'}
-          aria-label={node.title ?? (hierarchical ? CATALOG_ENTRY.label : LIST_LABEL)}
+          aria-label={formatUntrustedText(
+            node.title ?? (hierarchical ? CATALOG_ENTRY.label : LIST_LABEL),
+          )}
           aria-describedby={noteId}
         >
           {projection.trees.map(renderRowTree)}

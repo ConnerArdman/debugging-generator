@@ -24,16 +24,17 @@
  * `@/components/ui/BlankSlate` owns the inside of the block - the illustration, the heading, the
  * sentence and the action row, with their own stacking and spacing - and `CatalogEmptyNotice`
  * supplies the wording, picks the illustration by token and places the block in the catalog's own
- * field (`CatalogEmptyNotice.module.css`, whose three classes `root`, `body` and `term` are a
- * closed contract with this file). Nothing here restyles BlankSlate or reaches inside it.
+ * field (`CatalogEmptyNotice.module.css`, whose four classes `root`, `body`, `term` and `control`
+ * are a closed contract with this file). Nothing here restyles BlankSlate or reaches inside it.
  *
  * Two consequences of that contract are easy to get wrong and are therefore spelled out:
  *
  *   1. BlankSlate wraps whatever it is given as children in a paragraph of its own. The sentence
  *      below is consequently phrasing content - a `<span>` carrying this module's `body` class,
- *      with the echoed search term in a nested `<span>` - because a paragraph nested inside a
- *      paragraph is not valid HTML: the parser would close the outer one, and the resulting markup
- *      would no longer match what React rendered on the server.
+ *      with the echoed search term in a nested `<bdi>` and any direction control inside the term
+ *      in a `<span>` of its own - because a paragraph nested inside a paragraph is not valid HTML:
+ *      the parser would close the outer one, and the resulting markup would no longer match what
+ *      React rendered on the server.
  *   2. BlankSlate's `framed` variant draws a border, a radius and a recessed surface. The field
  *      declared in this module already draws exactly those, so `framed` is deliberately left at
  *      its default and the box is drawn once.
@@ -86,6 +87,10 @@ export interface CatalogEmptyNoticeProps {
   reason: 'no-matches' | 'empty-catalog' | 'page-past-end';
   /**
    * The search term in effect, echoed back so the reader can see exactly what was looked for.
+   * The echo is isolated from the sentence around it and set left to right, and every Unicode
+   * direction control the term carries is shown as a visible marker - its escape, such as
+   * `\u202E`, with the character's name as a tooltip - rather than applied, so the characters
+   * appear in the order they were typed and cannot reorder the rest of the term or the sentence.
    * Omitted, or whitespace only, means no term was searched and none is mentioned. It is not
    * mentioned for `page-past-end` either, whatever is passed: the term did match products there,
    * so echoing it under a sentence about the page would read as a statement that it had not.
@@ -177,6 +182,100 @@ const NO_MATCH_ADVICE: Record<'term' | 'category' | 'both', string> = {
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /**
+ * The twelve code points Unicode gives the Bidi_Control property, as a pattern for
+ * `String.prototype.split`: the Arabic letter mark (U+061C), the left-to-right and right-to-left
+ * marks (U+200E, U+200F), the embeddings, their pop and the overrides (U+202A-U+202E), and the
+ * isolates and their pop (U+2066-U+2069). They are written as escapes because every one of them
+ * is invisible, and a literal in the source would reorder the source itself in an editor.
+ *
+ * The group is capturing on purpose: `split` then returns each control as a piece of its own, so
+ * the text between controls lands on the even indexes of the result and the controls on the odd
+ * ones. The pattern carries no `g` flag because `split` finds every match without one, and a
+ * pattern without it keeps no `lastIndex` state between calls.
+ */
+const DIRECTION_CONTROL_SPLIT = /([\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069])/;
+
+/**
+ * The Unicode character name of each code point `DIRECTION_CONTROL_SPLIT` matches, in sentence
+ * case, for the tooltip of the marker that stands in for it. Keyed by code point, so the tooltip
+ * and the escape the marker prints are derived from the same number.
+ */
+const DIRECTION_CONTROL_NAMES: ReadonlyMap<number, string> = new Map([
+  [0x061c, 'Arabic letter mark'],
+  [0x200e, 'Left-to-right mark'],
+  [0x200f, 'Right-to-left mark'],
+  [0x202a, 'Left-to-right embedding'],
+  [0x202b, 'Right-to-left embedding'],
+  [0x202c, 'Pop directional formatting'],
+  [0x202d, 'Left-to-right override'],
+  [0x202e, 'Right-to-left override'],
+  [0x2066, 'Left-to-right isolate'],
+  [0x2067, 'Right-to-left isolate'],
+  [0x2068, 'First strong isolate'],
+  [0x2069, 'Pop directional isolate'],
+]);
+
+/**
+ * The search term as the sentence echoes it: isolated from the prose around it, set left to right,
+ * and with every Unicode direction control shown rather than obeyed.
+ *
+ * The term arrives from the address bar, so it can carry characters that are invisible yet reorder
+ * the text that follows them: behind a right-to-left override (U+202E), `<script>alert(1)` reads
+ * as its own mirror image. Printing the term as it stands would show the reader a string other than
+ * the one searched for. Each control is therefore replaced by a visible marker - its escape spelled
+ * out in ASCII (`\u202E`), carrying the character's name and code point as a tooltip - and the
+ * `<bdi dir="ltr">` around the whole keeps any direction the remaining characters have of their own
+ * from leaking into the quotation marks and the sentence on either side. The text between markers
+ * is printed unchanged, as a string React escapes like any other.
+ *
+ * Splitting with the capturing pattern above puts a control at every odd index and the text
+ * between controls at every even one. Empty text pieces - before a leading control, after a
+ * trailing one, or between two adjacent controls - are skipped, and a control always sits between
+ * any two text pieces that remain. The element therefore never holds two text nodes in a row, which
+ * keeps the guarantee the sentence around it makes: the server-rendered HTML carries no separator
+ * comment between neighbouring text nodes. A term without controls renders as one text node.
+ *
+ * A code point missing from `DIRECTION_CONTROL_NAMES` cannot occur while the table and the pattern
+ * list the same twelve; should they ever drift apart, the marker's tooltip gives the code point
+ * alone rather than a wrong name.
+ *
+ * @example
+ * ```tsx
+ * <EchoedSearchTerm text={'\u202eabc\u202c'} />
+ * // renders, inside a <bdi dir="ltr">: a `\u202E` marker titled
+ * // "Right-to-left override (U+202E)", the text "abc", and a `\u202C` marker titled
+ * // "Pop directional formatting (U+202C)"
+ * ```
+ */
+function EchoedSearchTerm({ text }: { text: string }) {
+  const pieces = text.split(DIRECTION_CONTROL_SPLIT);
+
+  return (
+    <bdi dir="ltr" className={styles.term}>
+      {pieces.map((piece, index) => {
+        if (index % 2 === 0) {
+          return piece.length > 0 ? piece : null;
+        }
+        // Every odd piece is exactly one of the BMP code points the pattern lists, so its single
+        // UTF-16 unit is the code point itself.
+        const code = piece.charCodeAt(0);
+        const hex = code.toString(16).toUpperCase().padStart(4, '0');
+        const name = DIRECTION_CONTROL_NAMES.get(code);
+        return (
+          <span
+            key={index}
+            className={styles.control}
+            title={name === undefined ? `U+${hex}` : `${name} (U+${hex})`}
+          >
+            {`\\u${hex}`}
+          </span>
+        );
+      })}
+    </bdi>
+  );
+}
+
+/**
  * The catalog's empty and no-match block.
  *
  * @example
@@ -255,7 +354,7 @@ export function CatalogEmptyNotice({
     sentence = (
       <>
         {'No products are listed for \u201c'}
-        <span className={styles.term}>{term}</span>
+        <EchoedSearchTerm text={term} />
         {`${tail}${advice}`}
       </>
     );

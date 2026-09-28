@@ -121,6 +121,19 @@
  * stands in for it in the accessibility tree; the chip's tooltip is the whole
  * path too.
  *
+ * ## Direction controls are shown, never obeyed
+ *
+ * A file, a backup path, a service message and a diff are untrusted text, and
+ * an invisible Unicode direction control in one of them (U+202E and its eleven
+ * siblings) would draw the characters after it in an order that was never
+ * recorded. Every one is shown as its visible escape (`\u202E`) by the design
+ * system's `formatUntrustedText`: the primitives apply it to their own text,
+ * tooltips and accessible names, and the path chip's parts — elements of this
+ * component, which `Code` leaves to their author — are revealed where they
+ * render. Only what is displayed or announced changes: the `onOpenFile`
+ * payload, the copied backup path, the split lookup and every key keep the
+ * record's raw strings.
+ *
  * ## Status vocabulary (AAP 0.5.1)
  *
  * The five journal statuses — `pending`, `applied`, `reverted`, `conflict`,
@@ -184,6 +197,7 @@ import {
   MODIFICATION_STATUS_TONE,
   Stack,
   Text,
+  formatUntrustedText,
 } from '@debuggen/panel-renderer';
 import type { BadgeTone } from '@debuggen/panel-renderer';
 import type { ModificationConflict, ModificationRecord } from '@debuggen/protocol';
@@ -1032,7 +1046,8 @@ interface ModificationItemProps {
  * own flow.
  *
  * The path renders through `Code`, which is byte-faithful: its text is the
- * record's `file` exactly, in the spans of the `.dgv-path` contract, so a
+ * record's `file` exactly — each direction control shown as its visible
+ * escape — in the spans of the `.dgv-path` contract, so a
  * narrow view shortens the lead, then the tail's directories, and the file
  * name last — visually, by the stylesheet's ellipsis, never by slicing the
  * string. Because the tail is the shortest suffix no other file of the list
@@ -1068,12 +1083,14 @@ function ModificationItem(props: ModificationItemProps): ReactElement {
       >
         <Text className="dg-visually-hidden">{record.file}</Text>
         <Code size="sm" className="dgv-path" title={record.file} aria-hidden="true">
-          {display.lead === '' ? null : <span className="dgv-path__lead">{display.lead}</span>}
+          {display.lead === '' ? null : (
+            <span className="dgv-path__lead">{formatUntrustedText(display.lead)}</span>
+          )}
           <span className="dgv-path__tail">
             {display.context === '' ? null : (
-              <span className="dgv-path__context">{display.context}</span>
+              <span className="dgv-path__context">{formatUntrustedText(display.context)}</span>
             )}
-            <span className="dgv-path__name">{display.name}</span>
+            <span className="dgv-path__name">{formatUntrustedText(display.name)}</span>
           </span>
         </Code>
         <Badge tone={tone} variant="soft" className="dgv-modifications__status">

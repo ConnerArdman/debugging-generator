@@ -356,6 +356,7 @@ import {
   formatShare,
   formatStatusLabel,
   formatTierLabel,
+  formatUntrustedText,
   oneLinePreview,
   pluralize,
 } from '../utils/format';
@@ -2606,6 +2607,13 @@ function barDescription(row: WaterfallRow, windowMs: number): string {
  * is — "took n/a" — never as the zero its bar is drawn at, and without the
  * lower-bound words, which qualify a figure there is none of.
  *
+ * The sentence carries captured text beyond the label — the other lineage
+ * candidates and the unresolved parent's span id — and its short form is the
+ * treeitem's own `aria-label`, which no primitive reveals. So every Unicode
+ * direction control in it is returned as its visible escape
+ * (`formatUntrustedText`): the name a screen reader hears and the bubble a
+ * pointer opens read in logical order, while the row itself stays raw.
+ *
  * @param row The row described.
  * @param labelText The label as this form of the sentence carries it.
  * @returns The sentence, its parts joined with ` · `.
@@ -2652,7 +2660,7 @@ function rowDescription(row: WaterfallRow, labelText: string): string {
   if (row.childrenTruncated) {
     parts.push('nested calls below this row were not drawn');
   }
-  return parts.join(' · ');
+  return formatUntrustedText(parts.join(' · '));
 }
 
 /** The selector for the controls nested inside a row, which own their own clicks. */

@@ -90,7 +90,15 @@
  * when the store refuses the revocation. A revocation that fails is retried
  * with backoff until it succeeds or the lease lapses, and until then `stop`
  * reports the cleanup as incomplete (`CLEANUP_PARTIAL`) instead of claiming a
- * clean stop. The token is a
+ * clean stop.
+ *
+ * A rotation (`POST /credentials/rotate`) or a revocation retires a running
+ * child's credential under it, and its preload never connects again. So a
+ * child is reused only while its credential still authenticates — its lease
+ * not found gone by a renewal or {@link DevServerLauncher.credentialsRotated},
+ * and {@link ServerAgentCredentialIssuer.isLive} not answering `false` — and a
+ * launch otherwise stops it and starts a replacement with a new credential
+ * (AAP §0.5.6: launched dev servers must be relaunched). The token is a
  * capability: it lives in the child's environment and nowhere else in this
  * module's output — never in a log line, an error message, hint or details, a
  * {@link LaunchedDevServer} record, a detection, or any response other than the
@@ -3393,6 +3401,12 @@ export interface ServerAgentCredentialReleaseInput {
 }
 
 /**
+ * What {@link ServerAgentCredentialIssuer.isLive} is asked about: one launched
+ * child's own credential, the same fields a revocation names.
+ */
+export type ServerAgentCredentialLivenessInput = ServerAgentCredentialRevokeInput;
+
+/**
  * The access boundary's credential operations, as the launcher needs them —
  * satisfied by `../server/auth.ts` through {@link serverAgentCredentialIssuer}.
  *
@@ -3427,6 +3441,17 @@ export interface ServerAgentCredentialReleaseInput {
  *   `{ released: false }`. It must be reached synchronously and act
  *   synchronously, like the access boundary's, so a caller's revocation fence
  *   still holds when it runs.
+ * - `isLive` answers, without changing anything, whether a launched child's
+ *   credential still authenticates: `ok(true)` while its row exists, is a
+ *   project-scoped server-agent credential and has not expired; `ok(false)`
+ *   once it was rotated away, revoked or has lapsed — which the launcher takes
+ *   as final: before it hands that child back to a later launch it stops it
+ *   and launches a replacement with a new credential (AAP §0.5.6); an `Err`
+ *   (or a throw) when the store cannot tell, which the launcher treats as
+ *   unknown and so reuses the child as before. Optional: an issuer without it
+ *   has its children replaced only once a renewal finds the credential gone
+ *   ({@link renew}'s `ok(false)`) or {@link DevServerLauncher.credentialsRotated}
+ *   is called.
  */
 export interface ServerAgentCredentialIssuer {
   issue(
@@ -3435,6 +3460,7 @@ export interface ServerAgentCredentialIssuer {
   renew(input: ServerAgentCredentialRenewInput): MaybePromise<Result<boolean, DebuggenError>>;
   revoke(input: ServerAgentCredentialRevokeInput): MaybePromise<unknown>;
   release?(input: ServerAgentCredentialReleaseInput): MaybePromise<Result<boolean, DebuggenError>>;
+  isLive?(input: ServerAgentCredentialLivenessInput): MaybePromise<Result<boolean, DebuggenError>>;
 }
 
 /**
@@ -3458,6 +3484,11 @@ export interface ServerAgentCredentialAuthority {
    * `false` when there was none to release.
    */
   releaseServerAgentCredential(token: string): Result<boolean, DebuggenError>;
+  /**
+   * Whether one credential still authenticates as a project-scoped server
+   * agent; read-only, `false` once it was rotated away, revoked or expired.
+   */
+  serverAgentCredentialIsLive(token: string): Result<boolean, DebuggenError>;
 }
 
 /**
@@ -3493,6 +3524,8 @@ export function serverAgentCredentialIssuer(
       authority.revokeServerAgentCredential(input.token),
     release: (input: ServerAgentCredentialReleaseInput) =>
       authority.releaseServerAgentCredential(input.token),
+    isLive: (input: ServerAgentCredentialLivenessInput) =>
+      authority.serverAgentCredentialIsLive(input.token),
   });
 }
 
@@ -4133,6 +4166,27 @@ export interface DevServerLauncher {
    * more first; when it survives again the launch is refused with the same
    * `survived-termination` error {@link DevServerLauncher.stop} answers, so no
    * second server is started beside it and its record is never replaced.
+   *
+   * A serving child is reused only while its own `server-agent` credential
+   * still authenticates. One whose credential was rotated away or revoked —
+   * found invalidated by a renewal or {@link credentialsRotated}, or answered
+   * `ok(false)` by {@link ServerAgentCredentialIssuer.isLive} — can never
+   * connect its preload again, so it is **replaced** (AAP §0.5.6: launched dev
+   * servers must be relaunched): stopped through the same termination a stop
+   * runs, which revokes what is left of its credential, then launched afresh
+   * with a new credential, answering `alreadyRunning: false` and the new
+   * `pid`. The replacement passes every check a fresh launch passes and keeps
+   * the old child's ownership: a developer-owned child is replaced by a
+   * developer-owned one, and a session-owned child by one owned by its
+   * sessions that have not ended plus the requesting session — or, when none
+   * is left, by the developer-owned child a launch naming no session starts.
+   * Holds taken on the old child are not carried over: like a stop, a hold
+   * whose child stopped serving commits nothing. Concurrent launches of the
+   * project join one replacement. When the old child survives its
+   * termination, the launch is refused with the `survived-termination` error.
+   * An unknown answer (`isLive` failed, or the issuer has no `isLive`) reuses
+   * the child as before.
+   *
    * A request carrying {@link DevServerLaunchInput.confirmProjectRoot} has
    * its project root re-proved before detection and again immediately before
    * the spawn; detection reads, the command policy judges and the child is
@@ -4268,6 +4322,22 @@ export interface DevServerLauncher {
    * place at any address.
    */
   addressOfCredential(tokenHash: string): string | undefined;
+  /**
+   * Every service credential was just rotated away (`AuthService.rotateAll`,
+   * behind `POST /credentials/rotate`): the credential of every child this
+   * launcher started no longer authenticates, so each lease is marked lapsed
+   * at once — renewal stops, the preload is attributed nowhere, and the
+   * project's next {@link launch} replaces the child instead of reusing it —
+   * without waiting for a renewal or a liveness check to find the credential
+   * gone. Credentials of dev servers the developer started
+   * ({@link issueCredential}) are left to their own supervision, which finds
+   * them gone at its next check.
+   *
+   * Synchronous and idempotent; never throws. Optional so a launcher double
+   * need not implement it: without it, the next launch's liveness check
+   * ({@link ServerAgentCredentialIssuer.isLive}) finds the same thing.
+   */
+  credentialsRotated?(): void;
   /**
    * Stop every launched child, a survivor of an earlier stop included.
    * Idempotent; never throws.
@@ -5950,7 +6020,7 @@ interface ScheduledTimer {
  * attempt is not memoised, so the next attempt — a retry, a later stop, the
  * shutdown sweep — can still reach the store. Only one attempt runs at a time.
  * The token never leaves this object except as the argument of the issuer's
- * own `renew` and `revoke`.
+ * own `renew`, `revoke` and `isLive`.
  */
 class CredentialLease {
   readonly projectRoot: string;
@@ -6014,6 +6084,19 @@ class CredentialLease {
       projectRoot: this.projectRoot,
       token,
       expiresAt,
+      ...(this.credentialId === undefined ? {} : { credentialId: this.credentialId }),
+    };
+  }
+
+  /** The liveness question about this credential, or `undefined` once it is gone. */
+  livenessInput(): ServerAgentCredentialLivenessInput | undefined {
+    const token = this.#token;
+    if (token === undefined || this.#invalidated) {
+      return undefined;
+    }
+    return {
+      projectRoot: this.projectRoot,
+      token,
       ...(this.credentialId === undefined ? {} : { credentialId: this.credentialId }),
     };
   }
@@ -6145,6 +6228,72 @@ const NO_SURVIVORS: DevServerTerminationReport = Object.freeze({ survivors: Obje
 /** A list with at least one member. */
 type NonEmptyList<T> = readonly [T, ...T[]];
 
+/**
+ * Who a newly spawned child belongs to: the sessions that own it — which
+ * make it session-owned, stopped when the last of them ends — or none, for
+ * the developer's own dev server, which no session end stops.
+ */
+interface ChildOwnership {
+  /** The session its record names as the one that launched it; set only when session-owned. */
+  readonly launchSessionId: string | undefined;
+  /** Its owning sessions; empty for a developer-owned child. */
+  readonly sessionIds: readonly string[];
+}
+
+/** The {@link ChildOwnership} of a developer-owned child. */
+const DEVELOPER_OWNED: ChildOwnership = Object.freeze({
+  launchSessionId: undefined,
+  sessionIds: Object.freeze([]),
+});
+
+/**
+ * The ownership of a child a launch spawns now.
+ *
+ * - A fresh launch: owned by the requesting session, or the developer's own
+ *   when the launch names none.
+ * - The replacement of a child whose credential no longer authenticates:
+ *   developer-owned when the old child was; otherwise owned by the old
+ *   child's sessions that have not ended, plus the requesting session, so
+ *   {@link DevServerLauncher.stopForSession} still stops it when the last of
+ *   them ends. The old record's launching session stays named while it is
+ *   one of them. When none is left — every owner ended while the old child
+ *   was kept only by pending holds, or while it was being replaced — nothing
+ *   could ever stop a session-owned replacement, so it is the developer-owned
+ *   child a launch naming no session starts.
+ *
+ * Read at the spawn, so a session that ended while the old child was being
+ * stopped is never counted among the new child's owners.
+ *
+ * @param sessionId The requesting session, when the launch names one.
+ * @param predecessor The child being replaced, when this launch replaces one.
+ * @param endedSessions The sessions known to have ended.
+ */
+function childOwnership(
+  sessionId: string | undefined,
+  predecessor: ChildState | undefined,
+  endedSessions: ReadonlySet<string>,
+): ChildOwnership {
+  if (predecessor === undefined) {
+    return sessionId === undefined
+      ? DEVELOPER_OWNED
+      : Object.freeze({ launchSessionId: sessionId, sessionIds: Object.freeze([sessionId]) });
+  }
+  if (!predecessor.sessionOwned) {
+    return DEVELOPER_OWNED;
+  }
+  const owners = [...predecessor.sessionIds].filter((id) => !endedSessions.has(id));
+  if (sessionId !== undefined && !owners.includes(sessionId)) {
+    owners.push(sessionId);
+  }
+  if (owners.length === 0) {
+    return DEVELOPER_OWNED;
+  }
+  const inherited = predecessor.launchSessionId;
+  const launchSessionId =
+    inherited !== undefined && owners.includes(inherited) ? inherited : (sessionId ?? owners[0]);
+  return Object.freeze({ launchSessionId, sessionIds: Object.freeze(owners) });
+}
+
 /** Everything the launcher tracks about one child. The credential is private to it. */
 class ChildState {
   readonly key: string;
@@ -6243,7 +6392,7 @@ class ChildState {
     readonly startedAt: number;
     readonly command: string;
     readonly script: string | undefined;
-    readonly sessionId: string | undefined;
+    readonly ownership: ChildOwnership;
     readonly lease: CredentialLease;
     readonly devServerUrl: string | undefined;
     readonly outputTail: OutputTail;
@@ -6255,10 +6404,10 @@ class ChildState {
     this.startedAt = init.startedAt;
     this.command = init.command;
     this.script = init.script;
-    this.launchSessionId = init.sessionId;
-    this.sessionOwned = init.sessionId !== undefined;
-    if (init.sessionId !== undefined) {
-      this.sessionIds.add(init.sessionId);
+    this.launchSessionId = init.ownership.launchSessionId;
+    this.sessionOwned = init.ownership.sessionIds.length > 0;
+    for (const id of init.ownership.sessionIds) {
+      this.sessionIds.add(id);
     }
     this.outputTail = init.outputTail;
     this.commandPolicy = init.commandPolicy;
@@ -6368,6 +6517,19 @@ function isOkResultOf(value: unknown, expected: boolean): boolean {
     value.ok === true &&
     'value' in value &&
     value.value === expected
+  );
+}
+
+/**
+ * Whether a port's return value is a promise (any thenable) rather than an
+ * answer given synchronously — a `Result` is a plain object without `then`.
+ */
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'then' in value &&
+    typeof value.then === 'function'
   );
 }
 
@@ -6579,6 +6741,26 @@ interface LaunchTicket {
   readonly globalGeneration: number;
   readonly keyGeneration: number;
 }
+
+/**
+ * What a launch that has already awaited something hands the fresh-launch
+ * path: the ticket it took before its first `await` — so a stop, a shutdown
+ * or the end of its session that came meanwhile still cancels it — and the
+ * child it replaces, whose ownership the new child keeps
+ * ({@link childOwnership}).
+ */
+interface FreshLaunchContext {
+  readonly ticket: LaunchTicket;
+  readonly predecessor?: ChildState | undefined;
+}
+
+/**
+ * Whether a serving child's own credential still authenticates, as far as the
+ * launcher can tell: `'stale'` only on a definite answer — its lease was found
+ * invalidated, or the issuer answered `ok(false)` — and `'live'` otherwise,
+ * an unknown answer included.
+ */
+type CredentialVerdict = 'live' | 'stale';
 
 /** How often a stopping process group is re-checked for survivors, in milliseconds. */
 const GROUP_POLL_INTERVAL_MS = 100;
@@ -6801,10 +6983,38 @@ class DevServerLauncherImpl implements DevServerLauncher {
         if (isErr(checked)) {
           return err(checked.error);
         }
-      }
-      const reused = existing === undefined ? undefined : this.#reusable(existing, sessionId);
-      if (reused !== undefined) {
-        return ok(reused);
+        // A launch of this project already in flight — the replacement of this
+        // very child among them — decides for every concurrent caller, which
+        // joins it below rather than judging the child a second time.
+        if (!this.#inflight.has(root.value.key)) {
+          const verdict = this.#credentialVerdict(existing);
+          if (verdict === 'live') {
+            const reused = this.#reusable(existing, sessionId);
+            if (reused !== undefined) {
+              return ok(reused);
+            }
+          } else {
+            // The child's credential no longer authenticates (or the answer is
+            // still coming): registered before anything is awaited, so every
+            // concurrent launch of the project joins this one decision and at
+            // most one replacement is spawned.
+            const replacing = this.#replaceIfStale(
+              existing,
+              root.value,
+              request,
+              sessionId,
+              verdict,
+            );
+            this.#inflight.set(root.value.key, replacing);
+            try {
+              return await replacing;
+            } finally {
+              if (this.#inflight.get(root.value.key) === replacing) {
+                this.#inflight.delete(root.value.key);
+              }
+            }
+          }
+        }
       }
 
       const pending = this.#inflight.get(root.value.key);
@@ -6882,12 +7092,164 @@ class DevServerLauncherImpl implements DevServerLauncher {
     return Object.freeze({ managed: true, alreadyRunning: true, devServerUrl, pid });
   }
 
+  /**
+   * Whether a serving child's own credential still authenticates, before the
+   * child is handed back to a later launch.
+   *
+   * `'stale'` at once for a lease already known invalidated (a renewal found
+   * the credential gone, or {@link DevServerLauncher.credentialsRotated} was
+   * called). Otherwise the issuer's {@link ServerAgentCredentialIssuer.isLive}
+   * decides: its synchronous answer is judged here, so a live child is reused
+   * with nothing awaited, exactly as before; an answer that is a promise is
+   * judged once it settles. An issuer without `isLive`, an `Err`, a throw or
+   * an answer that is no `Result` is unknown — `'live'`, logged — because a
+   * child is never stopped on a guess. The token goes to the issuer alone.
+   */
+  #credentialVerdict(state: ChildState): CredentialVerdict | Promise<CredentialVerdict> {
+    const input = state.lease.livenessInput();
+    if (input === undefined) {
+      return 'stale';
+    }
+    const { credentials } = this.#deps;
+    if (credentials.isLive === undefined) {
+      return 'live';
+    }
+    let answer: unknown;
+    try {
+      answer = credentials.isLive(input);
+    } catch (error) {
+      return this.#unknownLiveness(state, error);
+    }
+    if (isPromiseLike(answer)) {
+      return Promise.resolve(answer).then(
+        (settled) => this.#livenessVerdict(state, settled),
+        (error: unknown) => this.#unknownLiveness(state, error),
+      );
+    }
+    return this.#livenessVerdict(state, answer);
+  }
+
+  /** The verdict of one settled `isLive` answer; anything but `ok(true)` or `ok(false)` is unknown. */
+  #livenessVerdict(state: ChildState, answer: unknown): CredentialVerdict {
+    if (isOkResultOf(answer, false)) {
+      return 'stale';
+    }
+    if (isOkResultOf(answer, true)) {
+      return 'live';
+    }
+    const cause =
+      isErrResult(answer) && typeof answer === 'object' && answer !== null && 'error' in answer
+        ? answer.error
+        : undefined;
+    return this.#unknownLiveness(state, cause);
+  }
+
+  /** An `isLive` that could not answer: logged by its code alone, and the child reused. */
+  #unknownLiveness(state: ChildState, cause: unknown): CredentialVerdict {
+    this.#log(
+      'warn',
+      "Whether a launched dev server's credential still authenticates could not be confirmed; the running dev server is reused",
+      { projectRoot: state.key, pid: state.pid, errorCode: errnoCodeOf(cause) },
+    );
+    return 'live';
+  }
+
+  /**
+   * The launch of a project whose serving child's credential was found
+   * retired, or is still being checked ({@link #credentialVerdict}); runs as
+   * the project's in-flight launch, which every concurrent launch joins.
+   *
+   * Once the verdict is `'live'`, the child is reused as before — or, when it
+   * stopped serving while its credential was checked, it is made sure to be
+   * gone (a survivor refuses the launch) and a fresh child is launched, as a
+   * launch arriving now would. Once it is `'stale'`, the child can never
+   * connect its preload again (AAP §0.5.6), so:
+   *
+   * 1. its lease is lapsed — renewal stops and nothing attributes a preload to
+   *    it any more — and the replacement is logged, without the token;
+   * 2. it is stopped through {@link #terminate}, the path every stop takes,
+   *    which revokes what is left of its credential and forgets it;
+   * 3. a child that outlives that termination refuses the launch with the
+   *    `survived-termination` error, and stays registered;
+   * 4. otherwise the replacement is launched through the fresh-launch path —
+   *    detection, the command policy, a new credential, the spawn and
+   *    readiness — keeping the old child's ownership ({@link childOwnership}).
+   *
+   * The ticket is taken before the first `await`, so a stop of the project, a
+   * shutdown or the end of the requesting session that arrives meanwhile
+   * cancels the replacement exactly as it cancels any launch.
+   */
+  async #replaceIfStale(
+    existing: ChildState,
+    root: ProjectRootForms,
+    request: DevServerLaunchInput,
+    sessionId: string | undefined,
+    verdict: 'stale' | Promise<CredentialVerdict>,
+  ): Promise<Result<DevServerLaunchResult, DebuggenError>> {
+    const ticket = this.#ticket(root.key, sessionId);
+    const answer = await verdict;
+    if (answer === 'live') {
+      if (this.#isCancelled(ticket)) {
+        return err(cancelledError());
+      }
+      const reused = this.#reusable(existing, sessionId);
+      if (reused !== undefined) {
+        return ok(reused);
+      }
+      // It stopped serving while its credential was checked — it exited, or a
+      // stop by pid or session reached it. It must be gone, and its record
+      // with it, before another child is started for the project: a child
+      // that outlived that stop keeps its record and refuses the launch.
+      const ended = await this.#terminate(existing, 'relaunch');
+      if (ended.kind === 'survived') {
+        return err(survivedTerminationError([ended.survivor]));
+      }
+      if (this.#isCancelled(ticket)) {
+        return err(cancelledError());
+      }
+      return this.#launchFresh(root, request, sessionId, { ticket });
+    }
+
+    // Known retired: renewal stops and no preload is attributed to it any
+    // more, whether or not this launch goes on to replace it.
+    this.#lapseRetired(existing.lease);
+    if (this.#isCancelled(ticket)) {
+      return err(cancelledError());
+    }
+    this.#log(
+      'warn',
+      "A launched dev server's credential no longer authenticates (rotated or revoked); it is stopped and launched again with a new credential",
+      {
+        projectRoot: root.key,
+        pid: existing.pid,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      },
+    );
+    const termination = await this.#terminate(existing, 'credential-retired');
+    if (termination.kind === 'survived') {
+      return err(survivedTerminationError([termination.survivor]));
+    }
+    if (this.#isCancelled(ticket)) {
+      return err(cancelledError());
+    }
+    return this.#launchFresh(root, request, sessionId, { ticket, predecessor: existing });
+  }
+
+  /**
+   * Spawn a new child for the project and wait until it is ready.
+   *
+   * @param context Given by a launch that already awaited something: the
+   *   ticket it took first, and the child it replaces. Absent, the ticket is
+   *   taken now and the child's ownership follows the request alone.
+   */
   async #launchFresh(
     root: ProjectRootForms,
     request: DevServerLaunchInput,
     sessionId: string | undefined,
+    context?: FreshLaunchContext,
   ): Promise<Result<DevServerLaunchResult, DebuggenError>> {
-    const ticket = this.#ticket(root.key, sessionId);
+    const ticket = context?.ticket ?? this.#ticket(root.key, sessionId);
+    const predecessor = context?.predecessor;
 
     // The address the child reports to must be the service's bound address.
     let ingestUrl: string;
@@ -7159,7 +7521,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       startedAt,
       command: executableName(command.value.file),
       script: command.value.script,
-      sessionId,
+      ownership: childOwnership(sessionId, predecessor, this.#endedSessions),
       lease,
       devServerUrl: requestedUrl,
       outputTail: new OutputTail(token),
@@ -7200,6 +7562,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       ...(state.script === undefined ? {} : { script: state.script }),
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(command.value.form === 'framework-cli' ? { binDirectories: binDirectoryCount } : {}),
+      ...(predecessor?.pid === undefined ? {} : { replacedPid: predecessor.pid }),
     });
 
     if (this.#isCancelled(ticket)) {
@@ -8956,6 +9319,32 @@ class DevServerLauncherImpl implements DevServerLauncher {
     return undefined;
   }
 
+  credentialsRotated(): void {
+    try {
+      let lapsed = 0;
+      for (const { lease } of this.#registry.values()) {
+        if (!lease.invalidated) {
+          // The rotation deleted the row: nothing is left to renew or revoke.
+          this.#lapseRetired(lease);
+          lapsed += 1;
+        }
+      }
+      if (lapsed > 0) {
+        this.#log(
+          'info',
+          "The launched dev servers' credentials were rotated away; each is launched again, with a new credential, on its project's next launch",
+          { lapsed },
+        );
+      }
+    } catch (error) {
+      // Nothing above is expected to throw; the next launch's liveness check
+      // finds the same retired credentials, so a failure here costs nothing more.
+      this.#log('warn', 'Marking the rotated credentials of launched dev servers failed', {
+        errorCode: errnoCodeOf(error),
+      });
+    }
+  }
+
   /**
    * Stops a session-owned child that no session and no hold relies on any
    * more — the end of a hold whose session was never created, or whose
@@ -9753,6 +10142,18 @@ class DevServerLauncherImpl implements DevServerLauncher {
       });
     }
     this.#scheduleRenewal(lease);
+  }
+
+  /**
+   * A launched child's credential the access boundary no longer holds — it
+   * was rotated away or revoked — is lapsed: nothing renews it again, no
+   * preload is attributed to it, and a later termination has nothing left to
+   * revoke. The child itself keeps running until something stops it.
+   */
+  #lapseRetired(lease: CredentialLease): void {
+    lease.lapse();
+    this.#clearTimer(lease.renewalTimer);
+    lease.renewalTimer = undefined;
   }
 
   /** A timer that never keeps the service process alive on its own. */

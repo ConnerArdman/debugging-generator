@@ -20,10 +20,18 @@
  * The `dg-field*` wrapper structure below - wrapper, label, control row, hint, error - is declared
  * identically by this file and by the select primitive so that a toolbar row of a text field and a
  * dropdown aligns on one grid. That duplication is DELIBERATE and must not be "fixed" by
- * extracting a shared field helper: the primitive list is fixed at fourteen files, so no fifteenth
- * helper module may be created, and design-system compliance ranks above code quality when the two
- * disagree. The stylesheet is the shared artefact instead: one `dg-field*` rule set in
+ * extracting a shared field component: the primitive list is fixed at fourteen components, so no
+ * fifteenth field component may be created, and design-system compliance ranks above code quality
+ * when the two disagree. The stylesheet is the shared artefact instead: one `dg-field*` rule set in
  * `../styles/components.css` serves both components.
+ *
+ * UNTRUSTED TEXT
+ * The label, hint and error message are drawn through `./untrusted-text`, the one presentation
+ * formatter every primitive shares, so a bidirectional control in any of them (an error message
+ * relayed from the service, a label built from a captured name) is shown as a visible `\uXXXX`
+ * marker instead of silently reordering the words around it. The field's `value` and
+ * `placeholder` are left exactly as given: the value is the developer's own input and must round-
+ * trip through `onValueChange` byte for byte, and the placeholder is product copy.
  *
  * ALWAYS CONTROLLED
  * `value` plus `onValueChange` is the only data path. The component keeps no text state of its own,
@@ -57,6 +65,8 @@
 import clsx from 'clsx';
 import type { ChangeEvent, HTMLAttributes, ReactElement, ReactNode } from 'react';
 import { useId } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * Field density.
@@ -417,7 +427,7 @@ export function Input(props: InputProps): ReactElement {
         className={clsx('dg-field__label', labelHidden && 'dg-visually-hidden')}
         htmlFor={fieldId}
       >
-        {label}
+        {formatUntrustedText(label)}
       </label>
 
       <div className="dg-field__control">
@@ -471,13 +481,13 @@ export function Input(props: InputProps): ReactElement {
 
       {hintText !== undefined ? (
         <p className="dg-field__hint" id={hintElementId}>
-          {hintText}
+          {formatUntrustedNode(hintText)}
         </p>
       ) : null}
 
       {errorText !== undefined ? (
         <p className="dg-field__error" id={errorElementId}>
-          {errorText}
+          {formatUntrustedNode(errorText)}
         </p>
       ) : null}
     </div>

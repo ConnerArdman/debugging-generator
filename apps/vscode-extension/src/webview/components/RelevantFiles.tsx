@@ -50,6 +50,16 @@
  *   ellipsis, never by slicing the string, and the full value stays in the
  *   accessibility tree and in the path's tooltip. Symbols and reasons render
  *   verbatim.
+ * - **What is on screen is the logical text.** A path, symbol or reason is
+ *   untrusted — it comes from the project and from the model — and an
+ *   invisible Unicode direction control in it (U+202E and its eleven
+ *   siblings) would draw the characters after it in an order that was never
+ *   sent. Every one is shown as its visible escape (`\u202E`) with the
+ *   design system's `formatUntrustedText`: the primitives do it for their own
+ *   text, tooltips and names, and the path chip's parts, which are elements of
+ *   this component, are revealed where they render. Nothing else changes, and
+ *   the value raised through `onOpenFile`, the grouping and the React keys
+ *   stay the raw strings.
  * - **Rows stay apart when the path is shortened.** The investigation often
  *   selects files of one name — a route handler and its nested route, two
  *   components in sibling directories. `../path-display`'s `describePaths`
@@ -132,6 +142,7 @@ import {
   ErrorState,
   LoadingState,
   Text,
+  formatUntrustedText,
 } from '@debuggen/panel-renderer';
 import type { RelevantFile } from '@debuggen/protocol';
 
@@ -351,8 +362,15 @@ interface FilePathProps {
  * One row's path, in two forms: a visually hidden copy of the whole file,
  * which names the row, and the `aria-hidden` `.dgv-path` chip that shows it
  * middle-truncated — lead, then the tail's context and file name — with the
- * whole file as its tooltip. The chip's text is the file byte for byte; only
+ * whole file as its tooltip. The chip's text is the file character for
+ * character, with each direction control shown as its visible escape; only
  * the stylesheet shortens it.
+ *
+ * `Code` reveals its own string children and tooltip, but the chip's parts are
+ * `span` elements of this component, which `Code` leaves to their author, so
+ * each part is revealed here. The split itself is computed on the raw file:
+ * a control is one code unit and never a separator, so revealing the three
+ * parts one by one shows exactly the revealed whole.
  *
  * @param props See {@link FilePathProps}.
  * @returns The hidden copy followed by the chip.
@@ -366,12 +384,14 @@ function FilePath(props: FilePathProps): ReactElement {
         {file}
       </Text>
       <Code size="sm" className="dgv-path" title={file} aria-hidden="true">
-        {display.lead === '' ? null : <span className="dgv-path__lead">{display.lead}</span>}
+        {display.lead === '' ? null : (
+          <span className="dgv-path__lead">{formatUntrustedText(display.lead)}</span>
+        )}
         <span className="dgv-path__tail">
           {display.context === '' ? null : (
-            <span className="dgv-path__context">{display.context}</span>
+            <span className="dgv-path__context">{formatUntrustedText(display.context)}</span>
           )}
-          <span className="dgv-path__name">{display.name}</span>
+          <span className="dgv-path__name">{formatUntrustedText(display.name)}</span>
         </span>
       </Code>
     </>

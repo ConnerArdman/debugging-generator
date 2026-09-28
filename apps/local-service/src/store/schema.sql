@@ -10,7 +10,9 @@
 -- ./migrations.ts applies it as ladder version 1 in one transaction and stamps
 -- PRAGMA user_version, the version authority. Only comments may change here:
 -- every later schema change is an additive step in ./migrations.ts, so the
--- modifications journal always migrates forward intact. ./db.ts loads it
+-- modifications journal always migrates forward intact. The one documented
+-- exception is version 7, which rebuilds the bindings routing table to change
+-- its key and copies every row; see bindings below. ./db.ts loads it
 -- inline in the packaged editor extension, as ./schema.sql in development and
 -- as ./store/schema.sql beside dist/main.js, so it stays a standalone file.
 --
@@ -25,7 +27,8 @@
 --                 duration of telemetry_events, kept sub-millisecond.
 --   Row ids       TEXT with the ses_, cap_, pnl_, ana_, mod_ and evt_ prefixes
 --                 of @debuggen/shared; bindings, credentials and pairing_codes
---                 key on a tab id or a hash instead.
+--                 key on a tab id or a hash instead (bindings on a credential
+--                 hash and a tab id from version 7).
 --   Integrity     ON DELETE edges hold only because ./db.ts enables PRAGMA
 --                 foreign_keys on every connection.
 --   Vocabularies  parsed before a write. Only modifications.status and
@@ -275,6 +278,12 @@ CREATE INDEX IF NOT EXISTS idx_followups_session_id_asked_at
 -- session_id gives a session at most one bound tab; a second bind replaces the
 -- first. url is the tab URL at bind time, against which the origin of every
 -- later navigation is checked. tab_id is the browser tab id, not minted here.
+-- Version 7 of ./migrations.ts re-keys this table: a browser tab id is unique
+-- only within one browser, so the rebuilt table leads with bound_by, the hash
+-- of the DevTools credential that made the binding (empty for a row written
+-- before it), and keys on bound_by and tab_id together. The unique index on
+-- session_id is kept. The definition below is the version 1 shape the ladder
+-- starts from.
 CREATE TABLE IF NOT EXISTS bindings (
   tab_id     INTEGER PRIMARY KEY,
   session_id TEXT    NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,

@@ -22,6 +22,10 @@
  *     hidden copy of the whole path names the row.
  *   - **Accessible rows.** Each row is a button named by its file (and symbol)
  *     and described by its reason, inside an ordered list.
+ *   - **Direction controls are shown, never obeyed.** A U+202E/U+202C pair in
+ *     the path, symbol, a 500-character reason or an error prints as visible
+ *     `\u202E`/`\u202C` escapes in every part, tooltip and accessible name,
+ *     while `onOpenFile` still receives the raw file string.
  *   - **The three states** and their precedence: error > pending > empty > list.
  *   - **Silence.** Paths and reasons are the developer's content, so no state
  *     writes anything to any console (AAP 0.5.2).
@@ -685,6 +689,102 @@ describe('RelevantFiles activation', () => {
       ['src/features/alpha/Widget.tsx'],
       ['src/server/beta/handler.ts'],
     ]);
+  });
+});
+
+describe('RelevantFiles direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) around markup.
+   * Escaping keeps the markup inert, but the override alone would draw the text
+   * between them backwards — `</td><script>` read as `>tpircs<>dt/<`. Every
+   * code point is written as an escape so this suite is not itself a carrier.
+   */
+  const SPOOF = '\u202E</td><script>alert(7)</script>\u202C';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * What a reader must see: each control of {@link SPOOF} printed as its
+   * visible escape and every other character untouched. Spelled out here
+   * rather than by calling the formatter, so the suite pins the output.
+   */
+  function revealed(text: string): string {
+    return text.replaceAll('\u202E', '\\u202E').replaceAll('\u202C', '\\u202C');
+  }
+
+  /**
+   * The path's `/` separators split the spoof across the chip's lead and its
+   * file name, so each part must be revealed on its own.
+   */
+  const FILE = `src/spoof/${SPOOF}.ts`;
+  const SYMBOL = `handle${SPOOF}`;
+
+  /** The protocol's longest reason: exactly 500 characters, the pair inside. */
+  const REASON = `Serves the request ${SPOOF} that the selected element issues.`.padEnd(500, '.');
+
+  const ENTRY: RelevantFile = { file: FILE, symbol: SYMBOL, reason: REASON, score: 0.75 };
+
+  it('shows each control as a visible escape in the chip, the hidden name, the symbol and the reason', () => {
+    expect(REASON).toHaveLength(500);
+    render(<RelevantFiles files={[ENTRY]} onOpenFile={noop} />);
+
+    const row = within(theList()).getByRole('listitem');
+    const chip = row.querySelector('.dgv-path');
+    expect(chip?.tagName).toBe('CODE');
+    expect(chip?.getAttribute('dir')).toBe('ltr');
+    expect(chip?.textContent).toBe(revealed(FILE));
+    expect(chip?.getAttribute('title')).toBe(revealed(FILE));
+    // The spoof straddles two parts of the split; each shows its own marker.
+    expect(partText(row, 'dgv-path__lead')).toBe('src/spoof/\\u202E</td><script>alert(7)</');
+    expect(partText(row, 'dgv-path__name')).toBe('script>\\u202C.ts');
+
+    const symbol = row.querySelector('.dgv-files__meta .dg-text--accent');
+    expect(symbol?.textContent).toBe(revealed(SYMBOL));
+    expect(symbol?.getAttribute('title')).toBe(revealed(SYMBOL));
+    expect(partText(row, 'dgv-files__reason')).toBe(revealed(REASON));
+
+    expect(
+      screen.getByRole('button', { name: `${revealed(FILE)} ${revealed(SYMBOL)}` }),
+    ).toBeDefined();
+  });
+
+  it('leaves no raw control in any text, tooltip or accessible name, and no markup behind', () => {
+    const { container } = render(<RelevantFiles files={[ENTRY]} onOpenFile={noop} />);
+
+    expect(container.textContent).toContain('\\u202E');
+    expect(container.textContent).toContain('\\u202C');
+    expect(container.textContent).not.toMatch(RAW_CONTROL);
+
+    const labelled = container.querySelectorAll('[title], [aria-label]');
+    expect(labelled.length).toBeGreaterThan(0);
+    for (const element of labelled) {
+      expect(element.getAttribute('title') ?? '').not.toMatch(RAW_CONTROL);
+      expect(element.getAttribute('aria-label') ?? '').not.toMatch(RAW_CONTROL);
+    }
+
+    // The markup is text, never elements.
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+  });
+
+  it('raises onOpenFile with the raw file string, controls included', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    render(<RelevantFiles files={[ENTRY]} onOpenFile={onOpenFile} />);
+
+    await user.click(screen.getByRole('button', { name: `${revealed(FILE)} ${revealed(SYMBOL)}` }));
+
+    expect(onOpenFile.mock.calls).toEqual([[FILE]]);
+    expect(onOpenFile.mock.calls[0]?.[0]).toMatch(RAW_CONTROL);
+  });
+
+  it('shows the controls of an error message as visible escapes', () => {
+    render(<RelevantFiles files={[]} onOpenFile={noop} error={`Investigation failed: ${SPOOF}`} />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(revealed(`Investigation failed: ${SPOOF}`));
+    expect(alert.textContent).not.toMatch(RAW_CONTROL);
   });
 });
 

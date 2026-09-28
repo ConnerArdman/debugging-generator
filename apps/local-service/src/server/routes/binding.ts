@@ -30,9 +30,9 @@
  * | Message | Effect |
  * | --- | --- |
  * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated live session — neither ended nor failed — whose dev-server origin equals the tab's origin, and to the most recently updated failed one only when no live session serves that origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. A named session that ended or vanished is refused, and the injected {@link EndedSessionAgentPort} is told so the page disarm it owes is settled. |
- * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL, announces it as the binding now stands (`reason: 'bound'`) and re-arms the agent a new document starts dormant; a different origin drops the binding. A navigation of an unbound tab changes no binding. |
+ * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL, announces it as the binding now stands (`reason: 'bound'`) and re-arms the agent a new document starts dormant; a different origin drops the binding. A navigation of an unbound tab changes no binding. A navigation of a tab id that only another credential holds a binding of is refused `TAB_NOT_BOUND` and records nothing: readiness keys its evidence by tab id, and could not tell it from the other browser's bound tab. |
  * | page-agent report | Every `agent.ready` the readiness path accepts reaches {@link BindingDocumentObserver.documentReported}. A report naming a document other than the one the tab showed before its kept navigation proves that navigation a reload: it is announced (`reason: 'navigated'`) and, while its capture is open, reported as `Page reloaded during capture`. |
- * | `session.unbind` | Drops the binding. Idempotent: an unbound tab is a no-op. It never ends the session, cancels a capture or disarms instrumentation. |
+ * | `session.unbind` | Drops the sending credential's binding of the tab. Idempotent: a tab that credential has not bound is a no-op, even when another browser's tab with the same id is bound. It never ends the session, cancels a capture or disarms instrumentation. |
  *
  * **A tab that has no session yet awaits one.** A panel is opened — and its
  * tab announced — before the question that creates its session is asked, and
@@ -55,14 +55,22 @@
  * its DevTools closing: the tab awaits nothing more.
  *
  * **Cardinality** (AAP §0.2.3): one tab binds to at most one session and one
- * session accepts one tab at a time. A second bind replaces the first and is
+ * session accepts one tab at a time. A Chrome tab id is unique only within one
+ * browser, so "one tab" is one credential's tab: both stores key a binding by
+ * the credential that made it (its `tokenHash`, `boundBy`) and its tab id, and
+ * two paired browsers binding their own tab 7 to two sessions keep both
+ * bindings and hear nothing of each other. A second bind replaces the first and is
  * announced: once the bind's writes stand, every displaced binding is told with
  * `session.bound` carrying the displaced session, tab and URL and
  * `reason: 'replaced'`, before the new binding is announced — the order the
  * Chrome service worker's tab registry relies on (it drops a record only when
  * a drop names that record's tab *and* session). A redundant re-bind of the
  * same pair by the same credential — a service-worker reconnect re-announcing
- * its bindings — displaces nothing and announces no replacement.
+ * its bindings — displaces nothing and announces no replacement. The same pair
+ * bound by **another** credential is a takeover: the first holder's binding is
+ * displaced and announced `replaced` to it, and — because the registry never
+ * sends an establishment to a released binding's connection — the new
+ * `session.bound` reaches only the new holder and the session's editors.
  *
  * **Two stores, one truth.** The durable `bindings` row
  * (`../../store/sessions-repo.ts`) survives a restart; the live
@@ -109,9 +117,9 @@
  *
  * **Announcements** go to the session's DevTools and VS Code clients (the two
  * receivers AAP §0.4.2 names) through `broadcastToKinds`. The registry keeps a
- * released binding's connection eligible for binding announcements for a short
- * window, which is how a displaced or unbound panel still hears that it lost
- * its binding.
+ * released binding's connection eligible for release announcements for a
+ * short window, which is how a displaced or unbound panel still hears that it
+ * lost its binding.
  *
  * **Replay.** After a bind, {@link SessionReopener.reopen} replays the stored
  * record, progress rows, latest analysis and latest panel to the DevTools kind
@@ -152,10 +160,13 @@
  * capture or its instrumentation.
  *
  * **Stale store rows.** After a restart the registry is empty while the store
- * still holds rows, which carry no credential and so cannot authorize a change.
- * Such a row is left until the panel re-binds (the reconnecting service worker
- * re-announces its tabs, and `upsertBinding` replaces the row) or the session
- * ends. Navigation and unbind act only on live bindings, authorized against the
+ * still holds rows. A row records its holder's digest, which keys it but never
+ * authorizes a change on its own: no connection proved that credential since
+ * the restart. Such a row is left until the panel re-binds (the reconnecting
+ * service worker re-announces its tabs, and `upsertBinding` replaces the
+ * holder's row — or consumes a row that recorded no holder, one written before
+ * holders were recorded) or the session ends. Navigation and unbind act only
+ * on live bindings, authorized against the
  * credential that made them with `requireBoundSession`, with the tab the
  * frame's payload names as the acting tab: a frame about tab A changes only
  * tab A's binding, even though every tab of one paired extension presents the
@@ -266,13 +277,15 @@ import type { SessionManager } from '../../sessions/manager.js';
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionReopener } from '../../sessions/reopen.js';
 import { isTerminalSessionStatus } from '../../sessions/state-machine.js';
+import { UNRECORDED_BINDING_HOLDER } from '../../store/sessions-repo.js';
 import type {
   BindingUpsert,
   SessionsRepo,
   TabBinding as StoredTabBinding,
 } from '../../store/sessions-repo.js';
-import { requireBoundSession, requireRole } from '../auth.js';
+import { AUTH_FAILURE_REASONS, requireBoundSession, requireRole } from '../auth.js';
 import type { Principal } from '../auth.js';
+import { heldTabKey } from '../clients.js';
 import type {
   BindTabOutcome,
   ClientRegistry,
@@ -623,6 +636,8 @@ export interface BindingRoutesDeps {
    * The live bindings and the fan-out; the client registry in production.
    * `get` and `list` find the connection whose credential made a displaced
    * binding, so a refused bind can re-establish it under that credential.
+   * `tabHeldByAnotherCredential` is what refuses a navigation of a tab id only
+   * another paired browser holds a binding of.
    */
   readonly clients: Pick<
     ClientRegistry,
@@ -630,6 +645,7 @@ export interface BindingRoutesDeps {
     | 'updateTabUrl'
     | 'unbindTab'
     | 'bindingForTab'
+    | 'tabHeldByAnotherCredential'
     | 'bindingForSession'
     | 'broadcastToKinds'
     | 'get'
@@ -640,7 +656,9 @@ export interface BindingRoutesDeps {
   >;
   /**
    * The durable `bindings` rows, session records, the indexed origin lookup
-   * and open captures. `getBindingByTab` reads a tab's row before a bind
+   * and open captures. Every row is read, written and removed under its
+   * holder — the binding credential's `tokenHash` — so another browser's row
+   * of the same tab id is never touched. `getBindingByTab` reads a tab's row before a bind
    * replaces it or a drop removes it, so a refused re-bind of the same tab and
    * session, or a drop whose record mirror refuses, can write that row back.
    * `transaction` makes every such write-back status-aware: the row's session
@@ -790,8 +808,9 @@ export interface BindingRoutes {
    * then keep and re-arm on the same origin, drop on another.
    *
    * @returns What was done; `UNAUTHORIZED` for a non-DevTools principal;
-   * `TAB_NOT_BOUND` when the tab is bound by another credential;
-   * `PROTOCOL_INVALID_MESSAGE` for a malformed payload; `STORE_ERROR`.
+   * `TAB_NOT_BOUND` when the credential holds no binding of the tab id and
+   * another credential does; `PROTOCOL_INVALID_MESSAGE` for a malformed
+   * payload; `STORE_ERROR`.
    */
   handleTabNavigated(
     payload: TabNavigatedPayload,
@@ -799,10 +818,11 @@ export interface BindingRoutes {
   ): Promise<Result<TabNavigatedOutcome, DebuggenError>>;
 
   /**
-   * `session.unbind`: drop the tab's binding, idempotently.
+   * `session.unbind`: drop the credential's own binding of the tab,
+   * idempotently — another browser's binding of the same tab id is never
+   * reached, and an unbind of a tab the credential has not bound is ignored.
    *
    * @returns What was done; `UNAUTHORIZED` for a non-DevTools principal;
-   * `TAB_NOT_BOUND` when the tab is bound by another credential;
    * `PROTOCOL_INVALID_MESSAGE` for a malformed payload; `STORE_ERROR`.
    */
   handleSessionUnbind(
@@ -816,6 +836,13 @@ export interface DocumentReport {
   readonly tabId: number;
   /** The reporting document's id, as the page agent minted it. */
   readonly documentId: string;
+  /**
+   * The principal of the connection that relayed the report. A tab id is
+   * unique only within one browser, so the report is about that credential's
+   * tab — its document state and its binding — and never another browser's
+   * tab with the same id.
+   */
+  readonly principal: Principal;
 }
 
 /** A kept navigation of a tab, waiting for a new page-agent document to prove it a reload. */
@@ -870,14 +897,15 @@ export interface AgentReadyPort<Client> {
  * — so the service has applied the report to the tab's binding by the time
  * the router moves on to the connection's next frame. A refused report is
  * told nothing; a throw from the port propagates unchanged (the router answers
- * it as `INTERNAL`).
+ * it as `INTERNAL`). The observer is told the relaying connection's principal
+ * with the report, so the report reaches that credential's tab only.
  *
  * @example
  * ```ts
  * const readiness = observingDocumentReports(ledger, binding); // then wrapped for re-gating
  * ```
  */
-export function observingDocumentReports<Client>(
+export function observingDocumentReports<Client extends { readonly principal: Principal }>(
   port: AgentReadyPort<Client>,
   observer: BindingDocumentObserver,
 ): AgentReadyPort<Client> {
@@ -888,7 +916,11 @@ export function observingDocumentReports<Client>(
     ): Promise<Result<unknown, DebuggenError>> => {
       const recorded = await port.agentReady(payload, client);
       if (recorded.ok) {
-        await observer.documentReported({ tabId: payload.tabId, documentId: payload.documentId });
+        await observer.documentReported({
+          tabId: payload.tabId,
+          documentId: payload.documentId,
+          principal: client.principal,
+        });
       }
       return recorded;
     },
@@ -1098,6 +1130,21 @@ interface DisplacedBinding {
   readonly sessionId: SessionId;
   readonly tabId: number;
   readonly url: string;
+  /**
+   * The `tokenHash` of the DevTools credential that held the binding;
+   * `UNRECORDED_BINDING_HOLDER` for a durable row that recorded none — one
+   * written before the store recorded holders, which is nobody's in
+   * particular, so a bind of its very tab and session consumes it silently.
+   * Compared, never logged.
+   */
+  readonly boundBy: string;
+}
+
+/** The binding a bind made: the pair and the binding credential's `tokenHash`. */
+interface BoundIdentity {
+  readonly sessionId: SessionId;
+  readonly tabId: number;
+  readonly boundBy: string;
 }
 
 /**
@@ -1105,18 +1152,35 @@ interface DisplacedBinding {
  * each once, the live view first. The store can report a binding the live view
  * no longer holds (a row written before a restart); that session lost its tab
  * too and is told the same way.
+ *
+ * Whether a binding is left out depends on its holder as well as its pair.
+ * One that pairs the very tab and session of the new binding is left out only
+ * when the binder itself held it (a re-announcement, which displaces nothing)
+ * or no holder was recorded; held by **another** credential, it was taken over
+ * and is announced `replaced` like any other displaced binding (AAP §0.2.3: "a
+ * second bind replaces the first and is announced").
+ *
+ * Entries are merged by pair alone. A session holds at most one binding in
+ * each store, so a pair both stores report within one bind is one binding
+ * seen twice — the live view names its holder, and so does its row, unless
+ * the row was written before the store recorded holders — and it is announced
+ * once, from the live view.
  */
 function mergeDisplaced(
   live: readonly { readonly binding: TabBindingView }[],
   stored: BindingUpsert,
-  bound: { readonly sessionId: SessionId; readonly tabId: number },
+  bound: BoundIdentity,
 ): readonly DisplacedBinding[] {
   const merged = new Map<string, DisplacedBinding>();
   const add = (entry: DisplacedBinding): void => {
-    if (entry.sessionId === bound.sessionId && entry.tabId === bound.tabId) {
+    if (
+      entry.sessionId === bound.sessionId &&
+      entry.tabId === bound.tabId &&
+      (entry.boundBy === bound.boundBy || entry.boundBy === UNRECORDED_BINDING_HOLDER)
+    ) {
       return;
     }
-    const key = `${entry.tabId}\u0000${entry.sessionId}`;
+    const key = `${String(entry.tabId)}\u0000${entry.sessionId}`;
     if (!merged.has(key)) {
       merged.set(key, entry);
     }
@@ -1126,11 +1190,17 @@ function mergeDisplaced(
       sessionId: change.binding.sessionId,
       tabId: change.binding.tabId,
       url: change.binding.url,
+      boundBy: change.binding.boundBy,
     });
   }
   for (const row of [stored.displacedTab, stored.displacedSession]) {
     if (row !== undefined) {
-      add({ sessionId: row.sessionId, tabId: row.tab.tabId, url: row.tab.url });
+      add({
+        sessionId: row.sessionId,
+        tabId: row.tab.tabId,
+        url: row.tab.url,
+        boundBy: row.boundBy,
+      });
     }
   }
   return [...merged.values()];
@@ -1163,9 +1233,12 @@ interface MirrorWrite {
  * the tab's row and live binding back.
  */
 interface PriorBinding {
-  /** The tab's durable row, or `undefined` when it had none. */
+  /**
+   * The binder's view of the tab's durable row (its own row, else the tab's
+   * row that recorded no holder), or `undefined` when it had none.
+   */
   readonly row: StoredTabBinding | undefined;
-  /** The tab's live binding, or `undefined` when it had none. */
+  /** The binder's own live binding of the tab, or `undefined` when it had none. */
   readonly live: TabBindingView | undefined;
 }
 
@@ -1185,17 +1258,30 @@ interface BindUndo {
   readonly principal: Principal;
 }
 
-/** Whether two bindings pair the same tab with the same session. */
-function samePair(
-  left: { readonly tabId: number; readonly sessionId: string },
-  right: { readonly tabId: number; readonly sessionId: string },
-): boolean {
-  return left.tabId === right.tabId && left.sessionId === right.sessionId;
+/** What makes two bindings one: the holder, the tab and the session. */
+interface BindingIdentity {
+  readonly tabId: number;
+  readonly sessionId: string;
+  /** The holder's `tokenHash`, or `UNRECORDED_BINDING_HOLDER`. Compared, never logged. */
+  readonly boundBy: string;
 }
 
-/** The tab and session a durable row pairs, in the shape {@link samePair} compares. */
-function pairOfRow(row: StoredTabBinding): { readonly tabId: number; readonly sessionId: string } {
-  return { tabId: row.tab.tabId, sessionId: row.sessionId };
+/**
+ * Whether two bindings are one: the same holder pairing the same tab with the
+ * same session. Two paired browsers' bindings of the same tab id and session
+ * are two bindings, one of which displaced the other.
+ */
+function sameBinding(left: BindingIdentity, right: BindingIdentity): boolean {
+  return (
+    left.tabId === right.tabId &&
+    left.sessionId === right.sessionId &&
+    left.boundBy === right.boundBy
+  );
+}
+
+/** The holder, tab and session of a durable row, in the shape {@link sameBinding} compares. */
+function identityOfRow(row: StoredTabBinding): BindingIdentity {
+  return { tabId: row.tab.tabId, sessionId: row.sessionId, boundBy: row.boundBy };
 }
 
 /**
@@ -1292,22 +1378,25 @@ export function createBindingRoutes(
   /* ---- page-agent documents ---- */
 
   /**
-   * Per tab: the last page-agent document reported for it — what a kept
-   * navigation's new document is told apart from. Oldest report first,
-   * bounded by {@link MAX_DOCUMENT_TRACKED_TABS}.
+   * Per credential and tab (`heldTabKey`): the last page-agent document
+   * reported for it — what a kept navigation's new document is told apart
+   * from. Keyed by the relaying credential as well as the tab id, because a
+   * tab id is unique only within one browser. Oldest report first, bounded by
+   * {@link MAX_DOCUMENT_TRACKED_TABS}.
    */
-  const reportedDocuments = new Map<number, string>();
+  const reportedDocuments = new Map<string, string>();
 
   /**
-   * Per tab: the kept navigation still waiting for a new page-agent document
-   * to prove it a reload, bounded like {@link reportedDocuments}. An entry
-   * leaves when a report confirms it, when the next kept navigation replaces
-   * it, and when the tab's binding ends.
+   * Per credential and tab (`heldTabKey`, the binding's holder): the kept
+   * navigation still waiting for a new page-agent document to prove it a
+   * reload, bounded like {@link reportedDocuments}. An entry leaves when a
+   * report confirms it, when the next kept navigation replaces it, and when
+   * the tab's binding ends.
    */
-  const awaitingDocument = new Map<number, AwaitingDocument>();
+  const awaitingDocument = new Map<string, AwaitingDocument>();
 
   /** Sets `key` as the most recent entry of a bounded map, evicting the oldest beyond the bound. */
-  function rememberBounded<V>(map: Map<number, V>, key: number, value: V): void {
+  function rememberBounded<V>(map: Map<string, V>, key: string, value: V): void {
     map.delete(key);
     map.set(key, value);
     while (map.size > MAX_DOCUMENT_TRACKED_TABS) {
@@ -1329,17 +1418,20 @@ export function createBindingRoutes(
    * forgotten without a word about the capture.
    */
   function applyDocumentReport(report: DocumentReport): Result<void, DebuggenError> {
-    const { tabId, documentId } = report;
-    rememberBounded(reportedDocuments, tabId, documentId);
-    const awaiting = awaitingDocument.get(tabId);
+    const { tabId, documentId, principal } = report;
+    // The relaying credential's tab: another browser's tab with the same id
+    // has its own document state and binding, which this report never touches.
+    const key = heldTabKey(principal.tokenHash, tabId);
+    rememberBounded(reportedDocuments, key, documentId);
+    const awaiting = awaitingDocument.get(key);
     if (awaiting === undefined || awaiting.previousDocumentId === documentId) {
       // No navigation awaits a document, or the document the tab showed
       // before it reported again (a re-relayed report): nothing is proven.
       return ok(undefined);
     }
-    awaitingDocument.delete(tabId);
+    awaitingDocument.delete(key);
     const { sessionId, rearm } = awaiting;
-    const live = clients.bindingForTab(tabId);
+    const live = clients.bindingForTab(tabId, principal);
     if (live?.sessionId !== sessionId) {
       log.debug(
         'A reload was confirmed for a tab no longer bound to its session; nothing was announced',
@@ -1610,6 +1702,7 @@ export function createBindingRoutes(
         sessionId: row.sessionId,
         url: row.tab.url,
         boundAt: row.boundAt,
+        boundBy: row.boundBy,
       });
       return isErr(restored) ? restored : ok('restored');
     });
@@ -1636,11 +1729,18 @@ export function createBindingRoutes(
    * which the upsert replaced without reporting it. Each goes through
    * {@link restoreRow}, so a row whose session has ended meanwhile stays gone.
    *
+   * The new row is removed as its holder's view of the tab — its own row and
+   * the tab's row that recorded no holder — never another browser's row of
+   * the same tab id. That view held exactly the new row: the upsert consumed
+   * whatever the view showed before it, and a holder's own row and an
+   * unrecorded row of one tab never stand together, because the holder's
+   * first bind of the tab consumes the unrecorded one.
+   *
    * @param upsert What the bind's `upsertBinding` answered.
-   * @param priorRow The tab's row before the bind, from {@link PriorBinding}.
+   * @param priorRow The holder's view of the tab's row before the bind, from {@link PriorBinding}.
    */
   function rollbackUpsert(upsert: BindingUpsert, priorRow: StoredTabBinding | undefined): void {
-    const removed = sessions.deleteBinding(upsert.binding.tab.tabId);
+    const removed = sessions.deleteBinding(upsert.binding.tab.tabId, upsert.binding.boundBy);
     if (isErr(removed)) {
       log.error(
         'A binding row could not be rolled back',
@@ -1659,7 +1759,7 @@ export function createBindingRoutes(
     }
     if (
       priorRow !== undefined &&
-      !reported.some((row) => samePair(pairOfRow(row), pairOfRow(priorRow)))
+      !reported.some((row) => sameBinding(identityOfRow(row), identityOfRow(priorRow)))
     ) {
       restoreRow(priorRow);
     }
@@ -1808,7 +1908,7 @@ export function createBindingRoutes(
       const priorLive = undo.prior.live;
       if (
         priorLive !== undefined &&
-        !undo.live.displaced.some((change) => samePair(change.binding, priorLive))
+        !undo.live.displaced.some((change) => sameBinding(change.binding, priorLive))
       ) {
         restoreLiveBinding(priorLive);
       }
@@ -2006,7 +2106,7 @@ export function createBindingRoutes(
       return;
     }
     if (offerOpen) {
-      offerOpenSession(tabId, origin);
+      offerOpenSession(tabId, origin, connection.principal);
     }
   }
 
@@ -2017,8 +2117,11 @@ export function createBindingRoutes(
    * whose end the worker is unbinding), so its `session.created` could not
    * reach the tab. A session another tab holds is never offered — the bind it
    * would prompt replaces that tab's binding.
+   *
+   * @param principal The credential that announced the tab: the awaiting
+   *   record is its own, never another browser's tab with the same id.
    */
-  function offerOpenSession(tabId: number, origin: string): void {
+  function offerOpenSession(tabId: number, origin: string, principal: Principal): void {
     const found = findOpenSessionByOrigin(origin);
     if (isErr(found)) {
       log.warn('No open session could be looked up for a tab awaiting its origin', {
@@ -2032,7 +2135,7 @@ export function createBindingRoutes(
       return;
     }
     const message = createEnvelope(SESSION_CREATED_TYPE, { session: record }, { ts: clock() });
-    const offered = clients.offerSessionToAwaitingTab(tabId, message);
+    const offered = clients.offerSessionToAwaitingTab(tabId, principal, message);
     if (isErr(offered)) {
       log.debug(
         'An open session could not be offered to a tab awaiting its origin',
@@ -2147,11 +2250,15 @@ export function createBindingRoutes(
     const url = redactBoundUrl(request.url, origin);
     const boundAt = clock();
 
-    // 0. What the tab is bound to now, in both stores. A re-bind of the same
-    //    tab to the same session replaces that binding unreported (see
-    //    PriorBinding), so a refusal below needs this snapshot to put it back.
-    //    A row that cannot be read would refuse the upsert anyway.
-    const priorRow = sessions.getBindingByTab(tabId);
+    // 0. What the tab is bound to now, in both stores, in the binder's view: a
+    //    tab id is unique only within one browser, so another credential's
+    //    binding of the same id is another browser's tab and is no prior of
+    //    this one. A re-bind of the same tab to the same session replaces that
+    //    binding unreported (see PriorBinding), so a refusal below needs this
+    //    snapshot to put it back. A row that cannot be read would refuse the
+    //    upsert anyway.
+    const holder = principal.tokenHash;
+    const priorRow = sessions.getBindingByTab(tabId, holder);
     if (isErr(priorRow)) {
       log.error(
         "The tab's current binding row could not be read; the bind was refused",
@@ -2159,10 +2266,14 @@ export function createBindingRoutes(
       );
       return priorRow;
     }
-    const prior: PriorBinding = { row: priorRow.value, live: clients.bindingForTab(tabId) };
+    const prior: PriorBinding = {
+      row: priorRow.value,
+      live: clients.bindingForTab(tabId, principal),
+    };
 
-    // 1. The durable row: what a restart rebuilds from.
-    const stored = sessions.upsertBinding({ tabId, sessionId, url, boundAt });
+    // 1. The durable row, recorded against the binding credential: what a
+    //    restart rebuilds from.
+    const stored = sessions.upsertBinding({ tabId, sessionId, url, boundAt, boundBy: holder });
     if (isErr(stored)) {
       log.error(
         'The binding could not be persisted',
@@ -2194,7 +2305,11 @@ export function createBindingRoutes(
     //    that lost its tab, then show the tab on the bound one. Should any
     //    write refuse (or throw), every write of steps 1–3 is compensated in
     //    reverse and the refusal returned; nothing has been announced yet.
-    const released = mergeDisplaced(live.value.displaced, stored.value, { sessionId, tabId });
+    const released = mergeDisplaced(live.value.displaced, stored.value, {
+      sessionId,
+      tabId,
+      boundBy: holder,
+    });
     const mirrored: MirrorWrite[] = [];
     const undo: BindUndo = {
       stored: stored.value,
@@ -2398,12 +2513,14 @@ export function createBindingRoutes(
     announcedUrl: string,
     clearRecord: boolean,
   ): Promise<Result<BindingAnnouncement | undefined, DebuggenError>> {
-    const { tabId, sessionId } = binding;
-    // The tab's row as it stands, so a refused record mirror below can have it
-    // back exactly: a redundant re-bind renews the row's bound-at stamp but not
-    // the live view's, and the row may already be gone. A row that cannot be
-    // read would refuse the delete anyway.
-    const priorRow = sessions.getBindingByTab(tabId);
+    const { tabId, sessionId, boundBy } = binding;
+    // The tab's row as it stands in its holder's view, so a refused record
+    // mirror below can have it back exactly: a redundant re-bind renews the
+    // row's bound-at stamp but not the live view's, and the row may already be
+    // gone. A row that cannot be read would refuse the delete anyway. Only the
+    // holder's view is read and removed: another browser's binding of the same
+    // tab id is its own row.
+    const priorRow = sessions.getBindingByTab(tabId, boundBy);
     if (isErr(priorRow)) {
       log.error(
         "The tab's binding row could not be read; the binding was kept",
@@ -2411,7 +2528,7 @@ export function createBindingRoutes(
       );
       return priorRow;
     }
-    const removed = sessions.deleteBinding(tabId);
+    const removed = sessions.deleteBinding(tabId, boundBy);
     if (isErr(removed)) {
       log.error(
         'The binding row could not be removed',
@@ -2428,6 +2545,7 @@ export function createBindingRoutes(
         sessionId,
         tab: { tabId, url: binding.url },
         boundAt: binding.boundAt,
+        boundBy,
       });
       log.warn(
         'The live binding refused the unbind; the binding row was written back unless its session has closed',
@@ -2438,7 +2556,7 @@ export function createBindingRoutes(
     // The live binding is gone, and with it any navigation of the tab that
     // awaited a new document: a binding a refused mirror restores below
     // starts with none awaiting.
-    awaitingDocument.delete(tabId);
+    awaitingDocument.delete(heldTabKey(boundBy, tabId));
     if (change.value === undefined) {
       return ok(undefined);
     }
@@ -2485,26 +2603,43 @@ export function createBindingRoutes(
   }
 
   /**
-   * The live binding of a tab, authorized for the principal: `undefined` when
-   * the tab is not bound, `TAB_NOT_BOUND` when another credential bound it.
+   * The principal's own live binding of a tab, authorized for it:
+   * `undefined` when its credential holds no binding of the tab. A tab id is
+   * unique only within one browser, so another credential's binding of the
+   * same id — another browser's tab — is never answered, and never changed by
+   * this principal's frames.
    *
    * A binding frame is about the one tab its payload names, so that tab is the
-   * acting tab `requireBoundSession` checks the binding against. Two rules
-   * upstream keep that tab the sender's own: protocol refuses a frame whose
-   * envelope names a different tab, and `../ws.ts` refuses a payload tab other
-   * than the one a single-tab connection announced in its hello before this
-   * handler runs.
+   * acting tab `requireBoundSession` checks the binding against — a check the
+   * holder-keyed lookup already satisfies, kept so authorization never rests
+   * on how the registry indexes. Two rules upstream keep that tab the sender's
+   * own: protocol refuses a frame whose envelope names a different tab, and
+   * `../ws.ts` refuses a payload tab other than the one a single-tab
+   * connection announced in its hello before this handler runs.
    */
   function authorizedBinding(
     tabId: number,
     principal: Principal,
   ): Result<TabBindingView | undefined, DebuggenError> {
-    const binding = clients.bindingForTab(tabId);
+    const binding = clients.bindingForTab(tabId, principal);
     if (binding === undefined) {
       return ok(undefined);
     }
     const access = requireBoundSession(principal, binding.sessionId, binding, tabId);
     return isErr(access) ? access : ok(binding);
+  }
+
+  /**
+   * The refusal of a navigation of a tab id that only other credentials hold
+   * a binding of: the access boundary's own `session-not-bound` refusal
+   * (`../auth.ts`), exactly as it answered such a frame before bindings were
+   * keyed by holder.
+   */
+  function foreignTabRefusal(): Result<never, DebuggenError> {
+    const descriptor = AUTH_FAILURE_REASONS['session-not-bound'];
+    return refusal(descriptor.code, descriptor.message, descriptor.hint, {
+      reason: 'session-not-bound',
+    });
   }
 
   /* ---- tab.navigated ---- */
@@ -2528,8 +2663,22 @@ export function createBindingRoutes(
     url: string,
     principal: Principal,
   ): Promise<Result<TabNavigatedOutcome, DebuggenError>> {
-    const { tabId, sessionId } = binding;
-    const stored = sessions.upsertBinding({ tabId, sessionId, url, boundAt: binding.boundAt });
+    const { tabId, sessionId, boundBy } = binding;
+    // The binding's own row, under the holder that made it; `previousRow` is
+    // what a refusal below writes back.
+    const previousRow: StoredTabBinding = {
+      sessionId,
+      tab: { tabId, url: binding.url },
+      boundAt: binding.boundAt,
+      boundBy,
+    };
+    const stored = sessions.upsertBinding({
+      tabId,
+      sessionId,
+      url,
+      boundAt: binding.boundAt,
+      boundBy,
+    });
     if (isErr(stored)) {
       log.error(
         'The navigated URL could not be persisted',
@@ -2547,7 +2696,7 @@ export function createBindingRoutes(
     }
     const updated = clients.updateTabUrl({ tabId, url, principal });
     if (isErr(updated)) {
-      restoreRow({ sessionId, tab: { tabId, url: binding.url }, boundAt: binding.boundAt });
+      restoreRow(previousRow);
       log.warn(
         'The live binding refused the navigation; the binding row was restored',
         sessionFields(sessionId, { tabId, ...errorFields(updated.error) }),
@@ -2568,7 +2717,7 @@ export function createBindingRoutes(
             sessionFields(sessionId, { tabId, ...errorFields(reverted.error) }),
           );
         }
-        restoreRow({ sessionId, tab: { tabId, url: binding.url }, boundAt: binding.boundAt });
+        restoreRow(previousRow);
       };
       let mirrored: Result<void, DebuggenError>;
       try {
@@ -2599,10 +2748,14 @@ export function createBindingRoutes(
       return announced;
     }
     const rearm = rearmAgent(record);
-    rememberBounded(awaitingDocument, tabId, {
+    // Keyed by the binding's holder and tab: the next report of *this*
+    // browser's tab proves the reload, never one of another browser's tab
+    // with the same id.
+    const documentKey = heldTabKey(boundBy, tabId);
+    rememberBounded(awaitingDocument, documentKey, {
       sessionId,
       rearm,
-      previousDocumentId: reportedDocuments.get(tabId),
+      previousDocumentId: reportedDocuments.get(documentKey),
     });
     log.info(
       'Bound tab navigated within its origin',
@@ -2649,11 +2802,20 @@ export function createBindingRoutes(
     if (isErr(authorized)) {
       return authorized;
     }
+    const binding = authorized.value;
+    if (binding === undefined && clients.tabHeldByAnotherCredential(tabId, principal)) {
+      // The credential holds no binding of this tab id while another browser's
+      // tab with the same id is bound. The navigation recorder keys readiness
+      // by tab id alone, so accepting it would let this browser's navigation
+      // make readiness distrust the other browser's bound tab: refused, and
+      // nothing is recorded.
+      log.debug('A navigation of a tab id only another credential holds was refused', { tabId });
+      return foreignTabRefusal();
+    }
     // Accepted: the tab is unbound or bound by this credential. A refused frame
     // — another role, a malformed payload, another credential's tab — records
     // nothing, so it cannot make readiness distrust a report it has no say in.
     recordCommittedNavigation(tabId);
-    const binding = authorized.value;
     if (binding === undefined) {
       log.debug('A navigation of an unbound tab was ignored', { tabId });
       return ok({ kind: 'ignored' });

@@ -33,6 +33,12 @@
  *     names, SVG titles — for profiling vocabulary, which is the durable guard
  *     against a future well-meaning label change.
  *
+ * Captured and model-authored text also displays its logical order: a Unicode
+ * direction control in a frame's name, an ancestor's name or the node's title
+ * is drawn as its visible escape (`\u202E`) in every label, SVG `<title>` and
+ * accessible name — never raw, never as markup — while the selection a frame
+ * raises still carries the raw event id.
+ *
  * Alongside those, every component suite in this folder covers the three states
  * of a query-backed view — loading, empty and error — and the click-to-source
  * payload. Each state is driven through a stub `DataProvider` that respectively
@@ -118,6 +124,7 @@ import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions
 import type { PanelActions, PanelEventRef, PanelSelectionState } from '../host/PanelActions';
 import {
   NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
   estimateTextWidth,
   formatDuration,
   formatCount,
@@ -4965,5 +4972,142 @@ describe('FlameChart durations that are not measurements', () => {
 
     // The measured root is unaffected.
     expect(figuresOf(rowNamed(UNMEASURED_ROOT_EVENT.name)).duration).toBe(formatDuration(200));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * The QA report's payload — an escaped script tag behind a right-to-left
+ * override, which a browser draws backwards while `textContent` still holds the
+ * logical string — as a frame's name, so it reaches the frame's own label,
+ * title and accessible name and, through the ancestry, its child's. Written
+ * with escapes, never with the characters.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A frame name carrying an override and its pop around escaped markup. */
+const BIDI_NAME = 'example.QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** That name as it must display: both controls as their printable escapes. */
+const BIDI_SHOWN = 'example.QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** A node title carrying the same pair, and how it must display. */
+const BIDI_TITLE = 'Flame \u202Etitle\u202C';
+const BIDI_TITLE_SHOWN = 'Flame \\u202Etitle\\u202C';
+
+/** The hostile frame's event id, carrying an override that must reach the host raw. */
+const BIDI_EVENT_ID = 'event-\u202Eflame-0001';
+
+/** The root whose name carries the payload. */
+const BIDI_ROOT_EVENT = makeEvent({
+  id: BIDI_EVENT_ID,
+  spanId: spanIdFor(1),
+  name: BIDI_NAME,
+  kind: 'interaction',
+  tier: 'browser',
+  startTime: BASE_START_MS,
+  duration: 120,
+  seq: 0,
+  ingestSeq: 1,
+});
+
+/** Its child, whose ancestry names the hostile root. */
+const BIDI_CHILD_EVENT = makeEvent({
+  id: 'event-example-0002',
+  spanId: spanIdFor(2),
+  parentSpanId: spanIdFor(1),
+  name: 'example.child',
+  kind: 'fetch',
+  tier: 'browser',
+  startTime: BASE_START_MS + 4,
+  duration: 100,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/**
+ * The window frame whose `<title>` opens with `name`.
+ *
+ * @param name The frame's name as its title shows it.
+ * @returns Its `<rect>`.
+ */
+function frameRectTitled(name: string): Element {
+  const rect = Array.from(canvas().querySelectorAll(WINDOW_FRAME_SELECTOR)).find(
+    (candidate) => drawnFrameOf(candidate).name === name,
+  );
+
+  if (rect === undefined) {
+    throw new Error(`the canvas draws no frame titled "${name}"`);
+  }
+
+  return rect;
+}
+
+/**
+ * Asserts nothing in the document displays a raw direction control — not its
+ * text, which includes every SVG `<title>` and `<text>`, and not a `title` or
+ * `aria-label` — and that the payload's escaped markup never became an element.
+ */
+function expectNothingReorders(): void {
+  const root = document.body;
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of Array.from(root.querySelectorAll('*'))) {
+    for (const attribute of ['title', 'aria-label']) {
+      const value = element.getAttribute(attribute);
+      if (value !== null) {
+        expect(containsDirectionControl(value)).toBe(false);
+      }
+    }
+  }
+  expect(root.querySelector('script')).toBeNull();
+}
+
+describe('FlameChart direction controls in captured text', () => {
+  it('draws, names and lists a hostile frame in its logical order, and selects it raw', async () => {
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ title: BIDI_TITLE }), {
+      provider: resolvingProvider(makeTree([nest([BIDI_ROOT_EVENT, BIDI_CHILD_EVENT])])).provider,
+      actions: spies.actions,
+    });
+
+    // The tree and the canvas are both named by the revealed node title.
+    await screen.findByRole('tree', { name: (name) => name.startsWith(`${BIDI_TITLE_SHOWN}: `) });
+    expect(canvas().getAttribute('aria-label')?.startsWith(`${BIDI_TITLE_SHOWN}: `)).toBe(true);
+
+    // The hostile frame's title opens with its revealed name, and its
+    // accessible name is the revealed description its tree row carries too.
+    const root = frameRectTitled(BIDI_SHOWN);
+    const rootName = root.getAttribute('aria-label') ?? '';
+    expect(rootName.startsWith(`${BIDI_SHOWN} · `)).toBe(true);
+    expect(rowNamed(BIDI_SHOWN).getAttribute('aria-label')).toBe(rootName);
+
+    // The child names its hostile ancestor, revealed, in both carriers.
+    const child = frameRectTitled(BIDI_CHILD_EVENT.name);
+    expect(child.getAttribute('aria-label')).toContain(`inside ${BIDI_SHOWN}`);
+    expect(child.querySelector('title')?.textContent).toContain(`Inside ${BIDI_SHOWN}`);
+
+    // The label drawn on the hostile frame is revealed, whole or cut.
+    const labels = Array.from(canvas().querySelectorAll('text.dg-flame__frame-label')).map(
+      (label) => label.textContent,
+    );
+    expect(labels.some((label) => label.startsWith('example.QA_BIDI \\u202E'))).toBe(true);
+
+    expectNothingReorders();
+
+    // Selecting the frame hands the host the raw coordinates of its record.
+    await user.click(nameControlOf(rowNamed(BIDI_SHOWN)));
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_EVENT_ID,
+      spanId: BIDI_ROOT_EVENT.spanId,
+      traceId: BIDI_ROOT_EVENT.traceId,
+    });
+
+    // The selected row's tooltip and marks are revealed like everything else.
+    expectNothingReorders();
   });
 });

@@ -325,7 +325,7 @@ const PRELOAD_UNREACHABLE_REASON =
 
 /** The next step of a server signal the arm could not reach, carried as the row's detail. */
 const PRELOAD_UNREACHABLE_HINT =
-  'Launch the dev server from Debug Generator so its Node preload connects; the capture picks the server signals up as soon as it does.';
+  'Launch the dev server from Debug Generator so its Node preload connects (a launch also replaces a dev server it started whose credential was rotated or revoked); the capture picks the server signals up as soon as it does.';
 
 /** The next step when the page agent could not be sent its capture configuration. */
 const PAGE_AGENT_UNREACHABLE_HINT =
@@ -5757,7 +5757,7 @@ export function createInstrumentationService(
           'SERVER_AGENT_NOT_READY',
           'No dev-server preload is connected for this project, and the plan collects nothing in the page, so the capture could not be armed.',
           {
-            hint: 'Launch the dev server from Debug Generator so its Node preload connects, then start the capture again.',
+            hint: 'Launch the dev server from Debug Generator so its Node preload connects (a launch also replaces a dev server it started whose credential was rotated or revoked), then start the capture again.',
             details: { sessionId, captureId, reason: serverCode ?? 'SERVER_AGENT_NOT_READY' },
           },
         ),

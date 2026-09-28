@@ -798,19 +798,67 @@ const UPDATE_FOLLOWUP_SQL = `UPDATE followups SET question = ?, asked_at = ?, re
 WHERE id = ? AND session_id = ?`;
 
 /** The columns every binding read selects. */
-const BINDING_COLUMNS = 'tab_id, session_id, url, bound_at';
+const BINDING_COLUMNS = 'bound_by, tab_id, session_id, url, bound_at';
 
-/** The binding of one tab (the primary key). */
-const SELECT_BINDING_BY_TAB_SQL = `SELECT ${BINDING_COLUMNS} FROM bindings WHERE tab_id = ?`;
+/**
+ * The holder a `bindings` row records when it names none: every row written
+ * before schema version 7 re-keyed the table by holder and tab
+ * (`./migrations.ts`), and every write whose caller named no holder. Such a
+ * row belongs to every holder's view of its tab, so the first bind of that
+ * tab — by whichever credential — consumes it, exactly as a bind did before.
+ */
+export const UNRECORDED_BINDING_HOLDER = '';
+
+/**
+ * The longest holder a binding may record. A holder is the SHA-256 hex digest
+ * of a DevTools credential (64 characters); the bound leaves room for a longer
+ * digest without admitting an unbounded value.
+ */
+const MAX_BINDING_HOLDER_LENGTH = 128;
+
+/**
+ * What a recorded holder looks like: printable ASCII with no space, as every
+ * credential digest is. Checked before a holder is bound and when a row is
+ * read, so a malformed value is refused rather than compared.
+ */
+const BINDING_HOLDER_PATTERN = new RegExp(
+  `^[\\x21-\\x7e]{1,${String(MAX_BINDING_HOLDER_LENGTH)}}$`,
+  'u',
+);
+
+/** What an invalid holder is told it must be; names the shape, never the value. */
+const BINDING_HOLDER_EXPECTATION = `empty (no holder) or a credential digest of at most ${String(MAX_BINDING_HOLDER_LENGTH)} printable characters`;
+
+/**
+ * One holder's view of a tab (see {@link SessionsRepo.getBindingByTab}): the
+ * holder's own row first, else the tab's row that recorded no holder — at
+ * most one row, through two primary-key lookups. Bound as `(tabId, holder)`.
+ */
+const SELECT_HELD_BINDING_OF_TAB_SQL = `SELECT ${BINDING_COLUMNS} FROM bindings
+WHERE tab_id = ? AND bound_by IN (?, '')
+ORDER BY bound_by = ''
+LIMIT 1`;
+
+/** The rows of one tab id whoever holds them, at most two: enough to tell one holder from several. */
+const SELECT_BINDINGS_OF_TAB_SQL = `SELECT ${BINDING_COLUMNS} FROM bindings WHERE tab_id = ? ORDER BY bound_by LIMIT 2`;
 
 /** The binding of one session (the unique index). */
 const SELECT_BINDING_BY_SESSION_SQL = `SELECT ${BINDING_COLUMNS} FROM bindings WHERE session_id = ?`;
 
 /** Records a binding. */
-const INSERT_BINDING_SQL = `INSERT INTO bindings (${BINDING_COLUMNS}) VALUES (${placeholders(4)})`;
+const INSERT_BINDING_SQL = `INSERT INTO bindings (${BINDING_COLUMNS}) VALUES (${placeholders(5)})`;
 
-/** Drops the binding of one tab. */
-const DELETE_BINDING_BY_TAB_SQL = 'DELETE FROM bindings WHERE tab_id = ?';
+/** Drops one row by its primary key, bound as `(holder, tabId)`. */
+const DELETE_BINDING_BY_KEY_SQL = 'DELETE FROM bindings WHERE bound_by = ? AND tab_id = ?';
+
+/**
+ * Drops one holder's view of a tab: its own row and the tab's row that
+ * recorded no holder. Bound as `(tabId, holder)`.
+ */
+const DELETE_HELD_BINDINGS_OF_TAB_SQL = `DELETE FROM bindings WHERE tab_id = ? AND bound_by IN (?, '')`;
+
+/** Drops every row of one tab id, whoever holds it. */
+const DELETE_BINDINGS_OF_TAB_SQL = 'DELETE FROM bindings WHERE tab_id = ?';
 
 /** Drops the binding of one session. */
 const DELETE_BINDING_BY_SESSION_SQL = 'DELETE FROM bindings WHERE session_id = ?';
@@ -1281,6 +1329,15 @@ export interface UpsertBindingInput {
   readonly url: string;
   /** When the binding was made, in epoch milliseconds. Defaults to `now()`. */
   readonly boundAt?: number | undefined;
+  /**
+   * The holder: the `tokenHash` of the DevTools credential that made the
+   * binding, the value `../server/clients.ts` keys the live binding by. A tab
+   * id is unique only within one browser, so each holder's binding of a tab
+   * id is its own row. Omitted, the row records no holder
+   * ({@link UNRECORDED_BINDING_HOLDER}). A digest, never a credential; never
+   * logged.
+   */
+  readonly boundBy?: string | undefined;
 }
 
 /**
@@ -1296,6 +1353,12 @@ export interface TabBinding {
   readonly tab: BoundTab;
   /** When the binding was made, in epoch milliseconds. */
   readonly boundAt: number;
+  /**
+   * The holder the row records — the binding credential's `tokenHash` — or
+   * {@link UNRECORDED_BINDING_HOLDER} for a row that names none. Compared,
+   * never logged.
+   */
+  readonly boundBy: string;
 }
 
 /**
@@ -1308,13 +1371,15 @@ export interface BindingUpsert {
   /** The binding now stored. */
   readonly binding: TabBinding;
   /**
-   * The binding this **session** held before, when it was a different tab: that
-   * tab no longer receives the session's agent configuration or panels.
+   * The binding this **session** held before, when it was another row — a
+   * different tab, or the same tab id held by another credential: that tab no
+   * longer receives the session's agent configuration or panels.
    */
   readonly displacedTab?: TabBinding;
   /**
-   * The binding this **tab** held before, when it belonged to a different
-   * session: that session has lost its tab.
+   * The binding this **tab** held before in the holder's view (its own row,
+   * else the tab's row that recorded no holder), when it belonged to a
+   * different session: that session has lost its tab.
    */
   readonly displacedSession?: TabBinding;
 }
@@ -1978,32 +2043,45 @@ export interface SessionsRepo {
   listFollowUps(sessionId: SessionId): Result<FollowUpRecord[]>;
 
   /**
-   * Binds a tab to a session, replacing whatever either was bound to.
+   * Binds a tab to a session for a holder, replacing whatever either was
+   * bound to.
    *
-   * Inside one transaction it removes any binding of the session and any
-   * binding of the tab, then inserts the new one — the AAP §0.2.3 rule that one
-   * tab binds to at most one session and one session to at most one tab, with
-   * a second bind replacing the first. The replaced bindings are returned so
-   * the caller can announce them. Mirroring the binding onto
-   * `SessionRecord.boundTab` is the session manager's write, through
-   * {@link SessionsRepo.update}.
+   * A Chrome tab id is unique only within one browser, so a row is keyed by
+   * its holder and its tab id: two paired browsers' bindings of the same tab
+   * id are two rows and never displace each other. Inside one transaction it
+   * removes the holder's view of the tab (see {@link SessionsRepo.getBindingByTab}) and any
+   * binding of the session, whoever held it, then inserts the new row — the
+   * AAP §0.2.3 rule that one tab binds to at most one session and one session
+   * to at most one tab, with a second bind replacing the first. The replaced
+   * bindings are returned so the caller can announce them. Mirroring the
+   * binding onto `SessionRecord.boundTab` is the session manager's write,
+   * through {@link SessionsRepo.update}.
    *
-   * @param input The tab, the session, the tab's URL and the bind time.
+   * @param input The tab, the session, the tab's URL, the bind time and the holder.
    * @returns The new binding and the displaced ones, or `err`: `STORE_ERROR`
-   * for an invalid tab (`invalid-binding`) or an unreadable existing binding
-   * (`corrupt-row`, removable with {@link SessionsRepo.deleteBinding}),
-   * `SESSION_NOT_FOUND` when the session does not exist.
+   * for an invalid tab (`invalid-binding`), an invalid holder
+   * (`invalid-argument`) or an unreadable existing binding (`corrupt-row`,
+   * removable with {@link SessionsRepo.deleteBinding}), `SESSION_NOT_FOUND`
+   * when the session does not exist.
    */
   upsertBinding(input: UpsertBindingInput): Result<BindingUpsert>;
 
   /**
    * Reads the binding of one tab.
    *
+   * With `boundBy`, the holder's view of the tab: the row that holder made,
+   * else the tab's row that recorded no holder (one written before holders
+   * were recorded, which is every holder's until a bind consumes it). Without
+   * it, the tab's one row — answered only while a single row carries that tab
+   * id; rows of several holders are refused rather than one picked.
+   *
    * @param tabId The browser's tab id.
-   * @returns `ok(binding)`, `ok(undefined)` when the tab is unbound, or `err`
-   * `STORE_ERROR` (`invalid-argument`, `corrupt-row`).
+   * @param boundBy The holder whose view is read; omitted, the tab is read alone.
+   * @returns `ok(binding)`, `ok(undefined)` when the tab is unbound (in that
+   * view), or `err` `STORE_ERROR` (`invalid-argument`, `corrupt-row`, or
+   * `ambiguous-tab` when no holder was named and several hold the tab id).
    */
-  getBindingByTab(tabId: number): Result<TabBinding | undefined>;
+  getBindingByTab(tabId: number, boundBy?: string): Result<TabBinding | undefined>;
 
   /**
    * Reads the binding of one session.
@@ -2019,10 +2097,16 @@ export interface SessionsRepo {
    * navigation to another origin. Needs no readable row, so it is also how an
    * unreadable binding is cleared.
    *
+   * With `boundBy`, removes the holder's view of the tab: its own row and the
+   * tab's row that recorded no holder, never another holder's row of the same
+   * tab id. Without it, removes every row of the tab id, whoever holds it —
+   * the meaning this method had before rows recorded a holder.
+   *
    * @param tabId The browser's tab id.
-   * @returns How many bindings were removed (0 or 1), or `err` `STORE_ERROR`.
+   * @param boundBy The holder whose view of the tab is removed; omitted, every holder's.
+   * @returns How many bindings were removed, or `err` `STORE_ERROR`.
    */
-  deleteBinding(tabId: number): Result<number>;
+  deleteBinding(tabId: number, boundBy?: string): Result<number>;
 
   /**
    * Removes the binding of one session — on `session.end`.
@@ -3296,17 +3380,21 @@ function toFollowUpRecord(row: StoredRow, operation: string): Result<FollowUpRec
  * @returns The binding, or the refusal.
  */
 function toTabBinding(row: StoredRow, operation: string): Result<TabBinding> {
+  const boundBy = readText(row['bound_by']);
   const tabId = readInteger(row['tab_id']);
   const sessionId = readText(row['session_id']);
   const url = readText(row['url']);
   const boundAt = readInteger(row['bound_at']);
 
   if (
+    boundBy === undefined ||
+    !isBindingHolder(boundBy) ||
     tabId === undefined ||
     sessionId === undefined ||
     url === undefined ||
     boundAt === undefined
   ) {
+    // The holder is a credential digest: never named in the refusal.
     return err(corruptRowError(operation, 'bindings', tabId === undefined ? {} : { tabId }));
   }
 
@@ -3323,7 +3411,21 @@ function toTabBinding(row: StoredRow, operation: string): Result<TabBinding> {
     );
   }
 
-  return ok({ sessionId, tab: parsed.data, boundAt });
+  return ok({ sessionId, tab: parsed.data, boundAt, boundBy });
+}
+
+/**
+ * Whether `value` is a holder a binding may record: the unrecorded holder, or
+ * a credential digest ({@link BINDING_HOLDER_PATTERN}).
+ *
+ * @param value The candidate.
+ * @returns `true` when it is.
+ */
+function isBindingHolder(value: unknown): value is string {
+  return (
+    value === UNRECORDED_BINDING_HOLDER ||
+    (typeof value === 'string' && BINDING_HOLDER_PATTERN.test(value))
+  );
 }
 
 /**
@@ -5884,12 +5986,39 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
   /** Reads at most one binding row, absence being a success. */
   function readBinding(
     sql: string,
-    key: BoundValue,
+    keys: readonly BoundValue[],
     operation: string,
   ): Result<TabBinding | undefined> {
-    const row = store.statement(sql).get(key);
+    const row = store.statement(sql).get(...keys);
 
     return row === undefined ? ok(undefined) : toTabBinding(row, operation);
+  }
+
+  /**
+   * The tab's one row, whoever holds it: `ok(undefined)` for none, the row
+   * for one, and `ambiguous-tab` for rows of several holders — a tab id is
+   * unique only within one browser, so which one was meant cannot be told.
+   */
+  function readOnlyBindingOfTab(tabId: number, operation: string): Result<TabBinding | undefined> {
+    const rows = store.statement(SELECT_BINDINGS_OF_TAB_SQL).all(tabId);
+    const [first] = rows;
+
+    if (first === undefined) {
+      return ok(undefined);
+    }
+    if (rows.length > 1) {
+      return err(
+        invalidValueError(
+          operation,
+          'Several paired browsers hold a binding of this tab id; the tab must be read for the credential that bound it.',
+          'ambiguous-tab',
+          undefined,
+          { tabId },
+        ),
+      );
+    }
+
+    return toTabBinding(first, operation);
   }
 
   function upsertBinding(input: UpsertBindingInput): Result<BindingUpsert> {
@@ -5907,6 +6036,12 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         return err(
           invalidArgumentError(operation, 'boundAt', 'a finite epoch-millisecond number', fields),
         );
+      }
+
+      const boundBy = input.boundBy ?? UNRECORDED_BINDING_HOLDER;
+
+      if (!isBindingHolder(boundBy)) {
+        return err(invalidArgumentError(operation, 'boundBy', BINDING_HOLDER_EXPECTATION, fields));
       }
 
       const parsed = boundTabSchema.safeParse({ tabId: input.tabId, url: input.url });
@@ -5927,6 +6062,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         sessionId: input.sessionId,
         tab: parsed.data,
         boundAt: input.boundAt === undefined ? stamp(operation) : toEpochColumn(input.boundAt),
+        boundBy,
       });
     });
 
@@ -5936,14 +6072,18 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     }
 
     const binding = prepared.value;
+    // The holder is a credential digest: compared and bound, never a log field.
     const fields = { [LOG_BINDING_KEYS.sessionId]: binding.sessionId, tabId: binding.tab.tabId };
     const outcome = attempt(
       operation,
       () =>
         store.transaction((): Result<BindingUpsert> => {
+          // The holder's view of the tab — its own row, else the tab's row that
+          // recorded no holder — and never another holder's row of the same
+          // tab id, which is another browser's tab.
           const previousForTab = readBinding(
-            SELECT_BINDING_BY_TAB_SQL,
-            binding.tab.tabId,
+            SELECT_HELD_BINDING_OF_TAB_SQL,
+            [binding.tab.tabId, binding.boundBy],
             operation,
           );
 
@@ -5953,7 +6093,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
 
           const previousForSession = readBinding(
             SELECT_BINDING_BY_SESSION_SQL,
-            binding.sessionId,
+            [binding.sessionId],
             operation,
           );
 
@@ -5961,15 +6101,26 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
             return previousForSession;
           }
 
-          // Both edges of the one-to-one rule are cleared before the insert, so
-          // neither the tab's primary key nor the session's unique index can
-          // refuse it; a missing session fails the insert's foreign key and
-          // rolls both deletes back.
-          store.statement(DELETE_BINDING_BY_TAB_SQL).run(binding.tab.tabId);
+          // Both edges of the one-to-one rule are cleared before the insert:
+          // the row the holder's view showed frees its key (the holder's own
+          // row, or the unrecorded row it consumes), and the session's row —
+          // whoever held it — frees the session's unique index. A missing
+          // session fails the insert's foreign key and rolls both deletes back.
+          if (previousForTab.value !== undefined) {
+            store
+              .statement(DELETE_BINDING_BY_KEY_SQL)
+              .run(previousForTab.value.boundBy, previousForTab.value.tab.tabId);
+          }
           store.statement(DELETE_BINDING_BY_SESSION_SQL).run(binding.sessionId);
           store
             .statement(INSERT_BINDING_SQL)
-            .run(binding.tab.tabId, binding.sessionId, binding.tab.url, binding.boundAt);
+            .run(
+              binding.boundBy,
+              binding.tab.tabId,
+              binding.sessionId,
+              binding.tab.url,
+              binding.boundAt,
+            );
 
           const displacedSession =
             previousForTab.value !== undefined &&
@@ -5978,7 +6129,8 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
               : undefined;
           const displacedTab =
             previousForSession.value !== undefined &&
-            previousForSession.value.tab.tabId !== binding.tab.tabId
+            (previousForSession.value.tab.tabId !== binding.tab.tabId ||
+              previousForSession.value.boundBy !== binding.boundBy)
               ? previousForSession.value
               : undefined;
 
@@ -6008,15 +6160,23 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     return outcome;
   }
 
-  function getBindingByTab(tabId: number): Result<TabBinding | undefined> {
+  function getBindingByTab(tabId: number, boundBy?: string): Result<TabBinding | undefined> {
     const operation = 'getBindingByTab';
     const fields = { tabId };
     const outcome = attempt(
       operation,
-      (): Result<TabBinding | undefined> =>
-        isIntegerInRange(tabId, 0, Number.MAX_SAFE_INTEGER)
-          ? readBinding(SELECT_BINDING_BY_TAB_SQL, tabId, operation)
-          : err(invalidArgumentError(operation, 'tabId', 'a non-negative integer tab id')),
+      (): Result<TabBinding | undefined> => {
+        if (!isIntegerInRange(tabId, 0, Number.MAX_SAFE_INTEGER)) {
+          return err(invalidArgumentError(operation, 'tabId', 'a non-negative integer tab id'));
+        }
+        if (boundBy === undefined) {
+          return readOnlyBindingOfTab(tabId, operation);
+        }
+
+        return isBindingHolder(boundBy)
+          ? readBinding(SELECT_HELD_BINDING_OF_TAB_SQL, [tabId, boundBy], operation)
+          : err(invalidArgumentError(operation, 'boundBy', BINDING_HOLDER_EXPECTATION, fields));
+      },
       fields,
     );
 
@@ -6036,7 +6196,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         const invalid = sessionIdError(operation, sessionId);
 
         return invalid === undefined
-          ? readBinding(SELECT_BINDING_BY_SESSION_SQL, sessionId, operation)
+          ? readBinding(SELECT_BINDING_BY_SESSION_SQL, [sessionId], operation)
           : err(invalid);
       },
       fields,
@@ -6049,15 +6209,23 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     return outcome;
   }
 
-  function deleteBinding(tabId: number): Result<number> {
+  function deleteBinding(tabId: number, boundBy?: string): Result<number> {
     const operation = 'deleteBinding';
     const fields = { tabId };
     const outcome = attempt(
       operation,
-      (): Result<number> =>
-        isIntegerInRange(tabId, 0, Number.MAX_SAFE_INTEGER)
-          ? ok(changesOf(store.statement(DELETE_BINDING_BY_TAB_SQL).run(tabId)))
-          : err(invalidArgumentError(operation, 'tabId', 'a non-negative integer tab id')),
+      (): Result<number> => {
+        if (!isIntegerInRange(tabId, 0, Number.MAX_SAFE_INTEGER)) {
+          return err(invalidArgumentError(operation, 'tabId', 'a non-negative integer tab id'));
+        }
+        if (boundBy === undefined) {
+          return ok(changesOf(store.statement(DELETE_BINDINGS_OF_TAB_SQL).run(tabId)));
+        }
+
+        return isBindingHolder(boundBy)
+          ? ok(changesOf(store.statement(DELETE_HELD_BINDINGS_OF_TAB_SQL).run(tabId, boundBy)))
+          : err(invalidArgumentError(operation, 'boundBy', BINDING_HOLDER_EXPECTATION, fields));
+      },
       fields,
     );
 

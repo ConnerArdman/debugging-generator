@@ -1595,7 +1595,8 @@ const UNREADABLE_CHECKPOINT_REASON = 'the checkpoint pragma did not answer with 
  * both frame counts — the counts a connection outside WAL mode answers with
  * `busy = 0` — so it must be told apart from `no-wal` by `busy`.
  */
-const CONCURRENT_CHECKPOINT_REASON = 'another connection was checkpointing the write-ahead log';
+export const CONCURRENT_CHECKPOINT_REASON =
+  'another connection was checkpointing the write-ahead log';
 
 /**
  * The log fields that describe a checkpoint outcome: `checkpoint`, the

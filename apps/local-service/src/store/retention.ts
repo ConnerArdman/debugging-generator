@@ -187,7 +187,11 @@
  * the event loop free while it lasts. The connection's own threshold is
  * restored when the sweep ends, however it ends. A checkpoint that fails
  * restores it at once, and the rest of the sweep runs with SQLite's own
- * checkpoints, as before. The in-memory store has no log and is unaffected;
+ * checkpoints, as before. One that could not start because another connection
+ * was checkpointing the log — the store's own background checkpointer, whose
+ * interval can meet the wait — has not failed: the log is being folded in, so
+ * the sweep keeps its own checkpoints and waits again after its next batch.
+ * The in-memory store has no log and is unaffected;
  * a dry run writes nothing and changes nothing.
  *
  * ## Bounded work
@@ -278,7 +282,7 @@ import type { Logger, Result, SessionId } from '@debuggen/shared';
 
 import { DEFAULT_RETENTION_DAYS } from '../config.js';
 import type { ServiceConfig } from '../config.js';
-import { openWalCheckpointer, suspendAutoCheckpoint } from './db.js';
+import { CONCURRENT_CHECKPOINT_REASON, openWalCheckpointer, suspendAutoCheckpoint } from './db.js';
 import type { AutoCheckpointSuspension, Store, WalCheckpointer } from './db.js';
 import { scanSessionBackupReferences } from './modifications-repo.js';
 import type { ModificationsRepo } from './modifications-repo.js';
@@ -1997,6 +2001,18 @@ function createSweepWal(store: Store, settings: SweepSettings, logger: Logger): 
         });
         return;
       case 'failed':
+        if (outcome.reason === CONCURRENT_CHECKPOINT_REASON) {
+          // Another connection held the checkpoint lock: the log is being
+          // folded in right now, most often by the store's own background
+          // checkpointer. Handing the checkpoint back to the connection would
+          // meet the same lock on the event loop, so the sweep keeps its own
+          // and waits again after its next batch.
+          logger.debug(
+            'another connection was checkpointing the session store write-ahead log; the sweep waits again after its next batch',
+            { checkpoint: outcome.status, walBytes, durationMs: Math.round(outcome.durationMs) },
+          );
+          return;
+        }
         logger.warn(
           'the background checkpoint of the session store failed; the sweep continues with the connection’s own checkpoints',
           { checkpoint: outcome.status, checkpointReason: outcome.reason, walBytes },

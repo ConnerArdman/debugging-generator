@@ -114,6 +114,7 @@ import type {
 } from '@debuggen/shared';
 import {
   KIND_ATTRIBUTE_KEYS,
+  MAX_PREVIEW_LENGTH,
   MIN_EPOCH_MS,
   REDACTION_MARKER,
   REDACTION_MASK,
@@ -2060,6 +2061,111 @@ describe('redaction wiring and the store contract', () => {
     expect(report.persisted).toBe(2);
     expect(insertedRows(h.repo).map((row) => row.tier)).toEqual(['server', 'server']);
     expectFreeTextMaskedEverywhere(h, freeText.id, logged.id);
+  });
+
+  it('drops producer-sent bodies, masks personal data and flags cut previews before the store and the live tail', async () => {
+    // The QA report's relayed payloads (QSA-F04, F05, F06), through the real
+    // redactor: a body attribute, an address, a card number and a labelled
+    // token in free text, and a preview longer than the bound claiming to be
+    // whole.
+    const bodyText = '{"password":"SECRETBODY"}';
+    const address = 'alice' + '@example.test';
+    const longPreview = 'n'.repeat(40) + ' ' + 'lorem ipsum dolor sit amet '.repeat(10);
+    const h = harness();
+    const request = makeRequestIngress('/api/widgets/items', {
+      attributes: {
+        [METHOD_KEY]: 'POST',
+        [URL_KEY]: '/api/widgets/items',
+        [STATUS_KEY]: 200,
+        'http.request.body': bodyText,
+        'http.response.body': bodyText,
+        'http.request.body.size': bodyText.length,
+      },
+    });
+    const interaction = makeIngress({
+      attributes: {
+        'event.type': 'click',
+        'target.text': 'Pay with card 4111 1111 1111 1111 token secret-token-123',
+      },
+    });
+    const failure = makeIngress({
+      kind: 'error',
+      name: 'TypeError',
+      status: 'error',
+      attributes: {
+        'error.type': 'TypeError',
+        'error.message': `Order for ${address} failed with card 5555555555554444`,
+        'error.stack': `TypeError: Order for ${address} failed\n    at submitForm (src/a.ts:10:5)`,
+      },
+    });
+    const render = makeRenderIngress({
+      attributes: {
+        component: 'WidgetSummary',
+        phase: 'update',
+        renderCount: 2,
+        changedProps: [
+          { key: 'note', previous: { type: 'string', preview: longPreview, truncated: false } },
+        ],
+      },
+    });
+
+    const report = expectReport(
+      await h.ingest.ingest(BROWSER_CONTEXT, [request, interaction, failure, render]),
+    );
+    expect(report.persisted).toBe(4);
+
+    const stages: readonly (readonly [string, readonly StageRow[]])[] = [
+      ['persisted', insertedRows(h.repo)],
+      ['tailed', h.tail.push.mock.calls[0]?.[1] ?? []],
+    ];
+    for (const [stage, rows] of stages) {
+      const requestRow = rowWithId(rows, request.id);
+      expect(Object.keys(requestRow.attributes), `${stage} body keys`).not.toContain(
+        'http.request.body',
+      );
+      expect(Object.keys(requestRow.attributes), `${stage} body keys`).not.toContain(
+        'http.response.body',
+      );
+      expect(requestRow.attributes['http.request.body.size'], `${stage} body size`).toBe(
+        bodyText.length,
+      );
+      expect(requestRow.redacted, `${stage} dropped paths`).toEqual(
+        expect.arrayContaining(['http.request.body', 'http.response.body']),
+      );
+
+      expect(rowWithId(rows, interaction.id).attributes['target.text'], stage).toBe(
+        `Pay with card ${REDACTION_MARKER} token ${REDACTION_MARKER}`,
+      );
+      const failureRow = rowWithId(rows, failure.id);
+      expect(failureRow.attributes['error.message'], stage).toBe(
+        `Order for ${REDACTION_MARKER} failed with card ${REDACTION_MARKER}`,
+      );
+      expect(failureRow.attributes['error.stack'], stage).toBe(
+        `TypeError: Order for ${REDACTION_MARKER} failed\n    at submitForm (src/a.ts:10:5)`,
+      );
+
+      const [entry] = rowWithId(rows, render.id).attributes.changedProps as {
+        previous: { preview: string; truncated: boolean };
+      }[];
+      expect(Array.from(entry?.previous.preview ?? ''), `${stage} preview`).toHaveLength(
+        MAX_PREVIEW_LENGTH,
+      );
+      expect(entry?.previous.truncated, `${stage} truncated flag`).toBe(true);
+    }
+
+    for (const text of [
+      JSON.stringify(h.repo.calls),
+      JSON.stringify(h.repo.returned),
+      JSON.stringify(h.tail.push.mock.calls),
+    ]) {
+      for (const leak of ['SECRETBODY', address, '1111 1111', '5555555555554444', 'secret-token']) {
+        expect(text).not.toContain(leak);
+      }
+    }
+    // Already redacted: a fixed point of the redactor, as every stored row is.
+    for (const row of insertedRows(h.repo)) {
+      expect(redactEvent(row)).toEqual(row);
+    }
   });
 
   it('preserves fractional epoch-millisecond startTime and duration exactly, end to end', async () => {

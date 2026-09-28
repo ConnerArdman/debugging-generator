@@ -6,13 +6,17 @@
  *    is proven product text, and the body's `ref` names the boundary's local
  *    records — the closed `warn` record and, at `debug`, the redacted
  *    diagnostic twin (CWE-209, CWE-532).
- * 2. **The response-header policy (CWE-693).** Every reply — success, each
- *    refusal, `404`, `5xx`, the `503` after close, the body guard's and the
- *    verifier's replacements, an immutable-headers reply, `HEAD`, and the Node
- *    listener's own fallbacks over a real socket — carries
- *    `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and none
- *    carries `Access-Control-Allow-Origin` (so no web page can read a reply) or
- *    a `Server` banner.
+ * 2. **The response-header policy (CWE-693, CWE-1021).** Every reply —
+ *    success, each refusal, `404`, `5xx`, the `503` after close, the body
+ *    guard's and the verifier's replacements, an immutable-headers reply,
+ *    `HEAD`, and the Node listener's own fallbacks over a real socket —
+ *    carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+ *    `X-Frame-Options: DENY` and
+ *    `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`,
+ *    and none carries `Access-Control-Allow-Origin` (so no web page can read a
+ *    reply), a `Server` banner or an `X-Powered-By` banner. The expected
+ *    values are literals, not the module's constant, so a change to the policy
+ *    has to be made here too.
  * 3. **Every reply names its ref.** Every reply carries `X-Debuggen-Ref`; a
  *    failure body that satisfies protocol's error schema carries the same
  *    value as `ref` — added to a route's or the access boundary's body that
@@ -296,20 +300,26 @@ const WEB_ORIGIN = 'https://attacker.example';
 /** A body longer than `pair.complete`'s ceiling (`MAX_PAIR_REQUEST_BODY_BYTES`, 4 KiB). */
 const OVERSIZED_BODY = `{"code":"${'A'.repeat(8 * 1024)}"}`;
 
-/** The headers the policy fixes, and the two it forbids, as one reply carries them. */
+/** The headers the policy fixes, and the three it forbids, as one reply carries them. */
 interface PolicyHeaders {
   readonly contentTypeOptions: string | null;
   readonly cacheControl: string | null;
+  readonly frameOptions: string | null;
+  readonly contentSecurityPolicy: string | null;
   readonly allowOrigin: string | null;
   readonly server: string | null;
+  readonly poweredBy: string | null;
 }
 
 /** What every reply of the service must carry. */
 const EXPECTED_POLICY: PolicyHeaders = {
   contentTypeOptions: 'nosniff',
   cacheControl: 'no-store',
+  frameOptions: 'DENY',
+  contentSecurityPolicy: "default-src 'none'; frame-ancestors 'none'",
   allowOrigin: null,
   server: null,
+  poweredBy: null,
 };
 
 /** Reads the policy headers from a WHATWG reply or from a Node client's parsed reply. */
@@ -324,8 +334,11 @@ function policyOf(headers: Headers | IncomingHttpHeaders): PolicyHeaders {
   return {
     contentTypeOptions: read('x-content-type-options'),
     cacheControl: read('cache-control'),
+    frameOptions: read('x-frame-options'),
+    contentSecurityPolicy: read('content-security-policy'),
     allowOrigin: read('access-control-allow-origin'),
     server: read('server'),
+    poweredBy: read('x-powered-by'),
   };
 }
 

@@ -43,6 +43,14 @@
  * described as {@link NOT_AVAILABLE_LABEL}, never as the measured `0.00 ms` —
  * the fastest call of the capture — that the drawn value would read as.
  *
+ * "Direction controls in captured text" holds the one change display makes to
+ * a captured value: a Unicode direction control in a route, a lineage
+ * candidate or an unresolved parent's id is printed as its visible escape
+ * (`\u202E`) in the label, the row's accessible name and its description —
+ * never raw, never as markup — while the selection a row raises still carries
+ * the raw event id. Text without a control is untouched, so the byte
+ * comparisons below still hold.
+ *
  * ## The privacy cases, and why they are byte-comparisons
  *
  * A redacted URL and a parameterized statement arrive in their final display
@@ -142,6 +150,7 @@ import { httpStatusColorVar, kindColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
   collapseWhitespace,
+  containsDirectionControl,
   formatBytes,
   formatCount,
   formatDuration,
@@ -5743,5 +5752,109 @@ describe('Waterfall full values', () => {
     await user.keyboard('{ArrowRight}');
     expect(drawnRows()).toHaveLength(3);
     expect(drawnRows()[0]?.getAttribute('aria-expanded')).toBe('true');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * The QA report's payload — an escaped script tag behind a right-to-left
+ * override, which a browser draws backwards while `textContent` still holds the
+ * logical string — as a server request's matched route, beside a lineage
+ * candidate and an unresolved parent id that carry the same pair. Written with
+ * escapes, never with the characters.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A matched route carrying an override and its pop around escaped markup. */
+const BIDI_ROUTE = '/qa/\u202E</td><script>alert(7)</script>\u202C';
+
+/** That route as it must display: both controls as their printable escapes. */
+const BIDI_ROUTE_SHOWN = '/qa/\\u202E</td><script>alert(7)</script>\\u202C';
+
+/** The other candidate parent the attribution recorded, and how it must display. */
+const BIDI_CANDIDATE = '\u202Ecandidate\u202C';
+const BIDI_CANDIDATE_SHOWN = '\\u202Ecandidate\\u202C';
+
+/** The parent the re-attached call named, and how it must display. */
+const BIDI_PARENT = '\u202Eparent\u202C';
+const BIDI_PARENT_SHOWN = '\\u202Eparent\\u202C';
+
+/** The call's event id, carrying an override that must reach the host raw. */
+const BIDI_EVENT_ID = 'event-\u202Ewaterfall-0040';
+
+/** A re-attached server request with an ambiguous attribution, every captured string hostile. */
+const BIDI_SERVER_EVENT = makeEvent({
+  id: BIDI_EVENT_ID,
+  spanId: spanIdFor(40),
+  parentSpanId: spanIdFor(41),
+  kind: 'http.server',
+  tier: 'server',
+  name: 'example.server-request',
+  startTime: BASE_START_MS,
+  duration: 300,
+  attributes: {
+    'http.method': REQUEST_METHOD,
+    'http.route': BIDI_ROUTE,
+    'http.status_code': 200,
+    lineageAmbiguous: true,
+    lineageCandidates: [BIDI_CANDIDATE],
+    orphaned: true,
+    orphanedParentSpanId: BIDI_PARENT,
+  },
+});
+
+/**
+ * Asserts nothing in the document displays a raw direction control — not its
+ * text, which includes every description bubble, and not a `title` or
+ * `aria-label` — and that the payload's escaped markup never became an element.
+ */
+function expectNothingReorders(): void {
+  const root = document.body;
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of Array.from(root.querySelectorAll('*'))) {
+    for (const attribute of ['title', 'aria-label']) {
+      const value = element.getAttribute(attribute);
+      if (value !== null) {
+        expect(containsDirectionControl(value)).toBe(false);
+      }
+    }
+  }
+  expect(root.querySelector('script')).toBeNull();
+}
+
+describe('Waterfall direction controls in captured text', () => {
+  it('labels, names and describes a hostile call in its logical order, and selects it raw', async () => {
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([BIDI_SERVER_EVENT]).provider,
+      actions: spies.actions,
+    });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The visible label is the revealed route, and the row's accessible name
+    // opens with it and names the other candidate and the unresolved parent,
+    // revealed too.
+    const row = rowLabelled(BIDI_ROUTE_SHOWN);
+    const name = row.getAttribute('aria-label') ?? '';
+    expect(name.startsWith(`${BIDI_ROUTE_SHOWN} · `)).toBe(true);
+    expect(name).toContain(`other candidates: ${BIDI_CANDIDATE_SHOWN}`);
+    expect(name).toContain(`the parent ${BIDI_PARENT_SHOWN} of this call never arrived`);
+
+    expectNothingReorders();
+
+    // Activating the row hands the host the raw coordinates of its record.
+    await user.click(row);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_EVENT_ID,
+      spanId: BIDI_SERVER_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(rowLabelled(BIDI_ROUTE_SHOWN).getAttribute('aria-selected')).toBe('true');
   });
 });

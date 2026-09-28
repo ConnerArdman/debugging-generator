@@ -92,6 +92,7 @@
     "DashboardPlaceholder",
     "DispatchEta",
     "DispatchEtaContext",
+    "EchoedSearchTerm",
     "FormField",
     "FormatFit",
     "FreightDestination",

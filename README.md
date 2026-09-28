@@ -14,7 +14,7 @@ Evidence and inference are kept apart: every **Observed** statement cites captur
 
 - **Not cross-browser.** Chrome only, through a Manifest V3 DevTools extension.
 - **Not a bug fixer.** It shows evidence and suggests likely causes; it never edits your code to fix them.
-- **Not a hosted service.** Everything runs on your machine: the service binds to `127.0.0.1`, and with the `deterministic` model provider nothing leaves the machine at all. There is no cloud component.
+- **Not a hosted service.** Everything runs on your machine: the service binds to `127.0.0.1`, and with the `deterministic` model provider nothing Debug Generator captures or reads leaves the machine. Your project's dev server may still make its framework's own requests, such as Next.js's update check and telemetry ([what may leave the machine](docs/SECURITY.md#4-what-may-leave-the-machine-and-when)). There is no cloud component.
 - **Not in a store.** It is not published to the Chrome Web Store or the VS Code Marketplace; you load the Chrome extension unpacked and install the VS Code extension from this checkout or from a locally packaged VSIX.
 - **Not production tracing.** One developer, one local project, one question at a time.
 

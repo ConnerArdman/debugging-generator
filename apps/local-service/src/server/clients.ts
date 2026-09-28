@@ -43,8 +43,14 @@
  *
  * AAP §0.2.3: one tab binds to at most one session, one session accepts one
  * bound tab at a time, and a second bind replaces the first and is announced.
- * The registry holds the **live** view used for routing, keyed by tab and by
- * session; the durable row lives in `store/sessions-repo.ts`. A binding is
+ * The registry holds the **live** view used for routing, keyed by holder and
+ * tab and by session; the durable row lives in `store/sessions-repo.ts`, keyed
+ * the same way. A Chrome tab id is unique only within one browser profile, so
+ * two paired extensions inspect tabs whose ids collide: each credential's
+ * binding of a tab id is its own entry, and one browser binding its tab 7
+ * never displaces another browser's binding of *its* tab 7. The cardinality
+ * rule reads accordingly — a credential's tab binds to at most one session,
+ * and a session accepts one bound tab whoever holds it. A binding is
  * recorded against the credential that made it (`boundBy`, the principal's
  * `tokenHash`, the same field `./auth.ts`'s `requireBoundSession` checks) and
  * not against a socket: the Chrome MV3 service worker suspends after roughly
@@ -60,10 +66,23 @@
  * `tabId` to be that tab.
  *
  * When a bind displaces another binding, or a tab is unbound, the released
- * binding's connection stays eligible for **binding announcements** about that
+ * binding's connection stays eligible for **release announcements** about that
  * session for a short window ({@link RELEASED_BINDING_NOTICE_WINDOW_MS}), so
  * `routes/binding.ts` can tell the displaced panel it lost the binding with an
  * ordinary `broadcastToKinds` — and for nothing else.
+ *
+ * A binding announcement (`session.bound`) is delivered by what its `reason`
+ * says happened, never to every connection that ever held the session:
+ *
+ * | Announcement | Reaches | Never reaches |
+ * | --- | --- | --- |
+ * | a release — `replaced`, `unbound`, `origin-changed` | the session's editors and the connections of its released-binding notices | the connection carrying the session's current binding: a release is never about the binding that stands (a credential that moved the session to another of its own tabs still hears it, through its notice) |
+ * | an establishment — `bound`, `navigated` | the session's editors and the connection carrying its current binding | a released binding's connection, whose Chrome worker would otherwise record the new binding as its own |
+ *
+ * That is what makes a second bind of the **same tab and session by another
+ * credential** (AAP §0.2.3, "a second bind replaces the first and is
+ * announced") read correctly on both sides: the displaced credential hears
+ * exactly `replaced` and nothing after it, and the new holder hears `bound`.
  *
  * ## Tabs awaiting a session
  *
@@ -75,7 +94,8 @@
  * {@link ClientRegistry.awaitSession} when an origin bind finds no session, when
  * the tab's session ended and the worker unbound it, and when the tab left its
  * session's origin for another. The record holds the tab, the serialized
- * HTTP(S) origin of its document and the announcing credential — never a URL.
+ * HTTP(S) origin of its document and the announcing credential — never a URL —
+ * and is keyed by that credential and the tab, as a binding is.
  *
  * When a session is created, its `session.created` also reaches the connection
  * carrying every tab awaiting that session's dev-server origin (and nothing
@@ -310,6 +330,18 @@ const DROP_REASONS: ReadonlySet<BindingReason> = new Set<BindingReason>([
 ]);
 
 /**
+ * The reasons of a **release** announcement: a `session.bound` telling a
+ * binding's holder that its binding ended — taken over by another bind, or
+ * dropped. Every other member of the vocabulary (`bound`, `navigated`) is an
+ * establishment: the binding it names stands. The split decides who a binding
+ * announcement reaches (see "Bindings: live view, not durable record").
+ */
+const RELEASE_REASONS: ReadonlySet<BindingReason> = new Set<BindingReason>([
+  REASON_REPLACED,
+  ...DROP_REASONS,
+]);
+
+/**
  * Resolves the message type whose payload schema is `schema`, by object
  * identity in protocol's registry.
  *
@@ -336,7 +368,10 @@ const SERVER_AGENT_CONFIG_TYPE = messageTypeForSchema(
   'server-agent config',
 );
 
-/** The binding announcement: the only frame a released binding's connection may still receive. */
+/**
+ * The binding announcement. A released binding's connection may still receive
+ * one whose reason is a release ({@link RELEASE_REASONS}), and nothing else.
+ */
 const BINDING_ANNOUNCEMENT_TYPE = messageTypeForSchema(
   sessionBoundPayloadSchema,
   'binding announcement',
@@ -457,7 +492,11 @@ export interface ClientFilter {
    * project scope and never match.
    */
   readonly projectRoot?: string | undefined;
-  /** Clients that announced this tab, or that carry its binding. */
+  /**
+   * Clients that announced this tab, or that carry their own credential's
+   * binding of it — never a connection carrying another browser's tab that
+   * merely has the same id.
+   */
   readonly tabId?: number | undefined;
   /** Clients a fan-out for this session would reach. */
   readonly sessionId?: string | undefined;
@@ -518,16 +557,24 @@ export interface BindTabOutcome extends BindingChange {
 export interface UpdateTabUrlInput {
   readonly tabId: number;
   readonly url: string;
-  /** When given and a DevTools principal, it must be the credential that made the binding. */
-  readonly principal?: Principal | undefined;
+  /**
+   * The DevTools principal whose binding of the tab navigated. A binding is
+   * found by its credential and its tab together — a tab id alone may name
+   * another browser's tab — so the principal is required, and any other role
+   * is refused.
+   */
+  readonly principal: Principal;
 }
 
 /** What {@link ClientRegistry.unbindTab} is given besides the tab id. */
 export interface UnbindTabOptions {
   /** Why the binding ends; a drop reason from `BINDING_REASONS`. Defaults to the plain unbind. */
   readonly reason?: BindingReason | undefined;
-  /** When given and a DevTools principal, it must be the credential that made the binding. */
-  readonly principal?: Principal | undefined;
+  /**
+   * The DevTools principal whose binding of the tab ends. Required for the
+   * reason {@link UpdateTabUrlInput.principal} gives; any other role is refused.
+   */
+  readonly principal: Principal;
 }
 
 /** What {@link ClientRegistry.awaitSession} is given. */
@@ -772,8 +819,10 @@ export interface ClientRegistry {
 
   /**
    * Binds a tab to a session for the binding principal, enforcing AAP §0.2.3's
-   * cardinality: a previous binding of the tab and a previous tab of the
-   * session are displaced and returned, each with the reason to announce.
+   * cardinality: the principal's own previous binding of the tab and the
+   * session's previous tab (whoever held it) are displaced and returned, each
+   * with the reason to announce. Another credential's binding of the same tab
+   * id is another browser's tab and stays, unless it held this very session.
    * Re-binding the same tab to the same session with the same credential (a
    * service-worker reconnect re-announcing its bindings) is idempotent and
    * displaces nothing.
@@ -788,25 +837,48 @@ export interface ClientRegistry {
    * Keeps a binding across a same-origin navigation and records the new URL.
    * Origin comparison belongs to `routes/binding.ts`.
    *
-   * @returns The binding with reason `navigated`; `TAB_NOT_BOUND` when the tab
-   * is not bound (or, for a DevTools principal, not bound by it).
+   * @returns The binding with reason `navigated`; `TAB_NOT_BOUND` when the
+   * principal's credential holds no binding of the tab; `UNAUTHORIZED` for a
+   * non-DevTools principal.
    */
   updateTabUrl(input: UpdateTabUrlInput): Result<BindingChange, DebuggenError>;
 
   /**
-   * Drops a tab's binding. Idempotent: an unbound tab yields `ok(undefined)`.
+   * Drops the principal's binding of a tab. Idempotent: a tab the principal's
+   * credential holds no binding of yields `ok(undefined)` — another browser's
+   * binding of the same tab id is never reached.
    *
    * @returns The dropped binding with its reason; `PROTOCOL_INVALID_MESSAGE`
-   * for a reason that does not end a binding; `TAB_NOT_BOUND` when a DevTools
-   * principal is given that did not make the binding.
+   * for a reason that does not end a binding; `UNAUTHORIZED` for a
+   * non-DevTools principal.
    */
   unbindTab(
     tabId: number,
-    options?: UnbindTabOptions,
+    options: UnbindTabOptions,
   ): Result<BindingChange | undefined, DebuggenError>;
 
-  /** The live binding of a tab, or `undefined`. */
-  bindingForTab(tabId: number): TabBindingView | undefined;
+  /**
+   * The live binding of a tab that `principal`'s credential made, or
+   * `undefined` — always, for a principal that is not a DevTools one. A tab id
+   * is unique only within one browser, so another credential's binding of the
+   * same id is never answered.
+   *
+   * @example
+   * ```ts
+   * const own = clients.bindingForTab(payload.tabId, client.principal);
+   * ```
+   */
+  bindingForTab(tabId: number, principal: Principal): TabBindingView | undefined;
+
+  /**
+   * Whether a live binding of `tabId` exists and none of them was made by
+   * `principal`'s credential: the tab id is in use by other paired browsers
+   * only. What a report about an unbound tab of this id — a committed
+   * navigation, a page-agent readiness report — is refused on, because the
+   * service's readiness evidence is keyed by tab id alone and could not tell
+   * that report from one about the other browser's bound tab.
+   */
+  tabHeldByAnotherCredential(tabId: number, principal: Principal): boolean;
 
   /** The live binding of a session, or `undefined`. */
   bindingForSession(sessionId: string): TabBindingView | undefined;
@@ -817,8 +889,9 @@ export interface ClientRegistry {
    * Records that a tab a DevTools credential announced awaits a session for
    * `origin`, so the next session created for that dev-server origin reaches
    * the connection carrying the tab with its `session.created` (see "Tabs
-   * awaiting a session" in the module overview). Replaces the tab's previous
-   * record; the oldest record is evicted past {@link MAX_AWAITING_TABS}.
+   * awaiting a session" in the module overview). Replaces the previous record
+   * of the tab by the same credential — another browser's record of a tab with
+   * the same id stays; the oldest record is evicted past {@link MAX_AWAITING_TABS}.
    *
    * @returns `UNAUTHORIZED` for a non-DevTools principal or a `clientId` that
    * is not a connection of that credential; `PROTOCOL_INVALID_MESSAGE` for a
@@ -827,15 +900,19 @@ export interface ClientRegistry {
   awaitSession(input: AwaitSessionInput): Result<void, DebuggenError>;
 
   /**
-   * Ends a tab's awaiting record — its DevTools closed. With a DevTools
-   * `principal`, only a record that credential made is ended.
+   * Ends the awaiting record of a tab that `principal`'s credential announced
+   * — its DevTools closed. Another credential's record of the same tab id is
+   * never ended; a non-DevTools principal ends nothing.
    *
    * @returns Whether a record was ended.
    */
-  forgetAwaitingTab(tabId: number, principal?: Principal): boolean;
+  forgetAwaitingTab(tabId: number, principal: Principal): boolean;
 
-  /** The origin a tab awaits a session for, or `undefined` when it awaits none. */
-  awaitedOriginForTab(tabId: number): string | undefined;
+  /**
+   * The origin a tab `principal`'s credential announced awaits a session for,
+   * or `undefined` when that credential's tab awaits none.
+   */
+  awaitedOriginForTab(tabId: number, principal: Principal): string | undefined;
 
   /**
    * Offers a session that already serves the origin a tab awaits — one created
@@ -845,14 +922,19 @@ export interface ClientRegistry {
    * nothing else. The worker then announces the tab with `session.bind`, as
    * for a session created afterwards.
    *
+   * @param tabId The awaiting tab.
+   * @param principal The credential that announced it: a record is found by
+   * credential and tab together.
+   * @param message The `session.created` frame to offer.
    * @returns The delivery receipt; `PROTOCOL_INVALID_MESSAGE` for any frame
    * other than a `session.created` whose session serves the awaited origin;
-   * `TAB_NOT_BOUND` when the tab awaits no session; `TRANSPORT_DISCONNECTED`
-   * when the registry is closed or no connection of the announcing credential
-   * is online.
+   * `TAB_NOT_BOUND` when that credential's tab awaits no session;
+   * `TRANSPORT_DISCONNECTED` when the registry is closed or no connection of
+   * the announcing credential is online.
    */
   offerSessionToAwaitingTab(
     tabId: number,
+    principal: Principal,
     message: ProtocolMessage,
   ): Result<DeliveryReceipt, DebuggenError>;
 
@@ -1156,6 +1238,56 @@ function embeddedSessionRecord(
   };
 }
 
+/** What a binding announcement says happened to the binding it names. */
+type AnnouncementKind = 'release' | 'establishment';
+
+/**
+ * Classifies a binding announcement by its payload's `reason`: a release
+ * ({@link RELEASE_REASONS}) or an establishment. `undefined` for any other
+ * frame.
+ *
+ * A payload without a `reason` is an establishment, as protocol defines it. A
+ * `session.bound` frame whose payload does not parse — which protocol's
+ * encoder would refuse anyway — is classified as an establishment too, the
+ * kind that never reaches a released binding's connection: an unreadable frame
+ * must not widen who hears it.
+ */
+function announcementKindOf(message: ProtocolMessage): AnnouncementKind | undefined {
+  if (message.type !== BINDING_ANNOUNCEMENT_TYPE) {
+    return undefined;
+  }
+  const parsed = sessionBoundPayloadSchema.safeParse(message.payload);
+  const reason = parsed.success ? parsed.data.reason : undefined;
+  return reason !== undefined && RELEASE_REASONS.has(reason) ? 'release' : 'establishment';
+}
+
+/**
+ * Separates the two halves of a {@link heldTabKey}. A credential digest is
+ * hex text and a tab id is decimal, so neither can contain it.
+ */
+const HELD_TAB_KEY_SEPARATOR = '\u0000';
+
+/**
+ * The key of a live binding and of a tab awaiting a session: the `tokenHash`
+ * of the DevTools credential that holds it, and the tab id. A Chrome tab id is
+ * unique only within one browser, so two paired browsers inspect tabs whose
+ * ids collide; keyed by holder and tab together, each browser's tab 7 is its
+ * own entry and never displaces the other's (see "Bindings: live view, not
+ * durable record").
+ *
+ * Exported so `routes/binding.ts` keys its per-tab page-agent document state
+ * the same way. The key carries a credential digest: it is compared and used
+ * as a map key, never logged.
+ *
+ * @example
+ * ```ts
+ * heldTabKey(principal.tokenHash, 7); // one entry per credential for tab 7
+ * ```
+ */
+export function heldTabKey(holder: string, tabId: number): string {
+  return `${holder}${HELD_TAB_KEY_SEPARATOR}${String(tabId)}`;
+}
+
 /**
  * The serialized HTTP(S) origin of a URL, or `undefined` for one that does not
  * parse or whose origin is opaque — the comparison `routes/binding.ts` matches
@@ -1283,12 +1415,16 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   const byTab = new Map<number, Set<string>>();
   const bySession = new Map<string, Set<string>>();
   const byCredential = new Map<string, Set<string>>();
-  const bindingsByTab = new Map<number, BindingEntry>();
-  const tabBySession = new Map<string, number>();
+  /** Live bindings by {@link heldTabKey}: one per credential and tab. */
+  const bindingsByHeldTab = new Map<string, BindingEntry>();
+  /** Each bound session's {@link heldTabKey}: one bound tab per session, whoever holds it. */
+  const heldTabBySession = new Map<string, string>();
+  /** The credentials holding a live binding of each tab id, for {@link tabHeldByAnotherCredential}. */
+  const holdersByTab = new Map<number, Set<string>>();
   const sessionProjects = new Map<string, string>();
   const released = new Map<string, ReleasedNotice[]>();
-  /** Tabs awaiting a session, oldest record first (insertion order). */
-  const awaitingByTab = new Map<number, AwaitingTab>();
+  /** Tabs awaiting a session by {@link heldTabKey}, oldest record first (insertion order). */
+  const awaitingByHeldTab = new Map<string, AwaitingTab>();
 
   let closed = false;
   let totalDelivered = 0;
@@ -1346,7 +1482,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       removeFromIndex(bySession, sessionId, entry.id);
     }
     entry.attached.clear();
-    for (const binding of bindingsByTab.values()) {
+    for (const binding of bindingsByHeldTab.values()) {
       if (binding.recipientId === entry.id) {
         binding.recipientId = undefined;
       }
@@ -1356,12 +1492,12 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     // its new connection before the old one is swept, and re-announces its
     // tabs on connect either way.
     const credentialLive = byCredential.has(entry.principal.tokenHash);
-    for (const [tabId, awaiting] of [...awaitingByTab]) {
+    for (const [key, awaiting] of [...awaitingByHeldTab]) {
       if (awaiting.awaitedBy !== entry.principal.tokenHash) {
         continue;
       }
       if (!credentialLive) {
-        awaitingByTab.delete(tabId);
+        awaitingByHeldTab.delete(key);
       } else if (awaiting.recipientId === entry.id) {
         awaiting.recipientId = undefined;
       }
@@ -1371,8 +1507,30 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   /* ---- bindings ---- */
 
   function bindingOfSession(sessionId: string): BindingEntry | undefined {
-    const tabId = tabBySession.get(sessionId);
-    return tabId === undefined ? undefined : bindingsByTab.get(tabId);
+    const key = heldTabBySession.get(sessionId);
+    return key === undefined ? undefined : bindingsByHeldTab.get(key);
+  }
+
+  /**
+   * The live binding of `tabId` that `principal`'s credential made, or
+   * `undefined` — also for a principal that is not a DevTools one, which
+   * never holds a binding. Never another credential's binding of the same tab
+   * id: that is another browser's tab.
+   */
+  function heldBinding(tabId: number, principal: Principal): BindingEntry | undefined {
+    return principal.role === KIND_DEVTOOLS
+      ? bindingsByHeldTab.get(heldTabKey(principal.tokenHash, tabId))
+      : undefined;
+  }
+
+  /**
+   * Whether a live binding of `tabId` exists and none of them is
+   * `principal`'s credential's: the tab id is held by other paired browsers
+   * only (see {@link ClientRegistry.tabHeldByAnotherCredential}).
+   */
+  function tabHeldByAnotherCredential(tabId: number, principal: Principal): boolean {
+    const holders = holdersByTab.get(tabId);
+    return holders !== undefined && !holders.has(principal.tokenHash);
   }
 
   /**
@@ -1435,21 +1593,26 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     return Object.freeze(recipientId === undefined ? base : { ...base, recipientId });
   }
 
+  /** Indexes a binding by its holder and tab, by its session, and among its tab id's holders. */
   function setBinding(binding: BindingEntry): void {
-    bindingsByTab.set(binding.tabId, binding);
-    tabBySession.set(binding.sessionId, binding.tabId);
+    const key = heldTabKey(binding.boundBy, binding.tabId);
+    bindingsByHeldTab.set(key, binding);
+    heldTabBySession.set(binding.sessionId, key);
+    addToIndex(holdersByTab, binding.tabId, binding.boundBy);
   }
 
   /**
-   * Removes a binding from both binding indices and leaves a released notice,
+   * Removes a binding from every binding index and leaves a released notice,
    * so the binding's connection can still be told about the change.
    */
   function releaseBinding(binding: BindingEntry, now: number): void {
-    if (bindingsByTab.get(binding.tabId) === binding) {
-      bindingsByTab.delete(binding.tabId);
+    const key = heldTabKey(binding.boundBy, binding.tabId);
+    if (bindingsByHeldTab.get(key) === binding) {
+      bindingsByHeldTab.delete(key);
+      removeFromIndex(holdersByTab, binding.tabId, binding.boundBy);
     }
-    if (tabBySession.get(binding.sessionId) === binding.tabId) {
-      tabBySession.delete(binding.sessionId);
+    if (heldTabBySession.get(binding.sessionId) === key) {
+      heldTabBySession.delete(binding.sessionId);
     }
     if (releasedNoticeWindowMs === 0) {
       return;
@@ -1499,7 +1662,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   function rememberSessionProject(sessionId: string, root: string): void {
     if (!sessionProjects.has(sessionId) && sessionProjects.size >= MAX_TRACKED_SESSIONS) {
       for (const candidate of sessionProjects.keys()) {
-        if (!tabBySession.has(candidate) && !bySession.has(candidate)) {
+        if (!heldTabBySession.has(candidate) && !bySession.has(candidate)) {
           sessionProjects.delete(candidate);
           break;
         }
@@ -1607,7 +1770,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       return NO_IDS;
     }
     const sessions = new Set<string>();
-    for (const binding of bindingsByTab.values()) {
+    for (const binding of bindingsByHeldTab.values()) {
       if (binding.boundBy === entry.principal.tokenHash) {
         sessions.add(binding.sessionId);
       }
@@ -1846,6 +2009,12 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
    * Both carry only the sender's own frame id, so admitting them discloses
    * nothing about any session. Every other connection receives a session-less
    * frame unconditionally below.
+   *
+   * A DevTools connection receives a session's frame when its credential holds
+   * the session's binding. A credential whose binding of the session was just
+   * released may receive a **release** announcement about it and nothing else
+   * — never an establishment, which its Chrome worker would record as a binding
+   * of its own.
    */
   function mayReceiveDirect(entry: ClientEntry, message: ProtocolMessage, now: number): boolean {
     const principal = entry.principal;
@@ -1865,7 +2034,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     if (principal.role === KIND_DEVTOOLS) {
       return (
         credentialBindsSession(principal.tokenHash, sessionId) ||
-        (message.type === BINDING_ANNOUNCEMENT_TYPE &&
+        (announcementKindOf(message) === 'release' &&
           credentialReleasedSession(principal.tokenHash, sessionId, now))
       );
     }
@@ -1902,9 +2071,11 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   }
 
   /**
-   * Resolves a session's fan-out for `kinds`: its editors, the connection
-   * carrying its bound tab (which also relays for the page agent), and — for a
-   * binding announcement only — the connections whose binding it just released.
+   * Resolves a session's fan-out for `kinds`: its editors; the connection
+   * carrying its bound tab (which also relays for the page agent), except for
+   * a release announcement; and — for a release announcement only — the
+   * connections whose binding of the session was just released. See the
+   * delivery table in "Bindings: live view, not durable record".
    */
   function sessionRecipients(
     sessionId: string,
@@ -1919,6 +2090,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         recipients.push(entry);
       }
     };
+    const announcement = announcementKindOf(message);
 
     if (kinds.has(KIND_VSCODE)) {
       for (const id of idsOfKind(KIND_VSCODE)) {
@@ -1928,7 +2100,10 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         }
       }
     }
-    if (kinds.has(KIND_DEVTOOLS) || kinds.has(KIND_AGENT)) {
+    // A release is never about the binding that stands, so its holder's
+    // connection is not addressed as the current relay; a credential whose
+    // own binding of the session moved still hears it through its notice.
+    if ((kinds.has(KIND_DEVTOOLS) || kinds.has(KIND_AGENT)) && announcement !== 'release') {
       const binding = bindingOfSession(sessionId);
       if (binding !== undefined) {
         const relay = relayOf(binding);
@@ -1944,7 +2119,9 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         }
       }
     }
-    if (kinds.has(KIND_DEVTOOLS) && message.type === BINDING_ANNOUNCEMENT_TYPE) {
+    // Only a release reaches a released binding's connection: an
+    // establishment of the session's new binding is the new holder's alone.
+    if (kinds.has(KIND_DEVTOOLS) && announcement === 'release') {
       for (const notice of liveNotices(sessionId, clock())) {
         const relay = relayForCredential(notice.boundBy, notice.recipientId);
         if (relay !== undefined) {
@@ -1967,7 +2144,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
    */
   function awaitingRelays(message: ProtocolMessage): ClientEntry[] {
     const record = embeddedSessionRecord(message);
-    if (record === undefined || awaitingByTab.size === 0) {
+    if (record === undefined || awaitingByHeldTab.size === 0) {
       return [];
     }
     const origin = httpOriginOf(record.devServerUrl);
@@ -1976,7 +2153,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     }
     const relays: ClientEntry[] = [];
     let tabs = 0;
-    for (const awaiting of awaitingByTab.values()) {
+    for (const awaiting of awaitingByHeldTab.values()) {
       if (awaiting.origin !== origin) {
         continue;
       }
@@ -2048,7 +2225,9 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       }
     }
     if (tabId !== undefined) {
-      const binding = bindingsByTab.get(tabId);
+      // The connection's own credential's binding of the tab id, never
+      // another browser's binding of a tab with the same id.
+      const binding = heldBinding(tabId, entry.principal);
       const carries = binding !== undefined && relayOf(binding)?.id === entry.id;
       if (entry.tabId !== tabId && !carries) {
         return false;
@@ -2546,15 +2725,15 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       preferredId = sender.id;
     }
     const now = input.boundAt ?? clock();
-    // A bound tab awaits nothing: its session reached it.
-    awaitingByTab.delete(tabId);
+    // A bound tab awaits nothing: its session reached it. Only the binder's
+    // own record ends — another browser's tab with the same id still awaits.
+    awaitingByHeldTab.delete(heldTabKey(principal.tokenHash, tabId));
 
-    const current = bindingsByTab.get(tabId);
-    if (
-      current !== undefined &&
-      current.sessionId === sessionId &&
-      current.boundBy === principal.tokenHash
-    ) {
+    // The binder's own binding of the tab id. Another credential's binding of
+    // the same id is another browser's tab and is displaced only when it holds
+    // this very session (below).
+    const current = heldBinding(tabId, principal);
+    if (current !== undefined && current.sessionId === sessionId) {
       // A re-announcement (for example after a service-worker reconnect): keep
       // the binding, refresh its URL and carrier, displace nothing.
       current.url = url;
@@ -2602,18 +2781,25 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     );
   }
 
-  /** Whether `principal` may change a binding: any non-DevTools caller, or the DevTools credential that made it. */
-  function mayChangeBinding(binding: BindingEntry, principal: Principal | undefined): boolean {
-    return (
-      principal === undefined ||
-      principal.role !== KIND_DEVTOOLS ||
-      principal.tokenHash === binding.boundBy
+  /**
+   * The refusal of a binding change asked for by a principal that can hold no
+   * binding: only the DevTools credential that made a binding changes it, and
+   * it is looked up by that credential and its tab together.
+   */
+  function bindingChangeRefused(): Result<never, DebuggenError> {
+    return failure(
+      'UNAUTHORIZED',
+      'Only the DevTools credential that made a binding changes it.',
+      'bound-tab',
     );
   }
 
   function updateTabUrl(input: UpdateTabUrlInput): Result<BindingChange, DebuggenError> {
-    const binding = bindingsByTab.get(input.tabId);
-    if (binding === undefined || !mayChangeBinding(binding, input.principal)) {
+    if (input.principal.role !== KIND_DEVTOOLS) {
+      return bindingChangeRefused();
+    }
+    const binding = heldBinding(input.tabId, input.principal);
+    if (binding === undefined) {
       return failure('TAB_NOT_BOUND', 'The tab is not bound to a session.', 'bound-tab');
     }
     if (input.url.length === 0 || input.url.length > MAX_BINDING_URL_LENGTH) {
@@ -2633,7 +2819,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
 
   function unbindTab(
     tabId: number,
-    options: UnbindTabOptions = {},
+    options: UnbindTabOptions,
   ): Result<BindingChange | undefined, DebuggenError> {
     const reason = options.reason ?? REASON_UNBOUND;
     if (!DROP_REASONS.has(reason)) {
@@ -2643,12 +2829,14 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         'bound-tab',
       );
     }
-    const binding = bindingsByTab.get(tabId);
+    if (options.principal.role !== KIND_DEVTOOLS) {
+      return bindingChangeRefused();
+    }
+    // The credential's own binding of the tab id: an unbind never reaches
+    // another browser's binding of a tab with the same id.
+    const binding = heldBinding(tabId, options.principal);
     if (binding === undefined) {
       return ok(undefined);
-    }
-    if (!mayChangeBinding(binding, options.principal)) {
-      return failure('TAB_NOT_BOUND', 'The tab is not bound by this credential.', 'bound-tab');
     }
     const change: BindingChange = Object.freeze({ binding: bindingView(binding), reason });
     releaseBinding(binding, clock());
@@ -2696,46 +2884,53 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       }
       recipientId = sender.id;
     }
-    // Re-inserted, so the map's insertion order stays oldest-record-first.
-    awaitingByTab.delete(tabId);
-    while (awaitingByTab.size >= MAX_AWAITING_TABS) {
-      const oldest = awaitingByTab.keys().next();
+    // Keyed by the announcing credential and the tab, so another browser's
+    // tab with the same id keeps its own record. Re-inserted, so the map's
+    // insertion order stays oldest-record-first.
+    const key = heldTabKey(principal.tokenHash, tabId);
+    awaitingByHeldTab.delete(key);
+    while (awaitingByHeldTab.size >= MAX_AWAITING_TABS) {
+      const oldest = awaitingByHeldTab.entries().next();
       if (oldest.done === true) {
         break;
       }
-      awaitingByTab.delete(oldest.value);
+      const [oldestKey, evicted] = oldest.value;
+      awaitingByHeldTab.delete(oldestKey);
+      // The key carries a credential digest: only the evicted tab id is logged.
       log.debug('Evicted the oldest tab awaiting a session to stay within the bound', {
-        tabId: oldest.value,
+        tabId: evicted.tabId,
         limit: MAX_AWAITING_TABS,
       });
     }
-    awaitingByTab.set(tabId, {
+    awaitingByHeldTab.set(key, {
       tabId,
       origin,
       awaitedBy: principal.tokenHash,
       recipientId,
     });
-    log.debug('Tab awaits a session for its origin', { tabId, awaiting: awaitingByTab.size });
+    log.debug('Tab awaits a session for its origin', { tabId, awaiting: awaitingByHeldTab.size });
     return ok(undefined);
   }
 
-  function forgetAwaitingTab(tabId: number, principal?: Principal): boolean {
-    const awaiting = awaitingByTab.get(tabId);
-    if (
-      awaiting === undefined ||
-      (principal !== undefined &&
-        principal.role === KIND_DEVTOOLS &&
-        principal.tokenHash !== awaiting.awaitedBy)
-    ) {
+  /** The record of `tabId` that `principal`'s credential announced, or `undefined` (always, for a non-DevTools principal). */
+  function heldAwaitingTab(tabId: number, principal: Principal): AwaitingTab | undefined {
+    return principal.role === KIND_DEVTOOLS
+      ? awaitingByHeldTab.get(heldTabKey(principal.tokenHash, tabId))
+      : undefined;
+  }
+
+  function forgetAwaitingTab(tabId: number, principal: Principal): boolean {
+    if (heldAwaitingTab(tabId, principal) === undefined) {
       return false;
     }
-    awaitingByTab.delete(tabId);
+    awaitingByHeldTab.delete(heldTabKey(principal.tokenHash, tabId));
     log.debug('Tab no longer awaits a session', { tabId });
     return true;
   }
 
   function offerSessionToAwaitingTab(
     tabId: number,
+    principal: Principal,
     message: ProtocolMessage,
   ): Result<DeliveryReceipt, DebuggenError> {
     if (closed) {
@@ -2748,7 +2943,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         'client',
       );
     }
-    const awaiting = awaitingByTab.get(tabId);
+    const awaiting = heldAwaitingTab(tabId, principal);
     if (awaiting === undefined) {
       return failure('TAB_NOT_BOUND', 'The tab awaits no session.', 'client');
     }
@@ -2856,7 +3051,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       clients: clients.size,
       online,
       byKind: Object.freeze(byKindCounts),
-      bindings: bindingsByTab.size,
+      bindings: bindingsByHeldTab.size,
       trackedSessions: sessionProjects.size,
       delivered: totalDelivered,
       dropped: totalDropped,
@@ -2903,11 +3098,12 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     byTab.clear();
     bySession.clear();
     byCredential.clear();
-    bindingsByTab.clear();
-    tabBySession.clear();
+    bindingsByHeldTab.clear();
+    heldTabBySession.clear();
+    holdersByTab.clear();
     sessionProjects.clear();
     released.clear();
-    awaitingByTab.clear();
+    awaitingByHeldTab.clear();
     if (count > 0) {
       log.info('Closed every client connection', { closed: count, code });
     }
@@ -2918,10 +3114,11 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     const count = closeEntries([...clients.values()], code, reason);
     // Every credential that made a binding has just been revoked, so no binding
     // can route again; the re-paired extension re-binds with its new credential.
-    bindingsByTab.clear();
-    tabBySession.clear();
+    bindingsByHeldTab.clear();
+    heldTabBySession.clear();
+    holdersByTab.clear();
     released.clear();
-    awaitingByTab.clear();
+    awaitingByHeldTab.clear();
     log.info('Revoked every client connection', { closed: count, code });
     return count;
   }
@@ -2989,17 +3186,18 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     bindTab,
     updateTabUrl,
     unbindTab,
-    bindingForTab: (tabId) => {
-      const binding = bindingsByTab.get(tabId);
+    bindingForTab: (tabId, principal) => {
+      const binding = heldBinding(tabId, principal);
       return binding === undefined ? undefined : bindingView(binding);
     },
+    tabHeldByAnotherCredential,
     bindingForSession: (sessionId) => {
       const binding = bindingOfSession(sessionId);
       return binding === undefined ? undefined : bindingView(binding);
     },
     awaitSession,
     forgetAwaitingTab,
-    awaitedOriginForTab: (tabId) => awaitingByTab.get(tabId)?.origin,
+    awaitedOriginForTab: (tabId, principal) => heldAwaitingTab(tabId, principal)?.origin,
     offerSessionToAwaitingTab,
     markOffline,
     markOnline,

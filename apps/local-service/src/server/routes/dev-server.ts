@@ -96,7 +96,10 @@
  *   launch started under a then-live credential may therefore complete after
  *   a rotation. Its credential goes into the child's environment, never into
  *   this response, and the rotation's contract is that launched dev servers
- *   are relaunched (AAP §0.5.6).
+ *   are relaunched (AAP §0.5.6) — which the project's next launch does: the
+ *   launcher reuses a running child only while its credential still
+ *   authenticates, and otherwise stops it and answers with a replacement's
+ *   new `pid`.
  *
  * ## What this module does not do
  *

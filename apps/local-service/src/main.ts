@@ -105,7 +105,14 @@
  *     deadlines and a connection cap — so no connection holds a socket
  *     unbounded before the access boundary sees its request (CWE-400); a
  *     connection it refuses is answered by a raw `Connection: close` response
- *     carrying `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+ *     carrying the application's own response-header policy
+ *     (`./server/http.js`'s `RESPONSE_POLICY_HEADERS`):
+ *     `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+ *     `X-Frame-Options: DENY` and
+ *     `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
+ *     The replies Node writes itself before any listener runs — the `417` for
+ *     an unmet `Expect`, the `400` for an HTTP/1.1 request with no `Host` —
+ *     carry the same policy, set on every response from construction.
  *     New connections are admitted at a bounded rate, and those that have sent
  *     no complete request — or idle with none in flight — share a bounded
  *     budget whose oldest member a newcomer evicts, so stalled connections
@@ -232,7 +239,7 @@ import {
   type IncomingMessage,
   type RequestListener,
   type Server,
-  type ServerResponse,
+  ServerResponse,
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { performance } from 'node:perf_hooks';
@@ -326,7 +333,11 @@ import {
   createClientRegistry,
 } from './server/clients.js';
 import type { ClientRegistry } from './server/clients.js';
-import { DEFAULT_REQUEST_BODY_TIMEOUT_MS, createHttpApp } from './server/http.js';
+import {
+  DEFAULT_REQUEST_BODY_TIMEOUT_MS,
+  RESPONSE_POLICY_HEADERS,
+  createHttpApp,
+} from './server/http.js';
 import type { HttpApp } from './server/http.js';
 import {
   createBindingRoutes,
@@ -2549,7 +2560,9 @@ export function regatingReadinessPort(
   return Object.freeze({
     agentReady: async (payload: AgentReadyPayload, client: WsConnectionFacts) => {
       const recorded = await ledger.agentReady(payload, client);
-      const binding = recorded.ok ? bindings.bindingForTab(payload.tabId) : undefined;
+      const binding = recorded.ok
+        ? bindings.bindingForTab(payload.tabId, client.principal)
+        : undefined;
       if (binding !== undefined) {
         void pipeline.regate({ sessionId: binding.sessionId }).then((outcome) => {
           if (!outcome.ok) {
@@ -2873,11 +2886,46 @@ function trackOpenResponses(
 /** The statuses a connection the HTTP server refused is answered with. */
 type ClientErrorStatus = 400 | 408 | 413 | 431;
 
+/** Matches a CR or LF — either would end a header line inside a raw response head. */
+const RAW_HEAD_LINE_BREAK = /[\r\n]/u;
+
+/**
+ * Writes one entry of the application's response-header policy as a raw head
+ * line, its lower-case name in canonical casing — each hyphen-separated word
+ * capitalised, as Node writes the names it sets itself.
+ *
+ * @param name The header's lower-case name.
+ * @param value The header's value.
+ * @returns The line, without its CRLF.
+ * @throws {RangeError} When the name or value holds a CR or LF, which would
+ * split the head. The policy is a constant, so this surfaces a programming
+ * error the moment this module loads, never at a refused connection.
+ *
+ * @example
+ * ```ts
+ * rawPolicyHeaderLine('x-frame-options', 'DENY'); // 'X-Frame-Options: DENY'
+ * ```
+ */
+function rawPolicyHeaderLine(name: string, value: string): string {
+  if (RAW_HEAD_LINE_BREAK.test(name) || RAW_HEAD_LINE_BREAK.test(value)) {
+    throw new RangeError(
+      `The response-policy header ${JSON.stringify(name)} cannot be written into a raw response head.`,
+    );
+  }
+  const canonical = name
+    .split('-')
+    .map((word) => `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
+    .join('-');
+  return `${canonical}: ${value}`;
+}
+
 /**
  * Builds one entry of {@link CLIENT_ERROR_RESPONSES}.
  *
  * @param status The status.
- * @returns The complete response head, with no body.
+ * @returns The complete response head, with no body: the status line,
+ * `Connection: close`, `Content-Length: 0` and one line per header of
+ * `RESPONSE_POLICY_HEADERS`.
  */
 function rawClientErrorResponse(status: ClientErrorStatus): Buffer {
   return Buffer.from(
@@ -2885,8 +2933,9 @@ function rawClientErrorResponse(status: ClientErrorStatus): Buffer {
       `HTTP/1.1 ${String(status)} ${STATUS_CODES[status] ?? 'Error'}`,
       'Connection: close',
       'Content-Length: 0',
-      'Cache-Control: no-store',
-      'X-Content-Type-Options: nosniff',
+      ...Object.entries(RESPONSE_POLICY_HEADERS).map(([name, value]) =>
+        rawPolicyHeaderLine(name, value),
+      ),
       '',
       '',
     ].join('\r\n'),
@@ -2896,10 +2945,12 @@ function rawClientErrorResponse(status: ClientErrorStatus): Buffer {
 
 /**
  * The raw response for each {@link ClientErrorStatus}. Written straight to the
- * socket, below the application, so it carries by hand what the application
- * sets on every response it sends: no body (`Content-Length: 0`), no caching
- * and no content sniffing — and `Connection: close`, because the connection
- * is closed right after it.
+ * socket, below the application, so it carries what the application sets on
+ * every response it sends — `./server/http.js`'s `RESPONSE_POLICY_HEADERS`,
+ * read from that one definition: no caching, no content sniffing, no framing
+ * (`X-Frame-Options: DENY`, CSP `frame-ancestors 'none'`) and CSP
+ * `default-src 'none'` — with no body (`Content-Length: 0`) and
+ * `Connection: close`, because the connection is closed right after it.
  */
 const CLIENT_ERROR_RESPONSES: Readonly<Record<ClientErrorStatus, Buffer>> = Object.freeze({
   400: rawClientErrorResponse(400),
@@ -2907,6 +2958,47 @@ const CLIENT_ERROR_RESPONSES: Readonly<Record<ClientErrorStatus, Buffer>> = Obje
   413: rawClientErrorResponse(413),
   431: rawClientErrorResponse(431),
 });
+
+/**
+ * The `ServerResponse` class the HTTP server builds every response with: the
+ * platform's own, holding `./server/http.js`'s `RESPONSE_POLICY_HEADERS`
+ * from construction.
+ *
+ * Node answers some requests itself, before any `request` listener — and so
+ * before the application's listener can stamp the policy — runs: the `417`
+ * for an `Expect` other than `100-continue`, and the `400` for an HTTP/1.1
+ * request with no `Host` (RFC 9112 §3.2 requires it). Both are written
+ * through a response of this class, and `writeHead` merges the headers set
+ * here into the ones it is passed, so those replies carry the policy too,
+ * with Node's own status and semantics unchanged. The application's replies
+ * set the same values again; a header set twice by name is sent once.
+ *
+ * @example
+ * ```ts
+ * createServer<typeof IncomingMessage, typeof ServerResponse>({
+ *   ServerResponse: PolicyServerResponse,
+ * });
+ * ```
+ */
+class PolicyServerResponse<
+  Request extends IncomingMessage = IncomingMessage,
+> extends ServerResponse<Request> {
+  /**
+   * @param request The request the response answers.
+   * @param options The server's response options (`highWaterMark`,
+   * `rejectNonStandardBodyWrites`), which Node passes as a second argument.
+   */
+  constructor(request: Request, options?: object) {
+    // `@types/node` declares the base constructor with the request alone, but
+    // Node's own takes the options too; they reach it unchanged, so the
+    // server's write buffering and body-write rules are exactly Node's.
+    const platformArguments = [request, options] as unknown as [Request];
+    super(...platformArguments);
+    for (const [name, value] of Object.entries(RESPONSE_POLICY_HEADERS)) {
+      this.setHeader(name, value);
+    }
+  }
+}
 
 /**
  * The status Node answers a refused connection with, by its error code: an
@@ -3228,7 +3320,9 @@ function createConnectionAdmission(
  * control of {@link createConnectionAdmission}, fed by the response tracking
  * of {@link trackOpenResponses}, the raw `clientError` answer of
  * {@link createClientErrorHandler} and the refusal report of
- * {@link reportDroppedConnections}. Upgrade routing is attached by the caller.
+ * {@link reportDroppedConnections}. Every response it builds is a
+ * {@link PolicyServerResponse}, so the replies Node writes itself carry the
+ * response-header policy. Upgrade routing is attached by the caller.
  *
  * Exported so `./main.test.ts` can drive the admission budget with a handler
  * it controls — a slow one — which no route of the composed service offers.
@@ -3244,7 +3338,8 @@ export function createLimitedServer(
   logger: Logger,
 ): Server {
   const open: OpenResponses = new WeakMap();
-  const server = createServer({
+  const server = createServer<typeof IncomingMessage, typeof ServerResponse>({
+    ServerResponse: PolicyServerResponse,
     headersTimeout: limits.headersTimeoutMs,
     requestTimeout: limits.requestTimeoutMs,
     keepAliveTimeout: limits.keepAliveTimeoutMs,

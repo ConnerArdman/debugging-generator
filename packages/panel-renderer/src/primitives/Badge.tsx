@@ -20,9 +20,23 @@
  *
  * ## Tier
  *
- * Tier 1 atom. It imports nothing from this package — only React's types and
- * `clsx` — so no primitive, layout element or visualization component can
- * create an import cycle through it.
+ * Tier 1 atom. From this package it imports only the untrusted-text helper
+ * (`./untrusted-text`, a pure function over strings rather than a component);
+ * beyond it, only React's types and `clsx` — so no primitive, layout element or
+ * visualization component can create an import cycle through it.
+ *
+ * ## What is on screen is the logical text
+ *
+ * A chip's label is often captured text — an event name, a status a producer
+ * reported, a count's noun — and an invisible Unicode direction control in it
+ * (U+202E and its eleven siblings) would draw the glyphs after it in an order
+ * that was never captured. Every string child and icon, and a string `title`
+ * or `aria-label`, is therefore rendered through
+ * `formatUntrustedNode`/`formatUntrustedText`, which print each control as its
+ * visible escape (`\u202E`) and change nothing else. That is not formatting of
+ * the label — a raw number is still printed as that number — but the guarantee
+ * that the glyphs shown are the characters given, in the order given; the
+ * tooltip and the accessible name match the visible label (WCAG 2.5.3).
  *
  * ## The two colouring routes, and why there are two
  *
@@ -116,7 +130,8 @@
  *   component with a handler attached.
  * - `id`, `title`, `aria-label`, `aria-describedby`, `data-*` and every other
  *   HTML attribute pass straight through, because a chip is frequently the
- *   thing a tooltip describes or a test selects.
+ *   thing a tooltip describes or a test selects — a string `title` and
+ *   `aria-label` with their direction controls revealed, `data-*` raw.
  *
  * ## Class-name and custom-property contract declared by this file
  *
@@ -167,6 +182,8 @@
 
 import { clsx } from 'clsx';
 import type { CSSProperties, HTMLAttributes, ReactElement, ReactNode, Ref } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * The semantic status families a chip can carry.
@@ -474,6 +491,8 @@ export function Badge(props: BadgeProps): ReactElement {
     children,
     className,
     style: styleProp,
+    title,
+    'aria-label': label,
     ref,
     ...rest
   } = props;
@@ -498,19 +517,24 @@ export function Badge(props: BadgeProps): ReactElement {
   // literal. Every other value a chip takes comes from the stylesheet.
   const style: CssVariableStyle | CSSProperties | undefined = colorStyle ?? styleProp;
 
+  // The label, the glyph and the two string attributes a reader hovers or hears
+  // are revealed (see the module header); an absent attribute stays absent, and
+  // whether the glyph box is drawn is still decided from the glyph as given.
   return (
     <span
       className={clsx('dg-badge', TONE_CLASS[tone], VARIANT_CLASS[variant], className)}
       style={style}
+      title={title === undefined ? title : formatUntrustedText(title)}
+      aria-label={label === undefined ? label : formatUntrustedText(label)}
       ref={ref}
       {...rest}
     >
       {isRenderableIcon(icon) ? (
         <span className="dg-badge__icon" aria-hidden="true">
-          {icon}
+          {formatUntrustedNode(icon)}
         </span>
       ) : null}
-      {children}
+      {formatUntrustedNode(children)}
     </span>
   );
 }

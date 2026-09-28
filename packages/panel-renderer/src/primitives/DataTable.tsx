@@ -366,6 +366,7 @@ import type { TokenKey } from '../tokens/tokens';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
 import { Text } from './Text';
+import { formatUntrustedNode } from './untrusted-text';
 
 /**
  * The semantic width ROLE a column is sized by - what kind of content it holds, never how wide it
@@ -3096,7 +3097,10 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
                 className="dg-data-table__cell"
                 style={cellStyle}
               >
-                {column.cell(model.row, index, meta)}
+                {/* A cell renderer normally returns `Text`, `Code` or another primitive, each of
+                    which reveals direction controls itself; a renderer that returns a bare string
+                    of captured data is revealed here, so no cell can reorder its own text. */}
+                {formatUntrustedNode(column.cell(model.row, index, meta))}
               </div>
             );
           })}

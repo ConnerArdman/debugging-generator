@@ -64,7 +64,12 @@
  *    surfaces: the editor's `ModificationsList` and the panel's
  *    `SessionSummary` draw the same journal status, and this package is the
  *    only module both depend on, so the tone of each status is decided here
- *    once (see `./primitives/Badge`).
+ *    once (see `./primitives/Badge`). Beside the primitives sits the
+ *    untrusted-text formatter they all render through
+ *    (`./primitives/untrusted-text`): `formatUntrustedText` prints each of the
+ *    twelve Unicode direction controls as its visible `\u202E`-style escape,
+ *    `formatUntrustedNode` applies it to the strings of a React node, and
+ *    `containsDirectionControl` answers whether a raw value carries one.
  * 3. **The six layout primitives.** `PanelShell`, the theme root and the one
  *    scroll region a panel has; `Section`, `Split` and `Stack`, which are what
  *    the specification's three container node types render to and the only way
@@ -112,6 +117,17 @@
  *   preview, the views for their own axes and lanes); publishing the helpers
  *   would make presentation arithmetic part of the design system's contract and
  *   invite a surface to format a value twice, in two ways.
+ *
+ *   The untrusted-text formatter is the one part of `./utils/format` that IS
+ *   published, and it is published through the primitives module
+ *   (`./primitives/untrusted-text`) rather than by exposing `./utils`. The
+ *   reason is the same rule read the other way: both consumer surfaces — the
+ *   Chrome DevTools panel's components and the VS Code webview's components —
+ *   render captured and model-authored strings into elements and attributes of
+ *   their own (a `title`, an `aria-label`, a list row), and each of those must
+ *   reveal direction controls with exactly the definition the primitives use,
+ *   or one string would display two ways on two surfaces. Revealing is display
+ *   only: stored values, keys and callback arguments stay raw.
  * - The token table's generator alias in `./tokens/tokens`. It is the same
  *   object under a second name, read by the stylesheet generator from the
  *   module directly; `DESIGN_TOKENS` is the one name every consumer imports, so
@@ -233,6 +249,12 @@ export type { LoadingStateProps, LoadingStateVariant } from './primitives/Loadin
 
 export { ErrorState } from './primitives/ErrorState';
 export type { ErrorStateProps } from './primitives/ErrorState';
+
+export {
+  containsDirectionControl,
+  formatUntrustedNode,
+  formatUntrustedText,
+} from './primitives/untrusted-text';
 
 // ---------------------------------------------------------------------------
 // Layout primitives — the theme root, the container nodes, the toolbar and the

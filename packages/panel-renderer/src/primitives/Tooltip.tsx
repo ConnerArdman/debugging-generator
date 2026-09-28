@@ -150,6 +150,18 @@
  * that needs interactive content in an overlay needs a popover - a different pattern, with its own
  * focus management - and this package does not provide one in v1.
  *
+ * ## What the bubble shows is the logical text
+ *
+ * A description is routinely the untruncated form of untrusted text - a whole span name, a whole
+ * statement, a redacted URL - and an invisible Unicode direction control in it (U+202E and its
+ * eleven siblings) would draw the glyphs after it in an order that was never captured. Every string
+ * in `content` is therefore rendered through `formatUntrustedNode` from `./untrusted-text` - the
+ * one helper this primitive imports from its folder, a pure function over strings - which prints
+ * each control as its visible escape (`\u202E`) and changes nothing else: the glyphs in the bubble
+ * are the characters given, in the order given. Only the bubble's content is revealed. The trigger
+ * is the caller's element and renders its own text (a `Text` or `Code` trigger reveals its own),
+ * and the placement effect still keys on `content` as given.
+ *
  * ## No portal, no positioning library - but measured, fixed placement
  *
  * The bubble renders inside the panel's own DOM, positioned within the panel, which keeps it
@@ -238,6 +250,8 @@ import type {
   ReactElement,
   ReactNode,
 } from 'react';
+
+import { formatUntrustedNode } from './untrusted-text';
 
 /**
  * Which side of the trigger the bubble prefers. `start` and `end` are the logical sides, so one
@@ -535,7 +549,9 @@ const PLACEMENT_CLASS: Record<TooltipPlacement, string> = {
 export interface TooltipProps {
   /**
    * The description. Text, a number, a formatted value or an inert element - never a button, a
-   * link, a field or anything else focusable, because focus never enters the bubble.
+   * link, a field or anything else focusable, because focus never enters the bubble. Every string
+   * in it, directly or in an array, is shown with its direction controls revealed (see this
+   * module's header); an element in it renders its own text.
    */
   content: ReactNode;
 
@@ -1013,7 +1029,7 @@ export function Tooltip(props: TooltipProps): ReactElement {
         )}
         onClick={containBubbleClick}
       >
-        {content}
+        {formatUntrustedNode(content)}
       </span>
     </span>
   );

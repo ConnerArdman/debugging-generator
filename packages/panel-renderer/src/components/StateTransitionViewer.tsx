@@ -262,6 +262,7 @@ import {
   NOT_AVAILABLE_LABEL,
   formatCount,
   formatKindLabel,
+  formatUntrustedText,
   humanizeLabel,
   oneLinePreview,
 } from '../utils/format';
@@ -905,7 +906,10 @@ function previewOf(summary: string | undefined): { text: string; shortened: bool
 
   const text = oneLinePreview(summary);
 
-  return { text, shortened: text !== summary };
+  // The display text has its direction controls revealed, so it is weighed
+  // against the summary revealed the same way: a control is not a shortening,
+  // and the cell must not claim it shortened a value it showed whole.
+  return { text, shortened: text !== formatUntrustedText(summary) };
 }
 
 /**
@@ -1075,9 +1079,12 @@ function componentOptionsFor(
     names.push(current);
   }
 
+  // The value is the captured name, which the filter compares rows against;
+  // the label is what the picker prints in a native `<option>`, which reveals
+  // nothing on its own, so its direction controls are revealed here.
   return [
     { value: ALL_COMPONENTS, label: ALL_COMPONENTS_LABEL },
-    ...names.map((name) => ({ value: name, label: name })),
+    ...names.map((name) => ({ value: name, label: formatUntrustedText(name) })),
   ];
 }
 

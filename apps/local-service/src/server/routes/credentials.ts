@@ -21,8 +21,15 @@
  *    the journal;
  * 4. closes every open WebSocket with `WS_CLOSE_UNAUTHORIZED` (4401).
  *
+ * Once the store transaction has committed — whether or not the rest then
+ * finished — the handler tells the dev-server launcher
+ * ({@link DevServerLauncher.credentialsRotated}), which marks every launched
+ * child's credential lapsed.
+ *
  * Paired Chrome extensions must pair again, and launched dev servers must be
- * relaunched to receive a fresh credential. No credential travels in the
+ * relaunched to receive a fresh credential: the project's next
+ * `POST /dev-server/launch` stops the child whose credential is gone and
+ * launches a replacement with a new one. No credential travels in the
  * response: the new editor credential exists only in the `0600` file, and the
  * reply carries the two counts protocol's `credentialsRotateResponseSchema`
  * declares.
@@ -377,9 +384,14 @@ export interface CredentialsRoutesDeps {
    * synchronously — before its first `await` — which is what keeps the
    * revocation fence the handler checks just before it meaningful.
    *
-   * Read only when a release is answered, never while the handlers are built.
+   * Told, through its optional `credentialsRotated`, as soon as a rotation
+   * has committed, so every dev server it launched is replaced on its
+   * project's next launch rather than reused with a credential that no longer
+   * exists (AAP §0.5.6).
+   *
+   * Read only when a request is answered, never while the handlers are built.
    */
-  readonly launcher: Pick<DevServerLauncher, 'releaseCredential'>;
+  readonly launcher: Pick<DevServerLauncher, 'releaseCredential' | 'credentialsRotated'>;
 
   /**
    * Where this module's diagnostics go; defaults to the no-op logger. Records
@@ -803,6 +815,26 @@ export function createCredentialsRoutes(deps: CredentialsRoutesDeps): Credential
   };
 
   /**
+   * Tells the launcher that every credential was rotated away, once the
+   * rotation committed — whether or not it then finished — so each dev server
+   * it launched is replaced, with a new credential, on its project's next
+   * launch. Best effort and synchronous: a launcher without the hook, one
+   * missing from the composition or one that throws changes nothing about
+   * the answer, because the launcher's own liveness check at the next launch
+   * finds the same retired credentials.
+   */
+  const announceRotation = (): void => {
+    try {
+      deps.launcher.credentialsRotated?.();
+    } catch {
+      log.warn(
+        'The dev-server launcher could not be told about the rotation; its next launch finds the retired credentials',
+        { operation: ROTATE },
+      );
+    }
+  };
+
+  /**
    * The revocation fence: whether the credential that authorized the request
    * is still live. `requireLiveCredential` reports every failure as a
    * `Result`; a throw is a defect below and fails closed — it is answered as
@@ -898,8 +930,12 @@ export function createCredentialsRoutes(deps: CredentialsRoutesDeps): Credential
     }
 
     const rotated = rotate();
+    const state = isErr(rotated) ? rotationStateOf(rotated.error) : true;
+    if (state === true) {
+      // Committed: every launched dev server's credential is gone.
+      announceRotation();
+    }
     if (isErr(rotated)) {
-      const state = rotationStateOf(rotated.error);
       // A refusal is answered as one; a failure that states a rotation outcome
       // never is, even if a detail it carries happens to share a reason name.
       if (state === undefined && authFailureStatus(rotated.error) !== undefined) {

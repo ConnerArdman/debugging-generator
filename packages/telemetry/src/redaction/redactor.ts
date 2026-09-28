@@ -113,6 +113,8 @@
  *   length it arrived with, and no emitted value is a function, a symbol, a
  *   `bigint` or `undefined`.
  */
+import { SPAN_ID_PATTERN } from '@debuggen/shared';
+
 import {
   ALL_ATTRIBUTE_KEYS,
   MAX_COMPONENT_TREE_JSON_CHARS,
@@ -233,6 +235,53 @@ const COMPONENT_TREE_KEY: (typeof COMPONENT_TREE_ATTRIBUTE_KEYS)[number] = 'comp
 const CHANGED_PROP_NAME_FIELD: keyof ChangedPropEntry = 'key';
 
 /**
+ * The field of an {@link AttributeValueSummary} holding the bounded rendering,
+ * and the one recording whether it was cut. Typed as keys of the interface so
+ * a rename breaks the build rather than the flag silently going stale.
+ */
+const SUMMARY_PREVIEW_FIELD: keyof AttributeValueSummary = 'preview';
+const SUMMARY_TRUNCATED_FIELD: keyof AttributeValueSummary = 'truncated';
+
+/** The `state` key naming the render span a transition belongs to. */
+const RENDER_SPAN_ID_KEY: (typeof STATE_ATTRIBUTE_KEYS)[number] = 'renderSpanId';
+
+/** The `state` key naming the span that triggered a transition. */
+const TRIGGER_SPAN_ID_KEY: (typeof STATE_ATTRIBUTE_KEYS)[number] = 'triggerSpanId';
+
+/**
+ * Declared keys whose value is a **span id** written by the product itself —
+ * a reference to another event of the same capture, not captured data.
+ *
+ * A span id is 16 lower-case hexadecimal characters, so roughly one in two
+ * thousand is all digits, and a digit string of that length is exactly what
+ * the `payment-card` content rule reads as a card number when its checksum
+ * happens to hold. Masking such a reference would silently cut a state
+ * transition from its trigger, a lineage candidate from its request or an
+ * orphan from its intended parent. So a value of exactly the span-id shape
+ * ({@link SPAN_ID_PATTERN}) under one of these keys, at the top of the bag,
+ * travels as it arrived: sixteen hexadecimal characters can match no other
+ * content rule, need no URL masking and fit every bound. Any other value under
+ * these keys takes the ordinary path.
+ *
+ * `orphanedParentSpanId` and `lineageCandidates` come from catalog tuples
+ * typed `readonly string[]`, so their spelling is pinned by the colocated test
+ * rather than by the compiler.
+ */
+const SPAN_REFERENCE_KEYS: ReadonlySet<string> = new Set<string>([
+  RENDER_SPAN_ID_KEY,
+  TRIGGER_SPAN_ID_KEY,
+  'orphanedParentSpanId',
+]);
+
+/** The lineage key whose value is a list of span ids; see {@link SPAN_REFERENCE_KEYS}. */
+const SPAN_REFERENCE_LIST_KEY = 'lineageCandidates';
+
+/** Whether `value` is exactly a span id. */
+function isSpanIdShaped(value: unknown): value is string {
+  return typeof value === 'string' && SPAN_ID_PATTERN.test(value);
+}
+
+/**
  * Attribute keys whose value is dropped outright rather than masked.
  *
  * AAP 0.5.2 states that request and response **bodies are never captured**
@@ -250,6 +299,12 @@ const CHANGED_PROP_NAME_FIELD: keyof ChangedPropEntry = 'key';
  * `Request-Body` are one name. None of these folds onto a key the catalog
  * declares (asserted in the colocated test), so dropping them costs no
  * declared evidence.
+ *
+ * A body is also recognised by the **shape** of its key, because producers
+ * namespace attribute names: `http.request.body`, `http.response.body`,
+ * `rawBody`, `request.payload` and `responseBodyText` fold onto none of the
+ * names above, and each is exactly the unbounded application data this list
+ * exists to keep out. {@link isDroppedAttributeKey} is the whole rule.
  */
 export const DROPPED_ATTRIBUTE_KEYS = Object.freeze([
   'body',
@@ -450,6 +505,97 @@ function foldKey(key: string): string {
 
 /** Folded {@link DROPPED_ATTRIBUTE_KEYS}, for an O(1) test per attribute. */
 const DROPPED_KEY_FOLDS: ReadonlySet<string> = new Set<string>(DROPPED_ATTRIBUTE_KEYS.map(foldKey));
+
+/** Word segments that name a request or response body wherever they end a key. */
+const BODY_SEGMENTS: ReadonlySet<string> = new Set<string>([
+  'body',
+  'bodies',
+  'payload',
+  'payloads',
+]);
+
+/**
+ * Word segments that describe a body's *content* when they follow a body
+ * segment: `bodyText`, `http.request.body.content`, `responseBodyJson`.
+ *
+ * Deliberately a closed list of content words, so a key describing a body's
+ * **metadata** keeps its value — `http.request.body.size`, `bodyLength`, the
+ * Fetch API's `bodyUsed` flag and the declared resource-timing keys
+ * `encodedBodySize` and `decodedBodySize` are sizes and flags, not data.
+ */
+const BODY_CONTENT_SEGMENTS: ReadonlySet<string> = new Set<string>([
+  'text',
+  'json',
+  'raw',
+  'content',
+  'string',
+  'preview',
+  'snippet',
+  'excerpt',
+  'data',
+  'value',
+]);
+
+/** A lower-case letter or digit followed by an upper-case letter: a camelCase word boundary. */
+const CAMEL_BOUNDARY = /([a-z0-9])([A-Z])/g;
+
+/** An acronym followed by a capitalised word (`HTTPBody`): the boundary before the word. */
+const ACRONYM_BOUNDARY = /([A-Z])([A-Z][a-z])/g;
+
+/** Runs of the separators {@link KEY_SEPARATORS} removes, as split points. */
+const SEGMENT_SEPARATORS = /[\s._-]+/;
+
+/**
+ * An attribute key's word segments, lower-cased: split at separators and at
+ * camelCase boundaries, so `http.request.body`, `requestBody`, `REQUEST_BODY`
+ * and `HTTPBody` all end in `body`.
+ */
+function keySegments(key: string): string[] {
+  return key
+    .replace(CAMEL_BOUNDARY, '$1 $2')
+    .replace(ACRONYM_BOUNDARY, '$1 $2')
+    .toLowerCase()
+    .split(SEGMENT_SEPARATORS)
+    .filter((segment) => segment.length > 0);
+}
+
+/**
+ * Whether an attribute key names a value that is dropped outright: a key in
+ * {@link DROPPED_ATTRIBUTE_KEYS} under any spelling, or a key whose last word
+ * is a body (`http.request.body`, `rawBody`, `request.payload`) or whose last
+ * two words are a body and a content word (`bodyText`,
+ * `http.response.body.content`).
+ *
+ * AAP 0.5.2: request and response bodies are never captured. A producer that
+ * sends one anyway — under whatever namespaced name its instrumentation uses —
+ * must not get it stored, broadcast on the live tail or served to a panel, so
+ * the name decides and the value is never read. A key that merely *mentions*
+ * a body while describing its size or state (`http.request.body.size`,
+ * `bodyUsed`, `encodedBodySize`) is not a body and keeps its value, and so
+ * does a word that merely ends in the letters (`nobody`).
+ *
+ * @param key Attribute key, exactly as captured, at any depth.
+ */
+export function isDroppedAttributeKey(key: string): boolean {
+  const folded = foldKey(key);
+  if (DROPPED_KEY_FOLDS.has(folded)) {
+    return true;
+  }
+  if (!folded.includes('bod') && !folded.includes('payload')) {
+    // The overwhelmingly common case: no segmentation work at all.
+    return false;
+  }
+  const segments = keySegments(key);
+  const last = segments[segments.length - 1];
+  if (last === undefined) {
+    return false;
+  }
+  if (BODY_SEGMENTS.has(last)) {
+    return true;
+  }
+  const previous = segments[segments.length - 2];
+  return previous !== undefined && BODY_SEGMENTS.has(previous) && BODY_CONTENT_SEGMENTS.has(last);
+}
 
 /**
  * {@link UNTRUNCATED_ATTRIBUTE_KEYS}, matched **exactly** rather than folded.
@@ -1614,7 +1760,9 @@ function emitted(value: unknown, changed: boolean): ValueResult {
  * single function rather than a chain of maps:
  *
  * 1. **Dropped by policy** — a body, a row set or a parameter bag never
- *    travels ({@link DROPPED_ATTRIBUTE_KEYS}).
+ *    travels, whether its key is one of {@link DROPPED_ATTRIBUTE_KEYS} or is
+ *    shaped like a body's (`http.request.body`; see
+ *    {@link isDroppedAttributeKey}).
  * 2. **Header value** — masked positionally by `./headers.ts`, with the
  *    header's presence and multi-value count retained. A key is a header key
  *    when it is a dotted header attribute (`http.request.header.cookie`) or
@@ -1680,7 +1828,7 @@ function redactValue(
 ): ValueResult {
   const { limits } = state;
   try {
-    if (DROPPED_KEY_FOLDS.has(foldKey(key))) {
+    if (isDroppedAttributeKey(key)) {
       return OMITTED;
     }
 
@@ -1753,6 +1901,13 @@ function redactValue(
 
     if (key === COMPONENT_TREE_KEY) {
       return redactComponentTree(value, state);
+    }
+
+    // A span reference the product wrote travels as it arrived; see
+    // `SPAN_REFERENCE_KEYS`. Top level only, where the catalog declares it.
+    const atTop = depth === 1 && !inPreview;
+    if (atTop && SPAN_REFERENCE_KEYS.has(key) && isSpanIdShaped(value)) {
+      return emitted(value, false);
     }
 
     // A preview key opens the subtree; the exemption applies to the fields
@@ -1836,7 +1991,11 @@ function redactValue(
       }
       state.ancestors.add(value);
       try {
-        return emitted(redactArrayValue(value, path, depth, childPreview, state), false);
+        const spanReferences = atTop && key === SPAN_REFERENCE_LIST_KEY;
+        return emitted(
+          redactArrayValue(value, path, depth, childPreview, state, spanReferences),
+          false,
+        );
       } finally {
         state.ancestors.delete(value);
       }
@@ -1911,6 +2070,9 @@ function redactRecordValue(
 
   const keyBudget = depth === 0 ? keys.length : state.limits.maxTrackedKeys;
   const entries: [string, unknown][] = [];
+  // Set when this record is a value summary whose `preview` the walk cut to
+  // the preview bound; see `markSummaryTruncated`.
+  let previewCut = false;
 
   for (const key of keys) {
     // The key *name* is page-supplied text, and a name that is itself a
@@ -1976,7 +2138,16 @@ function redactRecordValue(
       continue;
     }
 
+    const truncatedBefore = state.truncatedValues;
     const result = redactValue(key, value, childPath, depth + 1, inPreview, state);
+    if (
+      inPreview &&
+      key === SUMMARY_PREVIEW_FIELD &&
+      typeof value === 'string' &&
+      state.truncatedValues > truncatedBefore
+    ) {
+      previewCut = true;
+    }
     if (!result.emit) {
       state.droppedKeys += 1;
       recordPath(state, childPath);
@@ -1989,7 +2160,42 @@ function redactRecordValue(
     entries.push([key, result.value]);
   }
 
+  if (previewCut) {
+    markSummaryTruncated(entries, path, state);
+  }
+
   return Object.fromEntries(entries);
+}
+
+/**
+ * Records on a value summary that the redactor cut its preview.
+ *
+ * `AttributeValueSummary.truncated` is how a consumer knows a preview is not
+ * the whole value, so a preview this walk shortened to the preview bound must
+ * not travel beside `truncated: false` — the `renderTable` and state views
+ * would present a cut value as complete. The producer normally cuts the
+ * preview itself and sets the flag; this is the backstop for one that did not,
+ * which is the case the walk exists for. The flag is set in place when the
+ * summary carries it and added when it does not, since the summary's own
+ * shape declares it; either way its path is recorded as changed. Idempotent:
+ * a second pass finds the preview within the bound and changes nothing.
+ *
+ * @param entries The summary's emitted entries, in order; modified in place.
+ * @param path The summary's own attribute path.
+ * @param state Walk state; the changed path goes here.
+ */
+function markSummaryTruncated(entries: [string, unknown][], path: string, state: WalkState): void {
+  const flagPath = joinKeyPath(path, SUMMARY_TRUNCATED_FIELD);
+  const existing = entries.find(([name]) => name === SUMMARY_TRUNCATED_FIELD);
+  if (existing === undefined) {
+    entries.push([SUMMARY_TRUNCATED_FIELD, true]);
+    recordPath(state, flagPath);
+    return;
+  }
+  if (existing[1] !== true) {
+    existing[1] = true;
+    recordPath(state, flagPath);
+  }
 }
 
 /**
@@ -2004,6 +2210,11 @@ function redactRecordValue(
  * `bigint`, or a container past the depth bound) becomes
  * {@link REDACTION_MARKER} rather than disappearing: dropping it would shift
  * every later index, and an array's positions are part of what it says.
+ *
+ * `spanReferences` marks the one declared list of span ids
+ * ({@link SPAN_REFERENCE_LIST_KEY}): an element of exactly the span-id shape
+ * travels as it arrived, for the reason {@link SPAN_REFERENCE_KEYS} gives, and
+ * every other element is redacted as usual.
  */
 function redactArrayValue(
   source: readonly unknown[],
@@ -2011,6 +2222,7 @@ function redactArrayValue(
   depth: number,
   inPreview: boolean,
   state: WalkState,
+  spanReferences = false,
 ): unknown[] {
   const elementBudget = state.limits.maxTrackedKeys;
   const output: unknown[] = [];
@@ -2035,6 +2247,11 @@ function redactArrayValue(
       state.maskedValues += 1;
       recordPath(state, childPath);
       output.push(REDACTION_MARKER);
+      continue;
+    }
+
+    if (spanReferences && isSpanIdShaped(element)) {
+      output.push(element);
       continue;
     }
 
@@ -2141,7 +2358,10 @@ function walkAttributes(
  *   Duplicate-request analysis depends on it (see {@link redactRecordValue}).
  * - **Nothing is added.** A bound reached means the remainder is omitted
  *   silently; there is no synthetic key announcing it. The counts in the
- *   report say how much went, and the event's `redacted` paths say which.
+ *   report say how much went, and the event's `redacted` paths say which. The
+ *   one field the walk may write is a value summary's own declared
+ *   `truncated` flag, set to `true` when the walk cut that summary's preview
+ *   (see `markSummaryTruncated`).
  *
  * @param attributes Attribute bag as captured. Never modified.
  * @param context What is known about the owning event; only `kind` is read.

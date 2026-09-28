@@ -163,6 +163,7 @@ import {
   formatCount,
   formatOffset,
   formatStatusLabel,
+  formatUntrustedText,
   oneLinePreview,
 } from '../utils/format';
 import { SourceLink } from './SourceLink';
@@ -1020,8 +1021,12 @@ function renderStatementCell(
 ): ReactNode {
   const { expanded, detailRowId } = meta;
   const unknown = group.statement === UNKNOWN_STATEMENT;
+  // The preview is display text: its direction controls are revealed
+  // (`oneLinePreview`), so it is weighed against the whole statement revealed
+  // the same way. A statement is abbreviated when the preview shortened or
+  // folded it, never merely because it carried a control.
   const preview = oneLinePreview(group.statement);
-  const abbreviated = !unknown && preview !== group.statement;
+  const abbreviated = !unknown && preview !== formatUntrustedText(group.statement);
 
   // Deliberately left to inference rather than annotated as `ReactElement`: the
   // tooltip below takes a child whose props carry `aria-describedby`, which it

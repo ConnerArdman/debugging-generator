@@ -18,6 +18,8 @@
  *     passed — never the React event the primitives hand their handlers.
  *   - **Four states, never a blank or half-filled badge** (AAP 0.5.5), with
  *     the precedence error > pending > "No target" > target.
+ *   - **Direction controls are shown, never obeyed**: a U+202E/U+202C pair in
+ *     any descriptor field or a pick error prints as visible escapes.
  *   - **Nothing is logged** (AAP 0.5.2): a descriptor carries a page URL, so
  *     no state may write to any `console` method.
  *
@@ -606,5 +608,67 @@ describe('TargetBadge privacy', () => {
 
     expect(onRequestTarget).toHaveBeenCalledTimes(3);
     expect(consoleCallCounts()).toEqual(NO_CONSOLE_CALLS);
+  });
+});
+
+describe('TargetBadge direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) around markup: the
+   * picked element's text, selector, tag, component names and URL all come
+   * from the inspected page. Every code point is written as an escape so this
+   * suite is not itself a carrier of what it defends against.
+   */
+  const SPOOF = '\u202E</td><script>alert(7)</script>\u202C';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * What a reader must see: each control of {@link SPOOF} printed as its
+   * visible escape and every other character untouched. Spelled out here
+   * rather than by calling the formatter, so the suite pins the output.
+   */
+  function revealed(text: string): string {
+    return text.replaceAll('\u202E', '\\u202E').replaceAll('\u202C', '\\u202C');
+  }
+
+  const TARGET = makeTarget({
+    selector: `main > button[data-label="${SPOOF}"]`,
+    tagName: `button${SPOOF}`,
+    text: `Run ${SPOOF} now`,
+    componentChain: [`Inner${SPOOF}`, 'OuterFrame'],
+    url: `http://localhost:4000/items/${SPOOF}`,
+  });
+
+  it('shows each control as a visible escape in every field, tooltip and name', () => {
+    const { container } = render(<TargetBadge target={TARGET} onRequestTarget={vi.fn()} />);
+
+    expect(codeTexts(container)).toEqual([
+      revealed(TARGET.selector),
+      revealed(`Inner${SPOOF}`),
+      'OuterFrame',
+      revealed(TARGET.url),
+    ]);
+    expect(container.textContent).toContain(revealed(`button${SPOOF}`));
+    expect(container.textContent).toContain(revealed(`Run ${SPOOF} now`));
+    const chain = container.querySelector(CHAIN_ITEM_SELECTOR);
+    expect(chain?.querySelector('[title]')?.getAttribute('title')).toBe(revealed(`Inner${SPOOF}`));
+
+    expect(container.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(container.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+  });
+
+  it('shows the controls of a pick error as visible escapes', () => {
+    render(<TargetBadge error={`The pick failed: ${SPOOF}`} onRequestTarget={vi.fn()} />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(revealed(`The pick failed: ${SPOOF}`));
+    expect(alert.textContent).not.toMatch(RAW_CONTROL);
   });
 });

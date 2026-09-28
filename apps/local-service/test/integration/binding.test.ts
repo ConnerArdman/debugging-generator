@@ -90,6 +90,18 @@
  * stamp itself — after the report the tab held, absent for a refused frame —
  * and that a recorder which throws never stops the binding from following.
  *
+ * ## Two credentials, one tab id
+ *
+ * A binding belongs to the DevTools credential that made it and its tab, and a
+ * Chrome tab id is unique only within one browser. Two cases open two paired
+ * extensions on the same tab id. When the second binds the very tab and session
+ * the first holds, that is a takeover: the first hears exactly `replaced` and
+ * never the new `bound`, and loses the session. When the second binds its own
+ * tab of that id to another session, nothing is displaced: both durable rows
+ * (one per holder) and both records' bound tabs stand, each browser acts, is
+ * delivered to and has its relayed telemetry attributed for its own session,
+ * and one browser's unbind leaves the other's binding.
+ *
  * ## Vocabulary
  *
  * No binding reason, client kind or message type is spelled here: reasons and
@@ -120,19 +132,23 @@ import {
 import type { InstrumentationActionType, InstrumentationPlan } from '@debuggen/instrumentation';
 import { normalizePanel, parsePanelSpecInput } from '@debuggen/panel-schema';
 import {
+  ACTING_TAB_HEADER,
   ANALYSIS_VERSION_START,
   BINDING_REASONS,
   CLIENT_KINDS,
+  HTTP_ROUTES,
   MESSAGE_PAYLOAD_SCHEMAS,
   MESSAGE_TYPES,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
+  READ_PROOF_HEADER,
   SESSION_STATUSES,
   agentConfigPayloadSchema,
   agentReadyPayloadSchema,
   createAnalysisResult,
   decodeMessage,
   errorCodeSchema,
+  httpErrorResponseSchema,
   isMessageOfType,
   progressStageSchema,
   sessionBindPayloadSchema,
@@ -163,17 +179,22 @@ import {
   DebuggenError,
   err,
   isErr,
+  newEventId,
   newId,
   newPanelId,
   newProducerId,
   newSessionId,
+  newTraceId,
   ok,
 } from '@debuggen/shared';
 import type { CaptureId, Result, SessionId } from '@debuggen/shared';
+import { sha256Hex } from '@debuggen/shared/node';
 import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
+import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
 import { createAgentReadyLedger } from '../../src/main.js';
 import type { AgentReadyLedger } from '../../src/main.js';
+import { AUTH_FAILURE_REASONS } from '../../src/server/auth.js';
 import type { DevtoolsPrincipal } from '../../src/server/auth.js';
 import { SOCKET_READY_STATE_OPEN, createClientRegistry } from '../../src/server/clients.js';
 import type { ClientRegistry, ClientSocket, TabBindingView } from '../../src/server/clients.js';
@@ -196,6 +217,12 @@ import { createPanelsRepo } from '../../src/store/panels-repo.js';
 import { createSessionsRepo } from '../../src/store/sessions-repo.js';
 import type { ProgressEntry, SessionsRepo, TabBinding } from '../../src/store/sessions-repo.js';
 import {
+  INGEST_ORIGINS,
+  PRODUCING_ORIGIN_BY_TIER,
+  isDropReason,
+} from '../../src/telemetry/attribute.js';
+import type { DropReason } from '../../src/telemetry/attribute.js';
+import {
   randomSecretLike,
   readFixtureJson,
   readTelemetryBatch,
@@ -211,6 +238,7 @@ import type {
   Harness,
   HarnessMessage,
   HarnessWsClient,
+  RawFetchResponse,
 } from './harness.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -347,6 +375,22 @@ const CONNECTION_CLOSED_LOG = 'a WebSocket connection closed';
  * feeds readiness's `latestNavigationAt` in production wiring.
  */
 const NAVIGATION_RECORDED_LOG = 'recorded a committed navigation of a tab';
+
+/**
+ * The info record both the client registry (`src/server/clients.ts`) and the
+ * binding route (`src/server/routes/binding.ts`) write for a bind, each with a
+ * `displaced` count — the pair a takeover once logged as `1` and `0`.
+ */
+const TAB_BOUND_LOG = 'Tab bound to session';
+
+/**
+ * The ingest origin of a batch a DevTools connection relays for its page
+ * agent, from the attributor's closed `INGEST_ORIGINS` (browser first).
+ */
+const [BROWSER_AGENT_ORIGIN] = INGEST_ORIGINS;
+
+/** The attribution drop of a batch whose bound session holds no open capture. */
+const NO_ACTIVE_CAPTURE = 'no-active-capture' satisfies DropReason;
 
 /** The first tab id this suite hands out; every test takes fresh ones above it. */
 const FIRST_TAB_ID = 4100;
@@ -520,6 +564,105 @@ function rowsFor(filter: { readonly tabId?: number; readonly sessionId?: string 
   return bindingRows().filter(
     (row) => row.tabId === filter.tabId || row.sessionId === filter.sessionId,
   );
+}
+
+/** One raw `bindings` row of a tab id, with the digest of the credential that holds it. */
+interface HeldBindingRow {
+  readonly boundBy: string;
+  readonly sessionId: string;
+  readonly url: string;
+}
+
+/**
+ * Every `bindings` row of one tab id, read raw with its holder and ordered by
+ * holder. A tab id is unique only within one browser, so a tab id two paired
+ * browsers both bound holds one row per holder; `storedBindingOfTab` refuses
+ * to guess between them.
+ */
+function heldRowsOfTab(tabId: number): HeldBindingRow[] {
+  const rows = service()
+    .store.statement(
+      'SELECT bound_by, session_id, url FROM bindings WHERE tab_id = ? ORDER BY bound_by',
+    )
+    .all(tabId);
+  return rows.map((row) => {
+    const boundBy = row['bound_by'];
+    const sessionId = row['session_id'];
+    const url = row['url'];
+    if (typeof boundBy !== 'string' || typeof sessionId !== 'string' || typeof url !== 'string') {
+      throw new Error('A bindings row does not have the shape the schema declares.');
+    }
+    return { boundBy, sessionId, url };
+  });
+}
+
+/** The digest a binding made by `credential` is recorded under — its `tokenHash`. */
+function holderOf(credential: DevtoolsCredential): string {
+  return sha256Hex(credential.token);
+}
+
+/** The cross-tier fixture every relayed batch of this suite is cut from. */
+const CROSS_TIER_FIXTURE = 'telemetry-trace-cross-tier.json';
+
+/** A relayed browser batch and the one trace every event of it carries. */
+interface RelayedBatch {
+  readonly traceId: string;
+  readonly events: readonly TelemetryEventIngress[];
+}
+
+/**
+ * The cross-tier fixture's page-agent events, re-identified — fresh event ids,
+ * one fresh trace and fresh producer ids — because the store refuses an event
+ * id it already holds, and the suite's completed session stored the same
+ * fixture. Order, timing and attributes are untouched.
+ */
+function freshBrowserBatch(): RelayedBatch {
+  const traceId = newTraceId();
+  const producers = new Map<string, string>();
+  const events = readTelemetryBatch(CROSS_TIER_FIXTURE)
+    .filter((event) => PRODUCING_ORIGIN_BY_TIER[event.tier] === BROWSER_AGENT_ORIGIN)
+    .map((event): TelemetryEventIngress => {
+      const producerId = producers.get(event.producerId) ?? newProducerId();
+      producers.set(event.producerId, producerId);
+      return { ...event, id: newEventId(), traceId, producerId };
+    });
+  if (events.length === 0) {
+    throw new Error(`${CROSS_TIER_FIXTURE} holds no event a page agent produces.`);
+  }
+  return Object.freeze({ traceId, events });
+}
+
+/** Where the store filed one stored telemetry row. */
+interface FiledEvent {
+  readonly sessionId: string;
+  readonly captureId: string;
+}
+
+/** Where the store filed every row of one trace, in ingest order. */
+function filedRowsOfTrace(traceId: string): FiledEvent[] {
+  return service()
+    .store.statement(
+      'SELECT session_id, capture_id FROM telemetry_events WHERE trace_id = ? ORDER BY ingest_seq',
+    )
+    .all(traceId)
+    .map((row) => {
+      const sessionId = row['session_id'];
+      const captureId = row['capture_id'];
+      if (typeof sessionId !== 'string' || typeof captureId !== 'string') {
+        throw new Error('A telemetry_events row does not have the shape the schema declares.');
+      }
+      return { sessionId, captureId };
+    });
+}
+
+/** The attribution-drop records for relayed page-agent batches logged at or after index `from`. */
+function browserDropsSince(from: number): CapturedLogRecord[] {
+  return service()
+    .logger.records.slice(from)
+    .filter(
+      (record) =>
+        record.fields['origin'] === BROWSER_AGENT_ORIGIN && isDropReason(record.fields['reason']),
+    );
 }
 
 /** The stored `sessions.record` document of one session, as the raw JSON text the row holds. */
@@ -750,6 +893,61 @@ function expectNoUrlIn(refusal: ErrorPayload, url: string): void {
   const text = JSON.stringify(refusal);
   expect(text).not.toContain(host);
   expect(text).not.toContain(pathname);
+}
+
+/** The HTTP read a DevTools panel makes of its session: `session.get`, from protocol's route table. */
+const SESSION_GET_OPERATION = 'session.get' satisfies HttpOperationId;
+
+/** The one path parameter of {@link SESSION_GET_OPERATION}, from the route table. */
+const [SESSION_GET_PARAM] = HTTP_ROUTES[SESSION_GET_OPERATION].params;
+
+/** The access boundary's refusal of a DevTools request for a session its acting tab is not bound to. */
+const SESSION_NOT_BOUND = AUTH_FAILURE_REASONS['session-not-bound'];
+
+/**
+ * Reads a session over HTTP as a DevTools panel does: under `credential`, from
+ * the extension it was issued to, with its read proof, acting for `tabId` —
+ * the request the access boundary admits only for the session that tab's
+ * binding, made by this very credential, names.
+ */
+function readSessionAs(
+  credential: DevtoolsCredential,
+  sessionId: SessionId,
+  tabId: number,
+): Promise<RawFetchResponse> {
+  if (SESSION_GET_PARAM === undefined) {
+    throw new Error('The session.get route names no path parameter.');
+  }
+  return service().rawFetch(
+    { operation: SESSION_GET_OPERATION, params: { [SESSION_GET_PARAM]: sessionId } },
+    {
+      token: credential.token,
+      origin: credential.origin,
+      headers: {
+        [ACTING_TAB_HEADER]: String(tabId),
+        [READ_PROOF_HEADER]: credential.readProof,
+      },
+    },
+  );
+}
+
+/** Asserts a response is the access boundary's `session-not-bound` refusal. */
+function expectNotBoundOverHttp(response: RawFetchResponse): void {
+  expect(response.status).toBe(SESSION_NOT_BOUND.status);
+  expect(httpErrorResponseSchema.parse(response.json).code).toBe(SESSION_NOT_BOUND.code);
+}
+
+/**
+ * The `displaced` count each subsystem logged for its `'Tab bound to session'`
+ * record at or after record index `from`, as `[subsystem, displaced]` pairs in
+ * log order: the registry (`clients`) and the route (`binding`) report the
+ * same bind, and must agree on how many bindings it displaced.
+ */
+function displacedCountsSince(from: number): [unknown, unknown][] {
+  return service()
+    .logger.records.slice(from)
+    .filter((record) => record.message === TAB_BOUND_LOG)
+    .map((record) => [record.fields['subsystem'], record.fields['displaced']]);
 }
 
 /**
@@ -1354,20 +1552,30 @@ describe(SESSION_BIND, () => {
     expect(intruder.credential.extensionId).not.toBe(owner.credential.extensionId);
     expect(intruder.client.identity.tabId).toBe(tabId);
 
-    expectRefused(
-      await sendSettled(
-        intruder.client,
-        SESSION_UNBIND,
-        sessionUnbindPayloadSchema.parse({ tabId }),
-      ),
-      CODES.TAB_NOT_BOUND,
+    // A tab id is unique only within one browser, so the intruder's unbind of
+    // "its" tab names a tab its credential never bound: there is nothing of its
+    // own to drop, and the owner's binding of the same id is never reached.
+    const intruderUnbind = await sendSettled(
+      intruder.client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
     );
+    expect(intruderUnbind.errors).toEqual([]);
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toMatchObject({ sessionId: created.sessionId });
     expectRefused(
       await sendSettled(
         intruder.client,
         TAB_NAVIGATED,
         tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(capturing, '/reports') }),
       ),
+      CODES.TAB_NOT_BOUND,
+    );
+    // Nor may it report a page agent ready in "its" tab: readiness keeps its
+    // evidence by tab id, and could not tell that report from one about the
+    // owner's bound tab of the same id.
+    expectRefused(
+      await sendSettled(intruder.client, AGENT_READY, newDocumentReport(tabId, url)),
       CODES.TAB_NOT_BOUND,
     );
     expectRefused(
@@ -1623,6 +1831,97 @@ describe('replacement', () => {
       { tabId, sessionId: created.sessionId, url },
     ]);
     expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url });
+  });
+
+  it('announces a takeover of the same tab and session by another credential as replaced to the first holder, and never re-establishes it there', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    // Two paired extensions, each with its own credential, inspecting a tab
+    // with the same id: the second binds the very pair the first holds.
+    const first = await openPanel(tabId);
+    const second = await openPanel(tabId);
+    expect(second.credential.extensionId).not.toBe(first.credential.extensionId);
+    const url = pageOf(created, '/orders');
+
+    expectEstablished(
+      first.client,
+      await bind(first.client, { tabId, url, sessionId: created.sessionId }),
+      created.sessionId,
+      tabId,
+    );
+
+    const logMark = service().logger.records.length;
+    const firstMark = first.client.received.length;
+    const editorMark = created.editor.received.length;
+    const takeover = await bind(second.client, { tabId, url, sessionId: created.sessionId });
+    expectEstablished(second.client, takeover, created.sessionId, tabId);
+    await settleAll(first.client, created.editor);
+
+    // The first holder hears exactly that its binding was replaced — and no
+    // `bound` for the pair, which it would read as confirmation of its own
+    // binding. The new holder hears the establishment and no release; the
+    // editor hears both, the release first.
+    const replaced = { sessionId: created.sessionId, tabId, url, reason: REASON_REPLACED };
+    const established = { sessionId: created.sessionId, tabId, url, reason: REASON_BOUND };
+    expect(announcementsSince(first.client, firstMark)).toEqual([replaced]);
+    expect(announcementsSince(second.client, takeover.mark)).toEqual([established]);
+    expect(announcementsSince(created.editor, editorMark)).toEqual([replaced, established]);
+
+    // The registry and the route agree that the bind displaced one binding.
+    expect(displacedCountsSince(logMark)).toEqual([
+      ['clients', 1],
+      ['binding', 1],
+    ]);
+
+    // One durable row for the pair, and the record mirror unchanged.
+    expect(rowsFor({ tabId, sessionId: created.sessionId })).toEqual([
+      { tabId, sessionId: created.sessionId, url },
+    ]);
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url });
+
+    // The first holder may no longer act on the session, over either transport,
+    // while the new holder may.
+    expectRefused(
+      await select(first.client, created.sessionId, targetOn(url)),
+      CODES.TAB_NOT_BOUND,
+    );
+    expectNotBoundOverHttp(await readSessionAs(first.credential, created.sessionId, tabId));
+    expect((await readSessionAs(second.credential, created.sessionId, tabId)).status).toBe(200);
+    const target = probeTarget(url, 'takeover');
+    expect((await select(second.client, created.sessionId, target)).errors).toEqual([]);
+    expect(recordOf(created.sessionId).target).toEqual(target);
+
+    // The session's tab-bound deliveries reach the new holder only: its fan-out,
+    // the editor's element request, and a later establishment of the binding —
+    // a same-origin navigation re-announcing it `bound` — none of which the
+    // first holder hears, however soon after its release it comes.
+    const firstLater = first.client.received.length;
+    const secondLater = second.client.received.length;
+    unwrap(
+      await service().manager.patch(created.sessionId, { target: targetOn(url) }),
+      'Patching the session',
+    );
+    await waitFor(second.client, REPLAY_SESSION_UPDATED, (_message, index) => index >= secondLater);
+    const asked = unwrap(
+      await service()
+        .http()
+        .request(TARGET_REQUEST_OPERATION, { params: { id: created.sessionId }, body: {} }),
+      'Requesting a target of the bound tab',
+    );
+    expect(asked).toEqual({ sessionId: created.sessionId, tabId });
+    await waitFor(second.client, TARGET_REQUEST, (_message, index) => index >= secondLater);
+    const nextUrl = pageOf(created, '/orders/weekly');
+    const navigated = await sendSettled(
+      second.client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: nextUrl }),
+    );
+    expect(navigated.errors).toEqual([]);
+    expect(announcementsSince(second.client, navigated.mark)).toEqual([
+      { ...established, url: nextUrl },
+    ]);
+    await settleAll(first.client);
+    expect(typesSince(first.client, firstLater)).toEqual([]);
   });
 
   it('refuses a replacement whose record mirror fails, restores the displaced binding everywhere and announces nothing', async () => {
@@ -1898,12 +2197,17 @@ describe('replacement', () => {
     expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
     expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
 
-    // The binding is still the first credential's: the second may not unbind
-    // it, and the first unbinds it at the URL it bound.
-    expectRefused(
-      await sendSettled(second.client, SESSION_UNBIND, sessionUnbindPayloadSchema.parse({ tabId })),
-      CODES.TAB_NOT_BOUND,
+    // The binding is still the first credential's: the second credential's
+    // unbind finds no binding of its own and drops nothing, and the first
+    // unbinds it at the URL it bound.
+    const secondUnbind = await sendSettled(
+      second.client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
     );
+    expect(secondUnbind.errors).toEqual([]);
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
     const unbound = await sendSettled(
       first.client,
       SESSION_UNBIND,
@@ -1994,6 +2298,185 @@ describe('replacement', () => {
     expect(unbound.errors).toEqual([]);
     expect(storedBindingOfSession(created.sessionId)).toBeUndefined();
     expectRefused(await select(secondTab, secondUrl), CODES.TAB_NOT_BOUND);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Two paired browsers whose tab ids collide
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('paired browsers whose tab ids collide', () => {
+  it('keeps each browser’s binding of the same tab id to its own session: nothing is announced, both rows stand, each acts, is delivered to and has its telemetry attributed on its own, and one unbind leaves the other', async () => {
+    const { capturing, created } = suite();
+    const tabId = freshTab();
+    // Two paired extensions, each with its own credential. Chrome numbers tabs
+    // per browser, so both inspect a tab with the same id.
+    const first = await openPanel(tabId);
+    const second = await openPanel(tabId);
+    expect(second.credential.extensionId).not.toBe(first.credential.extensionId);
+    const firstUrl = pageOf(capturing, '/reports');
+    const secondUrl = pageOf(created, '/orders');
+
+    const firstBind = await bind(first.client, { tabId, url: firstUrl });
+    expectEstablished(first.client, firstBind, capturing.sessionId, tabId);
+    await waitForArming(first.client, capturing, firstBind.mark);
+
+    const logMark = service().logger.records.length;
+    const firstMark = first.client.received.length;
+    const capturingEditorMark = capturing.editor.received.length;
+    const secondBind = await bind(second.client, { tabId, url: secondUrl });
+    expectEstablished(second.client, secondBind, created.sessionId, tabId);
+    await settleAll(first.client, capturing.editor, created.editor);
+
+    // Nothing was displaced: the first browser and its session's editor hear
+    // nothing, and the second browser hears only its own establishment.
+    expect(announcementsSince(first.client, firstMark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, capturingEditorMark)).toEqual([]);
+    expect(announcementsSince(second.client, secondBind.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: secondUrl, reason: REASON_BOUND },
+    ]);
+    expect(displacedCountsSince(logMark)).toEqual([
+      ['clients', 0],
+      ['binding', 0],
+    ]);
+
+    // One durable row per holder of the tab id, and both records keep their tab.
+    const firstHolder = holderOf(first.credential);
+    const secondHolder = holderOf(second.credential);
+    expect(heldRowsOfTab(tabId)).toEqual(
+      [
+        { boundBy: firstHolder, sessionId: capturing.sessionId, url: firstUrl },
+        { boundBy: secondHolder, sessionId: created.sessionId, url: secondUrl },
+      ].sort((left, right) => (left.boundBy < right.boundBy ? -1 : 1)),
+    );
+    expect(storedBindingOfSession(capturing.sessionId)).toMatchObject({
+      boundBy: firstHolder,
+      tab: { tabId, url: firstUrl },
+    });
+    expect(storedBindingOfSession(created.sessionId)).toMatchObject({
+      boundBy: secondHolder,
+      tab: { tabId, url: secondUrl },
+    });
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: secondUrl });
+
+    // Each browser acts for its own session — over either transport — and for
+    // no other, though its tab id is the same.
+    const firstTarget = probeTarget(firstUrl, 'first-browser');
+    const secondTarget = probeTarget(secondUrl, 'second-browser');
+    expect((await select(first.client, capturing.sessionId, firstTarget)).errors).toEqual([]);
+    expect(recordOf(capturing.sessionId).target).toEqual(firstTarget);
+    expect((await select(second.client, created.sessionId, secondTarget)).errors).toEqual([]);
+    expect(recordOf(created.sessionId).target).toEqual(secondTarget);
+    expectRefused(
+      await select(second.client, capturing.sessionId, targetOn(firstUrl)),
+      CODES.TAB_NOT_BOUND,
+    );
+    expectRefused(
+      await select(first.client, created.sessionId, targetOn(secondUrl)),
+      CODES.TAB_NOT_BOUND,
+    );
+    expect((await readSessionAs(first.credential, capturing.sessionId, tabId)).status).toBe(200);
+    expect((await readSessionAs(second.credential, created.sessionId, tabId)).status).toBe(200);
+    expectNotBoundOverHttp(await readSessionAs(second.credential, capturing.sessionId, tabId));
+    expectNotBoundOverHttp(await readSessionAs(first.credential, created.sessionId, tabId));
+
+    // Each session's tab-bound delivery reaches its own browser.
+    for (const [session, holder] of [
+      [capturing, first],
+      [created, second],
+    ] as const) {
+      const from = holder.client.received.length;
+      const asked = unwrap(
+        await service()
+          .http()
+          .request(TARGET_REQUEST_OPERATION, { params: { id: session.sessionId }, body: {} }),
+        'Requesting a target of the bound tab',
+      );
+      expect(asked).toEqual({ sessionId: session.sessionId, tabId });
+      await waitFor(
+        holder.client,
+        TARGET_REQUEST,
+        (message, index) => index >= from && message.payload.sessionId === session.sessionId,
+      );
+    }
+    await settleAll(first.client, second.client);
+    expect(
+      first.client.received.filter(
+        (message) =>
+          isMessageOfType(message, TARGET_REQUEST) &&
+          message.payload.sessionId === created.sessionId,
+      ),
+    ).toEqual([]);
+    expect(
+      second.client.received.filter(
+        (message) =>
+          isMessageOfType(message, TARGET_REQUEST) &&
+          message.payload.sessionId === capturing.sessionId,
+      ),
+    ).toEqual([]);
+
+    // A relayed batch is attributed to the session its own browser bound: the
+    // first browser's is filed under the capturing session's open capture, and
+    // the second browser's is attributed to the created session, which captures
+    // nothing, so it is dropped there and never filed under the other session.
+    const firstBatch = freshBrowserBatch();
+    const firstRelayed = await service().ingestFromAgent(first.client, firstBatch.events);
+    expect(firstRelayed.settled).toBe(true);
+    expect(firstRelayed.errors).toEqual([]);
+    const filed = filedRowsOfTrace(firstBatch.traceId);
+    expect(filed.length).toBeGreaterThan(0);
+    for (const row of filed) {
+      expect(row).toEqual({ sessionId: capturing.sessionId, captureId: capturing.captureId });
+    }
+
+    const dropMark = service().logger.records.length;
+    const secondBatch = freshBrowserBatch();
+    const secondRelayed = await service().ingestFromAgent(second.client, secondBatch.events);
+    expect(secondRelayed.settled).toBe(true);
+    expect(secondRelayed.errors).toEqual([]);
+    expect(filedRowsOfTrace(secondBatch.traceId)).toEqual([]);
+    const drops = browserDropsSince(dropMark);
+    expect(drops.length).toBeGreaterThan(0);
+    expect([...new Set(drops.map((record) => record.fields['reason']))]).toEqual([
+      NO_ACTIVE_CAPTURE,
+    ]);
+    expect(drops.some((record) => Object.values(record.fields).includes(created.sessionId))).toBe(
+      true,
+    );
+    expect(drops.some((record) => Object.values(record.fields).includes(capturing.sessionId))).toBe(
+      false,
+    );
+
+    // The second browser's unbind drops its own binding only.
+    const firstBeforeUnbind = first.client.received.length;
+    const unbound = await sendSettled(
+      second.client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(announcementsSince(second.client, unbound.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: secondUrl, reason: REASON_UNBOUND },
+    ]);
+    await settleAll(first.client);
+    expect(announcementsSince(first.client, firstBeforeUnbind)).toEqual([]);
+    expect(heldRowsOfTab(tabId)).toEqual([
+      { boundBy: firstHolder, sessionId: capturing.sessionId, url: firstUrl },
+    ]);
+    expect(storedBindingOfTab(tabId)).toMatchObject({
+      boundBy: firstHolder,
+      sessionId: capturing.sessionId,
+    });
+    expect(recordOf(created.sessionId).boundTab).toBeUndefined();
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+    const stillBound = probeTarget(firstUrl, 'first-browser-after-unbind');
+    expect((await select(first.client, capturing.sessionId, stillBound)).errors).toEqual([]);
+    expect(recordOf(capturing.sessionId).target).toEqual(stillBound);
+    expectRefused(
+      await select(second.client, created.sessionId, targetOn(secondUrl)),
+      CODES.TAB_NOT_BOUND,
+    );
   });
 });
 
@@ -3547,7 +4030,7 @@ async function bindRigSession(rig: RaceRig): Promise<RigBinding> {
   );
   expect(bound).toMatchObject({ sessionId: session.id, tabId, url });
   const row = unwrap(rig.sessions.getBindingByTab(tabId), 'Reading the bound row');
-  const live = rig.clients.bindingForTab(tabId);
+  const live = rig.clients.bindingForTab(tabId, rig.principal);
   if (row === undefined || live === undefined) {
     throw new Error('The bind left the tab without its row or its live binding.');
   }
@@ -3627,7 +4110,7 @@ describe('binding restoration racing session.end', () => {
       const dropping = kind.drop(current, bound.tabId);
       expect(await held.reached).toEqual({ sessionId: bound.sessionId, boundTab: undefined });
       expect(rigBindingRows(current)).toEqual([]);
-      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      expect(current.clients.bindingForTab(bound.tabId, current.principal)).toBeUndefined();
 
       // Meanwhile the real session.end commits `ended` without a bound tab,
       // removing the session's binding rows in the same store transaction.
@@ -3647,7 +4130,7 @@ describe('binding restoration racing session.end', () => {
         unwrap(current.sessions.getBindingBySession(bound.sessionId), 'Reading the session row'),
       ).toBeUndefined();
       expect(rigBindingRows(current)).toEqual([]);
-      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      expect(current.clients.bindingForTab(bound.tabId, current.principal)).toBeUndefined();
       const record = rigRecordOf(current, bound.sessionId);
       expect(record.status).toBe('ended');
       expect(record.boundTab).toBeUndefined();
@@ -3695,7 +4178,7 @@ describe('binding restoration racing session.end', () => {
       const dropping = kind.drop(current, bound.tabId);
       expect(await held.reached).toEqual({ sessionId: bound.sessionId, boundTab: undefined });
       expect(rigBindingRows(current)).toEqual([]);
-      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      expect(current.clients.bindingForTab(bound.tabId, current.principal)).toBeUndefined();
 
       // The session is still open when the record mirror is refused.
       held.answer(refusedMirror());
@@ -3707,7 +4190,7 @@ describe('binding restoration racing session.end', () => {
         bound.row,
       );
       expect(rigBindingRows(current)).toEqual(rowsBefore);
-      expect(current.clients.bindingForTab(bound.tabId)).toMatchObject({
+      expect(current.clients.bindingForTab(bound.tabId, current.principal)).toMatchObject({
         tabId: bound.tabId,
         sessionId: bound.sessionId,
         url: bound.url,
@@ -3723,7 +4206,7 @@ describe('binding restoration racing session.end', () => {
         { kind: 'dropped' },
       );
       expect(rigBindingRows(current)).toEqual([]);
-      expect(current.clients.bindingForTab(bound.tabId)).toBeUndefined();
+      expect(current.clients.bindingForTab(bound.tabId, current.principal)).toBeUndefined();
       const record = rigRecordOf(current, bound.sessionId);
       expect(record.boundTab).toBeUndefined();
       expect(record.status).toBe(recordBefore.status);

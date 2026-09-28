@@ -40,7 +40,8 @@
  * `./schema.sql`, handed in by the caller. Every later step must be purely
  * additive — `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`,
  * `ALTER TABLE … ADD COLUMN` — and must never drop, rename or rewrite an
- * object an earlier step declared.
+ * object an earlier step declared, save under the one documented exception
+ * below.
  *
  * That is a safety requirement rather than a matter of taste. This database
  * holds the modification journal: the rows that record, for every file this
@@ -50,6 +51,19 @@
  * must always be able to migrate forward without losing them. A step that
  * rebuilt a table would put a developer's working tree at the mercy of a schema
  * refactor.
+ *
+ * ### The one exception: a routing table whose key must change
+ *
+ * A table outside the modification journal that holds routing state, not
+ * history, may be rebuilt when its primary key must change — SQLite cannot
+ * alter a key in place — and only under all of these conditions: the rebuild
+ * runs inside the step's single transaction; every existing row is copied,
+ * and the copy is counted against the source before the old table is dropped,
+ * so a mismatch rolls the whole step back; the table keeps its name, its
+ * foreign keys and its indexes; and the step stays idempotent. Version 7
+ * ({@link BINDING_HOLDER_KEY_MIGRATION}) is the one such step: it re-keys the
+ * `bindings` routing table by holder and tab. The `modifications` table and
+ * its chains stay additive-only without exception.
  *
  * ## What this module deliberately does not do
  *
@@ -113,9 +127,11 @@ import type { DatabaseSync } from 'node:sqlite';
  * {@link PRODUCER_CLOCK_OFFSET_MIGRATION}. Version 6 adds the persisted
  * project-root identity, the canonical path each session's root was admitted
  * under, which the session manager holds every sink to across a restart — see
- * {@link SESSION_ROOT_IDENTITIES_MIGRATION}.
+ * {@link SESSION_ROOT_IDENTITIES_MIGRATION}. Version 7 keys the tab bindings by
+ * the credential that made them and the tab, so two paired browsers whose tab
+ * ids collide keep their own bindings — see {@link BINDING_HOLDER_KEY_MIGRATION}.
  */
-export const STORE_SCHEMA_VERSION = 6;
+export const STORE_SCHEMA_VERSION = 7;
 
 /**
  * The `subsystem` field every log record from this module carries, so store
@@ -887,6 +903,142 @@ const SESSION_ROOT_IDENTITIES_MIGRATION: StoreMigration = {
   },
 };
 
+/* -------------------------------------------------------------------------------------------------
+ * Version 7 — the tab bindings keyed by holder and tab
+ *
+ * Self-contained on purpose, as versions 4 and 6 are: every statement and
+ * constant of this step lives in this section, so the step can be renumbered
+ * as a unit should another ladder step land first.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The column naming the holder of a tab binding: the `tokenHash` of the
+ * DevTools credential that made it — the value `../server/clients.ts` keys the
+ * live binding by and `../server/auth.ts`'s `requireBoundSession` compares. A
+ * digest, never a credential.
+ *
+ * ## Why the key changes
+ *
+ * A Chrome tab id is unique only within one browser profile. Two paired
+ * extensions — two browsers, or two profiles of one — inspect tabs whose ids
+ * collide, and a table keyed by `tab_id` alone let one browser's bind of its
+ * tab 7 evict the other browser's binding of *its* tab 7: that session lost
+ * its tab and the first principal was refused `TAB_NOT_BOUND` from then on.
+ * Keyed by `(bound_by, tab_id)`, each holder's binding of a tab id is its own
+ * row, while the unique index on `session_id` still gives a session one bound
+ * tab across every holder (AAP §0.2.3).
+ *
+ * The empty string means "holder not recorded": every row this step copies,
+ * because no earlier build recorded one. `./sessions-repo.ts` reads such a row
+ * as part of every holder's view of its tab, so the first re-bind of that tab
+ * — by whichever credential — consumes it exactly as a bind did before.
+ */
+const BINDING_HOLDER_COLUMN = 'bound_by';
+
+/**
+ * Whether `bindings` already declares {@link BINDING_HOLDER_COLUMN}: the probe
+ * that makes the step idempotent — a store this step already re-keyed is left
+ * alone — for the reason {@link CHAIN_FORK_COLUMN_EXISTS_SQL} gives.
+ */
+const BINDING_HOLDER_COLUMN_EXISTS_SQL = `SELECT 1 AS present FROM pragma_table_info('bindings') WHERE name = ?`;
+
+/** The transient name the re-keyed table is built under before it replaces `bindings`. */
+const REKEYED_BINDINGS_TABLE = 'bindings_rekeyed';
+
+/**
+ * The re-keyed table: the version-1 columns behind the holder, the composite
+ * primary key, and the same foreign key and `STRICT` typing `./schema.sql`
+ * declares for every table.
+ */
+const CREATE_REKEYED_BINDINGS_SQL = `CREATE TABLE ${REKEYED_BINDINGS_TABLE} (
+  ${BINDING_HOLDER_COLUMN} TEXT    NOT NULL DEFAULT '',
+  tab_id     INTEGER NOT NULL,
+  session_id TEXT    NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+  url        TEXT    NOT NULL,
+  bound_at   INTEGER NOT NULL,
+  PRIMARY KEY (${BINDING_HOLDER_COLUMN}, tab_id)
+) STRICT`;
+
+/** Copies every existing binding into the re-keyed table, each as recording no holder. */
+const COPY_BINDINGS_SQL = `INSERT INTO ${REKEYED_BINDINGS_TABLE} (${BINDING_HOLDER_COLUMN}, tab_id, session_id, url, bound_at)
+SELECT '', tab_id, session_id, url, bound_at FROM bindings`;
+
+/** Removes the version-1 table, and with it its index; nothing references `bindings`. */
+const DROP_LEGACY_BINDINGS_SQL = 'DROP TABLE bindings';
+
+/** Gives the re-keyed table the name every reader and writer uses. */
+const RENAME_REKEYED_BINDINGS_SQL = `ALTER TABLE ${REKEYED_BINDINGS_TABLE} RENAME TO bindings`;
+
+/**
+ * One bound tab per session, enforced rather than merely indexed — the index
+ * `./schema.sql` declares, re-created on the re-keyed table (and a no-op on a
+ * store that already carries it).
+ */
+const CREATE_BINDINGS_SESSION_INDEX_SQL =
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_session_id ON bindings (session_id)';
+
+/** How many rows the re-keyed table holds, to prove every row was copied. */
+const COUNT_REKEYED_BINDINGS_SQL = `SELECT COUNT(*) AS n FROM ${REKEYED_BINDINGS_TABLE}`;
+
+/** How many rows the version-1 table holds before it is dropped. */
+const COUNT_LEGACY_BINDINGS_SQL = 'SELECT COUNT(*) AS n FROM bindings';
+
+/** A `COUNT(*)` result as a number; `node:sqlite` may answer a `bigint`. */
+function countOf(value: unknown): number {
+  return typeof value === 'bigint' ? Number(value) : typeof value === 'number' ? value : 0;
+}
+
+/**
+ * Schema version 7: the tab bindings keyed by holder and tab — see
+ * {@link BINDING_HOLDER_COLUMN} for why.
+ *
+ * The one step of the ladder that rebuilds a table, under the narrow exception
+ * the module overview sets out: `bindings` is routing state, not part of the
+ * modification journal, and SQLite cannot change a primary key in place. In
+ * the step's single transaction the re-keyed table is created, every row is
+ * copied into it recording no holder, the copy is counted against the source,
+ * the version-1 table is dropped, and the re-keyed table takes its name and
+ * its unique session index. A count that disagrees throws, so the transaction
+ * rolls back and the store stays at version 6 with every row where it was.
+ *
+ * Idempotent: a store whose `bindings` already declares the holder column is
+ * left as it is (only the unique session index is ensured). The adoption path
+ * re-runs version 1's `IF NOT EXISTS` DDL first, which creates nothing over a
+ * re-keyed table, so an adopted store reaches this step unchanged too.
+ *
+ * Only a count reaches the log — never a tab id, a session id or a URL.
+ */
+const BINDING_HOLDER_KEY_MIGRATION: StoreMigration = {
+  version: 7,
+  description: 'key the tab bindings by the credential that made them and the tab',
+  apply: (db, { logger }) => {
+    if (db.prepare(BINDING_HOLDER_COLUMN_EXISTS_SQL).get(BINDING_HOLDER_COLUMN) === undefined) {
+      const existing = countOf(db.prepare(COUNT_LEGACY_BINDINGS_SQL).get()?.['n']);
+
+      db.exec(CREATE_REKEYED_BINDINGS_SQL);
+      db.prepare(COPY_BINDINGS_SQL).run();
+
+      const copied = countOf(db.prepare(COUNT_REKEYED_BINDINGS_SQL).get()?.['n']);
+
+      if (copied !== existing) {
+        throw new Error(
+          `Re-keying the tab bindings copied ${String(copied)} of ${String(existing)} rows.`,
+        );
+      }
+
+      db.exec(DROP_LEGACY_BINDINGS_SQL);
+      db.exec(RENAME_REKEYED_BINDINGS_SQL);
+
+      logger.debug('re-keyed the tab bindings by holder and tab', {
+        subsystem: SUBSYSTEM,
+        keptBindings: copied,
+      });
+    }
+
+    db.exec(CREATE_BINDINGS_SESSION_INDEX_SQL);
+  },
+};
+
 /**
  * The store's schema ladder, in ascending version order.
  *
@@ -894,7 +1046,9 @@ const SESSION_ROOT_IDENTITIES_MIGRATION: StoreMigration = {
  * that may already exist on a developer's machine, and every step must be
  * additive for the reason set out in this module's overview: the modification
  * journal in here is what restores a developer's patched files, so an existing
- * database must always be able to migrate forward without losing a row.
+ * database must always be able to migrate forward without losing a row. The
+ * overview's one exception — a routing table outside the journal rebuilt, every
+ * row copied, when its key must change — is version 7's alone.
  *
  * Version 1 establishes `./schema.sql`; version 2 enforces single-child
  * modification chains and adds the telemetry purge indexes
@@ -905,7 +1059,9 @@ const SESSION_ROOT_IDENTITIES_MIGRATION: StoreMigration = {
  * documents ({@link SESSION_CLEANUP_SUMMARIES_MIGRATION}); version 5 adds the
  * per-producer clock offset column ({@link PRODUCER_CLOCK_OFFSET_MIGRATION});
  * version 6 adds the persisted project-root identity, with no backfill
- * ({@link SESSION_ROOT_IDENTITIES_MIGRATION}).
+ * ({@link SESSION_ROOT_IDENTITIES_MIGRATION}); version 7 re-keys the tab
+ * bindings by holder and tab, copying every row
+ * ({@link BINDING_HOLDER_KEY_MIGRATION}).
  *
  * Appending a step is two edits in one commit. The step takes the next
  * version: one above the highest version in this list, which is the current
@@ -950,6 +1106,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
   SESSION_CLEANUP_SUMMARIES_MIGRATION,
   PRODUCER_CLOCK_OFFSET_MIGRATION,
   SESSION_ROOT_IDENTITIES_MIGRATION,
+  BINDING_HOLDER_KEY_MIGRATION,
 ];
 
 /**

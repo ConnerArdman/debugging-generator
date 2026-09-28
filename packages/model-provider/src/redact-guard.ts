@@ -78,6 +78,16 @@
  * suite pins each shared literal, and the telemetry suites pin the same bytes
  * from their side, so a change made in one place fails in the other two.
  *
+ * The telemetry layer *masks* three further classes this guard does not
+ * *refuse* — `email-address`, `payment-card` and `labelled-secret` (a value
+ * written after a secret-like label such as `token` or `password=`). Masking
+ * them at ingest keeps personal data and opaque tokens out of the store, the
+ * live tail and every aggregate built from them; refusing them here would
+ * refuse the product's own legitimate payloads, because the bounded source
+ * excerpts Stage 2 selects routinely hold an address or a label followed by a
+ * value (a contact field, a form placeholder, a test fixture). Their
+ * `[redacted]` output is ordinary marker text, which passes every rule below.
+ *
  * ## Purity
  *
  * {@link inspectPayload}, {@link inspectPayloadReport},
@@ -113,14 +123,16 @@ import type { ModelRequest } from './types.js';
  * (`high-entropy-secret`); the rest are content shapes that identify
  * themselves wherever they appear.
  *
- * Five ids — `provider-key`, `jwt`, `private-key`, `connection-string` and
- * `bearer-token` — are spelled exactly as `packages/telemetry`'s redaction
- * layer spells them, and four of those also match `scripts/check-secrets.mjs`'s
- * rule ids, so one vocabulary reads across all three enforcement points. The
- * repository gate calls the last class `entropy`; this module and the telemetry
- * layer name the same rule `high-entropy-secret` here because a finding that
- * travels to a user interface has to say what it found rather than how it was
- * measured.
+ * Seven ids — every class but the last — are spelled exactly as
+ * `packages/telemetry`'s redaction layer spells them, and four of those
+ * (`provider-key`, `jwt`, `private-key`, `connection-string`) also match
+ * `scripts/check-secrets.mjs`'s rule ids, so one vocabulary reads across all
+ * three enforcement points. The telemetry layer and the repository gate call
+ * the last class `entropy`; this module names the same rule
+ * `high-entropy-secret` because a finding that travels to a user interface has
+ * to say what it found rather than how it was measured. The telemetry
+ * vocabulary's three ingest-only classes (see "Relationship to the other two
+ * enforcement points" above) are deliberately absent.
  *
  * Declared `as const` so {@link RedactionRuleId} is derived from it: a class
  * added to the table widens the union in the same edit, and every exhaustive

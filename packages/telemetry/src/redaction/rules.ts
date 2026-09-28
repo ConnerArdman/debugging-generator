@@ -76,6 +76,18 @@ export const TRUNCATION_SUFFIX = '\u2026';
  * `entropy`) deliberately match the repository secret gate's rule ids so that
  * logs, findings reports and documentation use one vocabulary across all three
  * enforcement points.
+ *
+ * Three ids are **ingest-only**: `email-address`, `payment-card` and
+ * `labelled-secret` recognise private values that carry no credential shape —
+ * an address or a card number quoted in an element's text or an error
+ * message, a value introduced by a word such as `token` or `password` — and
+ * mask them before an event is stored or tailed. Neither the outbound model
+ * guard nor the repository secret gate knows them, deliberately: the source
+ * excerpts a stage sends may legitimately contain an address or a test card
+ * number, and refusing those would fail the pipeline on the developer's own
+ * code. Their position in this list — after `connection-string`, and in this
+ * order — is also the order they run in, which is load-bearing (see
+ * {@link PATTERN_RULES}).
  */
 export const REDACTION_RULE_IDS = [
   'sensitive-header',
@@ -84,6 +96,9 @@ export const REDACTION_RULE_IDS = [
   'jwt',
   'private-key',
   'connection-string',
+  'email-address',
+  'payment-card',
+  'labelled-secret',
   'url-query-value',
   'entropy',
 ] as const;
@@ -292,6 +307,152 @@ const USERINFO_PASS = '[^\\s/?#@]{1,256}';
  * connection string stays diagnosable.
  */
 const USERINFO_SOURCE = '(' + SCHEME_SOURCE + '://)' + USERINFO_USER + ':' + USERINFO_PASS + '@';
+
+/*
+ * ---------------------------------------------------------------------------
+ * Personal data and labelled secrets in free text
+ *
+ * The rules above recognise a credential by its own shape. The three below
+ * recognise values that have no credential shape and are private because of
+ * what they are — an e-mail address, a payment card number — or because of
+ * the word in front of them (`token secret-token-123`, `password=hunter22`).
+ * Element text, error messages and stack text quote such values freely, and
+ * every string attribute reaches these rules through `scrub`, so they are what
+ * keeps them out of the store and the live tail.
+ *
+ * Each pattern consumes the character in front of its match as capture group
+ * 1 (the kept prefix, by the convention of {@link PatternRule}) instead of
+ * asserting a boundary, because this module uses no lookbehind. That same
+ * boundary is what makes a match start where its run starts: a scan position
+ * inside a run fails at once, so a long run is never matched from its middle.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Characters of an address's local part: the dot-atom characters addresses use in practice. */
+const EMAIL_LOCAL_CHARS = '[A-Za-z0-9._%+-]';
+
+/**
+ * `email-address`: `local@domain.tld`, replaced whole — the domain can
+ * identify a person as well as the local part can.
+ *
+ * The domain is one to eight labels and an alphabetic top-level label, and
+ * the address must not continue into another label character. That keeps a
+ * version specifier (`react@19.3.0`), a stack frame naming a function before
+ * its URL (`handleClick@http://…`, where `http:` is no label) and a scoped
+ * package name (`@scope/name`, which has no local part) from reading as an
+ * address. An `@` inside a URL's authority (`//user:pw@host.test/`) is
+ * userinfo rather than an address, and is left to the rules that own it —
+ * see {@link maskEmailAddress}.
+ */
+const EMAIL_ADDRESS_SOURCE =
+  '(^|[^A-Za-z0-9._%+-])' +
+  EMAIL_LOCAL_CHARS +
+  '{1,64}@(?:[A-Za-z0-9-]{1,63}\\.){1,8}[A-Za-z]{2,63}(?![A-Za-z0-9-])';
+
+/** Fewest digits of a payment card number (ISO/IEC 7812 primary account number). */
+const CARD_MIN_DIGITS = 13;
+
+/** Most digits of a payment card number. */
+const CARD_MAX_DIGITS = 19;
+
+/**
+ * A candidate for `payment-card`: a run of digits with at most one space or
+ * hyphen between any two, starting where a word starts.
+ *
+ * Deliberately wider than a card. Which part of the run is a card number, if
+ * any, is decided by {@link maskCardRun} — the Luhn checksum is arithmetic, not
+ * a pattern. The repeat bound is the scan window, so a run inside the window
+ * is always read whole: a run cut in two by a bound would be judged as two runs
+ * on one pass and as one run on the next, and {@link scrub} would stop being
+ * idempotent.
+ */
+const CARD_RUN_SOURCE =
+  '(^|[^A-Za-z0-9_])[0-9](?:[ -]?[0-9]){' +
+  String(CARD_MIN_DIGITS - 1) +
+  ',' +
+  String(MAX_SCAN_LENGTH) +
+  '}';
+
+/**
+ * The words that label the value after them as a secret, as pattern sources.
+ *
+ * The same credential vocabulary {@link SENSITIVE_NAME_TERMS} applies to
+ * names, narrowed to the words that introduce a value in prose: `key` and
+ * `auth` alone are too common in ordinary text ("primary key 12", "auth
+ * failed"), so a key only counts when it is an API or access key. A term may
+ * end a longer identifier (`access_token`, `clientSecret`, `DB_PASSWORD`),
+ * which the identifier run in front of it in {@link LABELLED_SECRET_SOURCE}
+ * absorbs.
+ */
+const SECRET_LABEL_TERMS: readonly string[] = [
+  'token',
+  'secret',
+  'password',
+  'passwd',
+  'pwd',
+  'passphrase',
+  'api[_-]?key',
+  'access[_-]?key',
+];
+
+/** Characters of a labelled value: the credential characters a token, key or password is written in. */
+const LABEL_VALUE_CHARS = '[A-Za-z0-9._~+/=-]';
+
+/** An optional quote around a label or a value, written plain or JSON-escaped (`\"`). */
+const LABEL_QUOTE = '(?:\\\\?["\'])?';
+
+/**
+ * A digit within the first 256 characters of the value.
+ *
+ * The requirement is what separates a value from prose: "Invalid token
+ * provided", "password: Required" and "token expired" carry no digit, while
+ * generated tokens, keys and nearly every password do. The window is bounded
+ * so that a hostile run of labels inside one long value costs a bounded amount
+ * per label rather than a rescan of the whole run.
+ */
+const LABEL_DIGIT_AHEAD = '(?=' + LABEL_VALUE_CHARS + '{0,255}[0-9])';
+
+/** `token: …`, `password=…`: an assignment, with blanks allowed around the separator. */
+const LABEL_ASSIGNED = '[ \\t]{0,16}[:=][ \\t]{0,16}' + LABEL_QUOTE;
+
+/**
+ * `token …`: a label followed by blanks only. A value in that position needs
+ * six characters as well as a digit, because prose puts short words and
+ * numbers after these terms far more often than an assignment does.
+ */
+const LABEL_SPACED = '[ \\t]{1,16}' + LABEL_QUOTE + '(?=' + LABEL_VALUE_CHARS + '{6})';
+
+/**
+ * `labelled-secret`: a value introduced by a credential word. The kept prefix
+ * (group 1) is everything up to the value — the boundary, the label, its
+ * quotes and the separator — so `token secret-token-123` becomes
+ * `token [redacted]` and the label stays diagnosable.
+ *
+ * A label directly after `?`, `&` or `#` is a query or fragment parameter, and
+ * is left to `./url.ts`, which masks the value positionally to `?`; masking it
+ * here first would leave the marker standing as the parameter's value, which
+ * reads worse and says less. The two denied header names that end in a label
+ * (`X-Api-Key:`, `X-Auth-Token:`) are left to the `sensitive-header` line rule,
+ * which already replaces their whole value, so one header line is one
+ * finding. A value is never `[redacted]` — `[` is outside
+ * {@link LABEL_VALUE_CHARS} — so the rule is a fixed point of its own output.
+ */
+const LABELLED_SECRET_SOURCE =
+  '((?:^|[^A-Za-z0-9_?&#-])(?!(?:x-api-key|x-auth-token)[ \\t]*:)[A-Za-z0-9_-]{0,32}(?:' +
+  SECRET_LABEL_TERMS.join('|') +
+  ')' +
+  LABEL_QUOTE +
+  '(?:' +
+  LABEL_ASSIGNED +
+  '|' +
+  LABEL_SPACED +
+  ')' +
+  LABEL_DIGIT_AHEAD +
+  ')' +
+  LABEL_VALUE_CHARS +
+  '{4,' +
+  RUN_LIMIT +
+  '}';
 
 /**
  * The six header names whose value is always replaced, lower-cased.
@@ -615,6 +776,29 @@ const USERINFO_DETECT = new RegExp(USERINFO_SOURCE);
 const USERINFO_REPLACE = new RegExp(USERINFO_SOURCE, 'g');
 const USERINFO_LOCATE = new RegExp(USERINFO_SOURCE, 'g');
 /*
+ * The address and card rules need a fourth role, a *scan*, because their
+ * detection is not a `test`: a match is only a finding once the code behind
+ * the pattern accepts it (the address is not userinfo; the run holds a
+ * checksum-valid number). Each scan instance is global, used only with `exec`
+ * by {@link scanningDetector}, and reset before every scan, exactly like the
+ * location instances.
+ */
+const EMAIL_SCAN = new RegExp(EMAIL_ADDRESS_SOURCE, 'g');
+const EMAIL_REPLACE = new RegExp(EMAIL_ADDRESS_SOURCE, 'g');
+const EMAIL_LOCATE = new RegExp(EMAIL_ADDRESS_SOURCE, 'g');
+const CARD_RUN_SCAN = new RegExp(CARD_RUN_SOURCE, 'g');
+const CARD_RUN_REPLACE = new RegExp(CARD_RUN_SOURCE, 'g');
+const CARD_RUN_LOCATE = new RegExp(CARD_RUN_SOURCE, 'g');
+/*
+ * Case-insensitive, so `Password:`, `API_KEY=` and `accessToken` are labels.
+ * The flag is safe here where it is not for the header line rule: this rule's
+ * already-redacted test is structural (`[` cannot start a value), not a
+ * byte-for-byte comparison with the marker.
+ */
+const LABELLED_DETECT = new RegExp(LABELLED_SECRET_SOURCE, 'i');
+const LABELLED_REPLACE = new RegExp(LABELLED_SECRET_SOURCE, 'gi');
+const LABELLED_LOCATE = new RegExp(LABELLED_SECRET_SOURCE, 'gi');
+/*
  * The crossing-run instances are non-global: each is used once, with `exec`,
  * to find its leftmost match, and a non-global instance ignores `lastIndex`
  * altogether — so this fourth role, like the first, carries no state between
@@ -662,6 +846,300 @@ function redactPemBlocks(input: string): string {
 }
 
 /**
+ * How far back the token readers below look for the start of the token a
+ * match sits in. A URL's authority, or the part of a URL in front of one query
+ * value, is far shorter than this.
+ */
+const TOKEN_LOOKBACK = 1_024;
+
+/** Characters that end a whitespace-delimited token of text. Non-global, so it carries no state. */
+const TOKEN_BREAK = /[\s"'`<>()]/;
+
+/** Characters that end a URL's authority. Non-global, so it carries no state. */
+const AUTHORITY_END = /[/?#]/;
+
+/** Characters that open a URL's query or fragment. Non-global, so it carries no state. */
+const QUERY_OPENER = /[?#]/;
+
+/** The text of the token `start` sits in, from the token's start up to `start`. */
+function tokenBefore(input: string, start: number): string {
+  const from = Math.max(0, start - TOKEN_LOOKBACK);
+  let tokenStart = from;
+  for (let index = start - 1; index >= from; index -= 1) {
+    if (TOKEN_BREAK.test(input.charAt(index))) {
+      tokenStart = index + 1;
+      break;
+    }
+  }
+  return input.slice(tokenStart, start);
+}
+
+/**
+ * Whether the text in front of `start` opens a URL authority that `start` is
+ * still inside: a `//` earlier in the same token with no `/`, `?` or `#` after
+ * it (`https://`, `//user:`). An `@` there separates userinfo from a host.
+ */
+function isInsideAuthority(input: string, start: number): boolean {
+  const token = tokenBefore(input, start);
+  const opener = token.lastIndexOf('//');
+  return opener >= 0 && !AUTHORITY_END.test(token.slice(opener + 2));
+}
+
+/**
+ * The replacement for an address, a card number or a labelled value that
+ * starts at `start`: {@link REDACTION_MASK} when it sits in a URL's query or
+ * fragment (a `?` or `#` earlier in the same token), {@link REDACTION_MARKER}
+ * anywhere else.
+ *
+ * Inside a query the value is replaced by exactly what `./url.ts` writes for
+ * a query value, so the text is already a fixed point of every URL masker
+ * that reads it next. The marker there would be misread: the URL maskers take
+ * a run ending in the marker for text a scan bound cut and move the marker to
+ * a line of its own, and a masker that strips trailing punctuation from a URL
+ * would keep the marker's closing bracket after the value's mask.
+ *
+ * @param input The whole text being scanned, for the context in front.
+ * @param start Offset in `input` where the masked value starts.
+ */
+function contentMaskAt(input: string, start: number): string {
+  return QUERY_OPENER.test(tokenBefore(input, start)) ? REDACTION_MASK : REDACTION_MARKER;
+}
+
+/**
+ * The replacement for one address match: the leading boundary followed by the
+ * mask of {@link contentMaskAt}, or the match itself when the `@` is a URL's
+ * userinfo separator.
+ *
+ * Userinfo is left to the rules that own it: `connection-string` replaces a
+ * credentialed one wherever a scheme introduces it, and `./url.ts` replaces
+ * any other positionally while keeping the host. Replacing it here would take
+ * the host with it — `//demo:pw@host.test/p` would lose `host.test` and keep
+ * the user name — so an address inside an authority is not an address.
+ *
+ * @param input The whole text being scanned, for the context in front.
+ * @param index Offset of the match in `input`.
+ * @param matched The matched text: `lead` followed by the address.
+ * @param lead Capture group 1, the boundary character in front of the address.
+ */
+function maskEmailAddress(input: string, index: number, matched: string, lead: string): string {
+  const start = index + lead.length;
+  return isInsideAuthority(input, start) ? matched : lead + contentMaskAt(input, start);
+}
+
+/** Replaces every e-mail address in `input` (see {@link maskEmailAddress}). */
+function redactEmailAddresses(input: string): string {
+  return input.replace(EMAIL_REPLACE, (matched: string, lead: string, offset: number) =>
+    maskEmailAddress(input, offset, matched, lead),
+  );
+}
+
+/**
+ * Keeps a labelled value's label and separator and replaces only the value,
+ * with the mask of {@link contentMaskAt}.
+ *
+ * @param _match The whole match: `label` followed by the value.
+ * @param label Capture group 1, the kept label, separator and quote.
+ * @param offset Offset of the match in `input`.
+ * @param input The whole text being scanned.
+ */
+function redactLabelledValue(_match: string, label: string, offset: number, input: string): string {
+  return label + contentMaskAt(input, offset + label.length);
+}
+
+/** Exactly one character that continues a word. Non-global, so it carries no state. */
+const WORD_CHARACTER = /^[A-Za-z0-9_]$/;
+
+/** Whether `unit` is the UTF-16 code of an ASCII digit. */
+function isDigitCode(unit: number): boolean {
+  return unit >= 0x30 && unit <= 0x39;
+}
+
+/**
+ * Whether a digit string is a payment card number: 13 to 19 digits, a first
+ * digit of 2 to 6, and a valid Luhn check digit.
+ *
+ * The first-digit range is the major industry identifiers card networks issue
+ * under (2 and 5 for one network family, 3 for travel and entertainment cards,
+ * 4 for another, 6 for merchandising and banking). It is also what keeps the
+ * commonest long numbers in telemetry out: an epoch timestamp in milliseconds
+ * or microseconds starts with 1 for the rest of this century.
+ *
+ * @param digits ASCII digits only; separators already removed.
+ */
+function isCardNumber(digits: string): boolean {
+  if (digits.length < CARD_MIN_DIGITS || digits.length > CARD_MAX_DIGITS) {
+    return false;
+  }
+  const first = digits.charCodeAt(0) - 0x30;
+  if (first < 2 || first > 6) {
+    return false;
+  }
+  let sum = 0;
+  let doubled = false;
+  for (let index = digits.length - 1; index >= 0; index -= 1) {
+    let digit = digits.charCodeAt(index) - 0x30;
+    if (doubled) {
+      digit *= 2;
+      if (digit > 9) {
+        digit -= 9;
+      }
+    }
+    sum += digit;
+    doubled = !doubled;
+  }
+  return sum % 10 === 0;
+}
+
+/** One group of a candidate run: consecutive digits, with their offsets in the run. */
+interface DigitGroup {
+  readonly start: number;
+  readonly end: number;
+  readonly digits: string;
+}
+
+/** Splits a candidate run (digits with single separators) into its digit groups. */
+function digitGroups(run: string): DigitGroup[] {
+  const groups: DigitGroup[] = [];
+  let start = -1;
+  for (let index = 0; index <= run.length; index += 1) {
+    const isDigit = index < run.length && isDigitCode(run.charCodeAt(index));
+    if (isDigit && start < 0) {
+      start = index;
+    } else if (!isDigit && start >= 0) {
+      groups.push({ start, end: index, digits: run.slice(start, index) });
+      start = -1;
+    }
+  }
+  return groups;
+}
+
+/**
+ * The replacement for one candidate run: the run with every card number in it
+ * replaced by the mask of {@link contentMaskAt}, or the match itself when it
+ * holds none.
+ *
+ * A card number is written whole or in groups, so it is looked for along
+ * group boundaries: from each group, the longest span of whole groups that is
+ * a card number ({@link isCardNumber}) is masked, and the search resumes after
+ * it. That masks `4111 1111 1111 1111` inside `…1111 1111 123` (a number
+ * followed by its security code) without taking the security code for part of
+ * it, and both cards of a list separated by single spaces.
+ *
+ * Two contexts are numbers rather than cards, and are left alone:
+ *
+ * - **A decimal.** A run whose leading boundary is `.` or `,` after a digit is
+ *   the fraction of a number (`0.4111111111111111` is what `Math.random()`
+ *   prints), and a last group followed by `.` or `,` and a digit is its
+ *   integer part.
+ * - **A word.** A last group followed by a letter or `_` belongs to that word —
+ *   the digits that open a hexadecimal identifier or a trace id — and so does
+ *   one followed by another digit, which only happens when the run reached the
+ *   repeat bound and was not read to its end.
+ *
+ * Deterministic and a fixed point: a second pass sees the unmasked groups
+ * again, split by the mask, and every span it can form was already tried and
+ * refused on the first.
+ *
+ * @param input The whole text being scanned, for the context either side.
+ * @param index Offset of the match in `input`.
+ * @param matched The matched text: `lead` followed by the run.
+ * @param lead Capture group 1, the boundary character in front of the run.
+ */
+function maskCardRun(input: string, index: number, matched: string, lead: string): string {
+  if ((lead === '.' || lead === ',') && index > 0 && isDigitCode(input.charCodeAt(index - 1))) {
+    return matched;
+  }
+  const run = matched.slice(lead.length);
+  const groups = digitGroups(run);
+  const after = index + matched.length;
+  const next = input.charAt(after);
+  const gluedToWord = WORD_CHARACTER.test(next);
+  const decimalPoint = (next === '.' || next === ',') && isDigitCode(input.charCodeAt(after + 1));
+  if (gluedToWord || decimalPoint) {
+    groups.pop();
+  }
+
+  const mask = contentMaskAt(input, index + lead.length);
+  let output = '';
+  let copied = 0;
+  let first = 0;
+  while (first < groups.length) {
+    let chosen = -1;
+    let digits = '';
+    for (let last = first; last < groups.length; last += 1) {
+      digits += groups[last]?.digits ?? '';
+      if (digits.length > CARD_MAX_DIGITS) {
+        break;
+      }
+      if (isCardNumber(digits)) {
+        chosen = last;
+      }
+    }
+    const opening = groups[first];
+    const closing = chosen < 0 ? undefined : groups[chosen];
+    if (opening === undefined || closing === undefined) {
+      first += 1;
+      continue;
+    }
+    output += run.slice(copied, opening.start) + mask;
+    copied = closing.end;
+    first = chosen + 1;
+  }
+  return copied === 0 ? matched : lead + output + run.slice(copied);
+}
+
+/** Replaces every card number in `input` (see {@link maskCardRun}). */
+function redactCardNumbers(input: string): string {
+  return input.replace(CARD_RUN_REPLACE, (matched: string, lead: string, offset: number) =>
+    maskCardRun(input, offset, matched, lead),
+  );
+}
+
+/**
+ * What a rule's detection needs: a `test` over a value. A `RegExp` is one, for
+ * the rules a pattern decides alone; {@link scanningDetector} builds the other
+ * kind, for the rules whose matches a pattern can only propose.
+ */
+interface ContentDetector {
+  test(input: string): boolean;
+}
+
+/** The replacement a proposing rule computes for one match; the match itself means "not a finding". */
+type MatchMasker = (input: string, index: number, matched: string, lead: string) => string;
+
+/**
+ * Detection for a rule whose pattern proposes candidates and whose code
+ * decides them: whether any candidate the scan finds would be changed by the
+ * rule's own masker.
+ *
+ * It answers from the replacement itself, so detection and redaction cannot
+ * disagree. `scan` is a global instance used only here, with `exec`, and reset
+ * before every scan; like every detector it reads the value it is given end to
+ * end.
+ */
+function scanningDetector(scan: RegExp, mask: MatchMasker): ContentDetector {
+  return Object.freeze<ContentDetector>({
+    test(input: string): boolean {
+      scan.lastIndex = 0;
+      let match = scan.exec(input);
+      while (match !== null) {
+        if (mask(input, match.index, match[0], match[1] ?? '') !== match[0]) {
+          return true;
+        }
+        match = scan.exec(input);
+      }
+      return false;
+    },
+  });
+}
+
+/** `email-address` detection: an address outside a URL authority. */
+const EMAIL_DETECTOR: ContentDetector = scanningDetector(EMAIL_SCAN, maskEmailAddress);
+
+/** `payment-card` detection: a candidate run holding a card number. */
+const CARD_DETECTOR: ContentDetector = scanningDetector(CARD_RUN_SCAN, maskCardRun);
+
+/**
  * One content-driven rule: how it is detected, how it is replaced, and how a
  * cut near it is placed.
  *
@@ -675,8 +1153,12 @@ function redactPemBlocks(input: string): string {
 interface PatternRule {
   /** Vocabulary id reported for this rule. */
   readonly id: RedactionRuleId;
-  /** Non-global instance, used only with `test`. */
-  readonly detect: RegExp;
+  /**
+   * Answers whether a value holds this rule's shape: a non-global `RegExp`,
+   * used only with `test`, or a {@link scanningDetector} for a rule whose
+   * matches a pattern can only propose.
+   */
+  readonly detect: ContentDetector;
   /** Replaces every occurrence, leaving no partial match behind. */
   readonly redact: (input: string) => string;
   /**
@@ -792,6 +1274,53 @@ const PATTERN_RULES: readonly PatternRule[] = Object.freeze<PatternRule[]>([
     // Likewise for a password longer than the rule's `{1,256}` bound: the `@`
     // that would terminate it can no longer be reached.
     crossing: USERINFO_CROSSING,
+  },
+  // The three ingest-only rules run after every credential rule, and their
+  // order among themselves matters:
+  //
+  // - `connection-string` first, because a credentialed URL's password
+  //   followed by `@host.tld` also reads as an address; replacing the address
+  //   first would take the host with it and leave the user name behind.
+  // - `email-address` before `payment-card`, because an address's replacement
+  //   ends in `]` (or is `?`, inside a URL query), which is a boundary a card
+  //   run can start after: masking the address first means the card rule sees
+  //   that boundary on this pass rather than on the next, which is what keeps
+  //   `scrub` idempotent.
+  //
+  // None of the three needs a crossing pattern or a continuation. The longest
+  // address (64 + 1 + 8 × 64 + 63 code units) and the longest card span (19
+  // digits and 18 separators) are far shorter than `BOUNDARY_OVERLAP`, so a
+  // match that begins before a cut always ends inside the examined window.
+  // A labelled value can be longer, but its rule needs no terminator after
+  // the value, so it matches across a cut whatever the value's length; its
+  // continuation only stands in for the digit its value requires.
+  {
+    id: 'email-address',
+    detect: EMAIL_DETECTOR,
+    redact: redactEmailAddresses,
+    // Locates userinfo-shaped matches too: a cut inside `//user:pw@host.test`
+    // moving back to where the run starts drops what the URL rules would have
+    // masked anyway, which is the safe direction.
+    locate: EMAIL_LOCATE,
+    continuation: '',
+  },
+  {
+    id: 'payment-card',
+    detect: CARD_DETECTOR,
+    redact: redactCardNumbers,
+    // Locates every candidate run, not only a checksum-valid one, so a cut
+    // moves in front of any long digit run it would split: a head of digits
+    // cannot be judged once its tail is gone, and dropping it is the safe
+    // direction.
+    locate: CARD_RUN_LOCATE,
+    continuation: '',
+  },
+  {
+    id: 'labelled-secret',
+    detect: LABELLED_DETECT,
+    redact: (input) => input.replace(LABELLED_REPLACE, redactLabelledValue),
+    locate: LABELLED_LOCATE,
+    continuation: '0'.repeat(8),
   },
 ]);
 
@@ -1026,10 +1555,11 @@ export function cutAtCredentialBoundary(value: string, limit: number): string {
 /**
  * Holds a scrubbed result to {@link MAX_SCAN_LENGTH} code units.
  *
- * Three rules grow the text they replace (`Bearer x` becomes
- * `Bearer [redacted]`, `Cookie: a` becomes `Cookie: [redacted]`, and short
- * userinfo becomes the marker), so a value just under the bound can come back
- * over it. Clamping here keeps
+ * Several rules grow the text they replace (`Bearer x` becomes
+ * `Bearer [redacted]`, `Cookie: a` becomes `Cookie: [redacted]`,
+ * `token: ab12` becomes `token: [redacted]`, and short userinfo or a short
+ * address such as `a@b.io` becomes the marker), so a value just under the
+ * bound can come back over it. Clamping here keeps
  * {@link scrub} idempotent: its output is always short enough that a second
  * call takes the unbounded path and changes nothing. The cut goes through
  * {@link cutAtCredentialBoundary} like every other cut in this module: the
@@ -1184,7 +1714,8 @@ export function isSensitiveKeyName(name: string): boolean {
  * Removes credential material from a value by content, applying every
  * content-driven rule: sensitive header lines, provider credentials, bearer
  * credentials, JOSE tokens, PEM private keys and credentialed connection
- * strings.
+ * strings, then e-mail addresses, payment card numbers and values labelled by
+ * a credential word.
  *
  * Guarantees, each covered by the colocated tests:
  *

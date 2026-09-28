@@ -18,13 +18,18 @@
  *     ISOLATED-world bridge.
  *
  * Not declared: `action`/`default_popup`, `options_page`, `omnibox`,
- * `commands`, `externally_connectable`, `content_security_policy` and
- * `web_accessible_resources`. The extension has no such surface, and each one
- * would widen the permission boundary documented in `docs/SECURITY.md`. A
- * manifest-declared content script is injected by Chrome from the extension
- * package, so the MAIN-world agent needs no web-accessible-resource entry, and
- * neither does the bridge: `vite.config.ts` builds it as one self-contained
- * IIFE, so it imports no chunk a page would have to be able to fetch.
+ * `commands`, `externally_connectable` and `web_accessible_resources`. The
+ * extension has no such surface, and each one would widen the permission
+ * boundary documented in `docs/SECURITY.md`. A manifest-declared content script
+ * is injected by Chrome from the extension package, so the MAIN-world agent
+ * needs no web-accessible-resource entry, and neither does the bridge:
+ * `vite.config.ts` builds it as one self-contained IIFE, so it imports no chunk
+ * a page would have to be able to fetch.
+ *
+ * Declared although it adds no surface: `content_security_policy`, which
+ * narrows the boundary instead of widening it. Every extension page runs under
+ * the deny-by-default policy {@link EXTENSION_PAGES_CSP} rather than Chrome's
+ * default one, which restricts scripts and plugins only.
  */
 import { defineManifest } from '@crxjs/vite-plugin';
 
@@ -51,6 +56,74 @@ const VERSION = '0.1.0';
  * array.
  */
 const LOCAL_APP_ORIGINS = ['http://localhost/*', 'http://127.0.0.1/*'] as const;
+
+/**
+ * The directives of {@link EXTENSION_PAGES_CSP}, one per entry, in the order
+ * the policy string lists them.
+ */
+const EXTENSION_PAGES_CSP_DIRECTIVES = [
+  // Deny by default. Every fetch directive not named below falls back to this
+  // one - `font-src`, `frame-src`, `media-src`, `manifest-src` and `child-src`
+  // - so no font, frame, media file or plugin loads from anywhere.
+  "default-src 'none'",
+  // Scripts, and through the `worker-src` fallback workers, come only from the
+  // extension package. No `'unsafe-inline'`, no `'unsafe-eval'` (which Manifest
+  // V3 forbids an extension page in any case) and no `'wasm-unsafe-eval'`:
+  // nothing here compiles WebAssembly, and `src/shared/csp-runtime.ts` switches
+  // Zod to its jitless path before any schema exists, so no page ever attempts
+  // `eval` or `new Function`.
+  "script-src 'self'",
+  "object-src 'none'",
+  // The panel's stylesheet is a file the build emits. React writes `style`
+  // props through the CSSOM, which `style-src` does not govern, so no
+  // `'unsafe-inline'` is needed for them.
+  "style-src 'self'",
+  // Only packaged images. Neither `data:` nor `blob:`: no extension page
+  // renders an image it did not ship.
+  "img-src 'self'",
+  // The extension itself, and the local service on exactly the two hosts
+  // `src/background/auth.ts` (`parseServiceEndpoint`) accepts as its address -
+  // named with `http:`, because the service listens over plain HTTP (CSP also
+  // lets an `http:` source match `https:` on the same host, which stays on
+  // loopback), and on any port, because `DEBUGGEN_PORT` is configurable (a `:*`
+  // port also matches an address whose port is omitted). The `ws:` sources are
+  // the service socket: a CSP `http:` source does not match a `ws:` URL. Keep
+  // these hosts in step with `SERVICE_ENDPOINT_HOSTNAMES` there and with
+  // LOCAL_APP_ORIGINS above.
+  "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*",
+  // No `<base>` element can re-point the pages' relative URLs.
+  "base-uri 'none'",
+  // No form submits anywhere: the pairing dialog's form is handled by script
+  // (`preventDefault`) and never navigates.
+  "form-action 'none'",
+] as const;
+
+/**
+ * `content_security_policy.extension_pages`: the policy Chrome enforces on
+ * every extension page - the DevTools page, the panel document and the module
+ * service worker. The two content scripts are not extension pages and are not
+ * governed by it: the MAIN-world agent runs under the developer's page policy,
+ * and the ISOLATED-world bridge makes no network request of its own.
+ *
+ * Why it is declared at all: Chrome's default Manifest V3 policy restricts
+ * `script-src` and `object-src` only, and `host_permissions` govern neither
+ * image loads nor CORS-enabled `fetch`. Under the default, a script running in
+ * an extension page could send data to any web origin through
+ * `new Image().src` or `fetch(url, { mode: 'cors' })`; under this policy both
+ * are refused and reported as a `securitypolicyviolation`, so nothing an
+ * extension page holds can leave the machine by either channel.
+ *
+ * Deliberately absent:
+ *   - `frame-ancestors`: DevTools hosts the panel document in a frame of its
+ *     own, so restricting the ancestors would stop the panel from rendering;
+ *   - `upgrade-insecure-requests`: it would rewrite the service's plain-HTTP
+ *     loopback address to `https:`, which the service does not serve;
+ *   - a `sandbox` policy: the extension has no sandboxed page.
+ *
+ * `docs/SECURITY.md` quotes this string verbatim, and `test/manifest.test.ts`
+ * asserts the built value both as a whole and directive by directive.
+ */
+const EXTENSION_PAGES_CSP = EXTENSION_PAGES_CSP_DIRECTIVES.join('; ');
 
 export default defineManifest({
   manifest_version: 3,
@@ -119,6 +192,14 @@ export default defineManifest({
   // `src/background/auth.ts` (`parseServiceEndpoint`) enforces - since no other
   // host or scheme is granted.
   host_permissions: [...LOCAL_APP_ORIGINS],
+
+  // The egress boundary the host permissions above cannot draw on their own;
+  // see EXTENSION_PAGES_CSP. Only `extension_pages`: there is no sandboxed page.
+  // @crxjs/vite-plugin 2.7.1 passes the key through to `dist/manifest.json`
+  // unchanged on a build.
+  content_security_policy: {
+    extension_pages: EXTENSION_PAGES_CSP,
+  },
 
   // Two static entries, and the ORDER IS THE CONTRACT: Chrome injects the
   // scripts of one entry in declaration order, so the MAIN-world agent must come

@@ -56,9 +56,12 @@
  * error - is declared identically by this file and by the text-entry primitive
  * so that a toolbar row of a text field and a picker aligns on one grid. That
  * duplication is DELIBERATE and must not be "fixed" by extracting a shared
- * field helper: the primitive list of AAP 0.6.2 is fixed at fourteen files, so
- * no fifteenth helper module may be created, and AAP 0.6.4 ranks design-system
- * compliance above code quality when the two disagree. The stylesheet is the
+ * field component: the primitive list of AAP 0.6.2 is fixed at fourteen
+ * components, so no fifteenth field component may be created, and AAP 0.6.4
+ * ranks design-system compliance above code quality when the two disagree.
+ * (`./untrusted-text` is not such a component: it renders nothing, and every
+ * primitive shares it so a direction control in a label, a hint, an error or an
+ * option is revealed by one definition.) The stylesheet is the
  * shared artefact instead: one `dg-field*` rule set in
  * `../styles/components.css` serves both components, which is also why the two
  * files' wrapper markup and class usage must stay comparable line for line.
@@ -99,6 +102,8 @@ import clsx from 'clsx';
 import { ChevronDown } from 'lucide-react';
 import type { ChangeEvent, ReactElement, Ref, SelectHTMLAttributes } from 'react';
 import { useId } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * One choice offered by the picker.
@@ -496,7 +501,7 @@ export function Select(props: SelectProps): ReactElement {
         className={clsx('dg-field__label', labelHidden && 'dg-visually-hidden')}
         htmlFor={fieldId}
       >
-        {label}
+        {formatUntrustedText(label)}
       </label>
 
       <div className={clsx('dg-field__control', 'dg-select')}>
@@ -513,7 +518,7 @@ export function Select(props: SelectProps): ReactElement {
         >
           {showPlaceholder ? (
             <option value="" disabled>
-              {placeholderText}
+              {formatUntrustedNode(placeholderText)}
             </option>
           ) : null}
 
@@ -521,10 +526,14 @@ export function Select(props: SelectProps): ReactElement {
               every `options[i]` to `SelectOption | undefined`, and the only ways
               out of that are a non-null assertion or a widening cast, neither of
               which this package admits. The key is the value, which is the one
-              field an option list must keep unique. */}
+              field an option list must keep unique. The label is the only text
+              the platform popup draws, and it may be a captured value (a
+              component or kind a filter offers), so its direction controls are
+              revealed here; the option's `value` stays raw, because it is what
+              `onValueChange` reports back to the caller. */}
           {options.map((option) => (
             <option key={option.value} value={option.value} disabled={option.disabled}>
-              {option.label}
+              {formatUntrustedText(option.label)}
             </option>
           ))}
         </select>
@@ -547,13 +556,13 @@ export function Select(props: SelectProps): ReactElement {
 
       {hintText !== undefined ? (
         <p className="dg-field__hint" id={hintElementId}>
-          {hintText}
+          {formatUntrustedNode(hintText)}
         </p>
       ) : null}
 
       {errorText !== undefined ? (
         <p className="dg-field__error" id={errorElementId}>
-          {errorText}
+          {formatUntrustedNode(errorText)}
         </p>
       ) : null}
     </div>

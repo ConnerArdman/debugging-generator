@@ -16,13 +16,16 @@
  *   on the title of version 2 rather than on `<body>`.
  * - **Each generation reads its own panel's evidence.** Every query the views
  *   make carries the id of the panel they were drawn for.
+ * - **A hostile failure stays legible (QA-SEC F02).** Markup and a
+ *   right-to-left override pair in the generation failure's message render as
+ *   text, each direction control printed as its visible `\u202E`-style escape.
  *
  * Collected by the root `vitest.config.ts` into the `chrome-extension` project
  * (happy-dom). Every string here is generic vocabulary written for this suite;
  * it names nothing of an inspected project.
  */
 
-import { createDataProvider } from '@debuggen/panel-renderer';
+import { containsDirectionControl, createDataProvider } from '@debuggen/panel-renderer';
 import type {
   DataProvider,
   DataQueryResolver,
@@ -193,5 +196,42 @@ describe('PanelView replacing a panel with its follow-up version', () => {
     expect(screen.getByRole('heading', { level: 2, name: PANEL_TITLE }).textContent).toBe(
       PANEL_TITLE,
     );
+  });
+});
+
+/**
+ * The label QA-SEC F02 ingested: markup wrapped in U+202E RIGHT-TO-LEFT
+ * OVERRIDE and U+202C POP DIRECTIONAL FORMATTING, which drew its tail reversed
+ * while `textContent` stayed logical.
+ */
+const BIDI_LABEL = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** The same label as the view prints it: each control as its visible escape. */
+const REVEALED_LABEL = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+describe('PanelView — hostile failure text', () => {
+  it("prints each direction control of the failure's message as its visible escape", () => {
+    const { provider } = makeTransport();
+
+    render(
+      <PanelView
+        spec={undefined}
+        status="error"
+        error={{ message: `Analysis stopped: ${BIDI_LABEL}` }}
+        dataProvider={provider}
+        actions={makeActions()}
+        theme="dark"
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(`Analysis stopped: ${REVEALED_LABEL}`);
+    expect(document.querySelector('script')).toBeNull();
+    expect(containsDirectionControl(document.body.textContent)).toBe(false);
+    for (const element of document.body.querySelectorAll('*')) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(containsDirectionControl(attribute.value), attribute.name).toBe(false);
+      }
+    }
   });
 });

@@ -42,6 +42,10 @@
  *   - **A failed record says why**, beside its saved original.
  *   - **"Copy path" copies the backup path exactly**, says so, and when the
  *     clipboard refuses selects the path for the platform's copy shortcut.
+ *   - **Direction controls are shown, never obeyed**: a U+202E/U+202C pair in a
+ *     file, backup path or service message prints as visible escapes in the
+ *     chip, callout, control names and diff region, while "Open file" and
+ *     "Copy path" still hand over the raw strings.
  *   - **The three states** and their precedence: error > pending > empty > list.
  *   - **Missing records are stated** as a polite status above the list, or in
  *     place of the empty state, with a "Load all modifications" control.
@@ -1163,6 +1167,129 @@ describe('ModificationsList open file', () => {
 
     expect(screen.queryByRole('button', { name: /^Open file/u })).toBeNull();
     expect(screen.getAllByRole('button', { name: /^View diff of /u })).toHaveLength(RECORDS.length);
+  });
+});
+
+describe('ModificationsList direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) around markup.
+   * Escaping keeps the markup inert, but the override alone would draw the text
+   * between them backwards. Every code point is written as an escape so this
+   * suite is not itself a carrier of what it defends against.
+   */
+  const SPOOF = '\u202E</td><script>alert(7)</script>\u202C';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * What a reader must see: each control of {@link SPOOF} printed as its
+   * visible escape and every other character untouched. Spelled out here
+   * rather than by calling the formatter, so the suite pins the output.
+   */
+  function revealed(text: string): string {
+    return text.replaceAll('\u202E', '\\u202E').replaceAll('\u202C', '\\u202C');
+  }
+
+  /** The `/` separators split the spoof across the chip's lead and file name. */
+  const FILE = `src/spoof/${SPOOF}.ts`;
+  const BACKUP = `/home/dev/.debuggen/backups/ses_fixture/${SPOOF}`;
+  const SPOOFED = numberedRecord(20, FILE, 'conflict', { backupPath: BACKUP });
+
+  /** The service's own wording for a missing file, carrying the spoof. */
+  const MESSAGE = `'${FILE}' is missing, so nothing was written.`;
+
+  /**
+   * Asserts that no text node and no attribute under `root` carries a raw
+   * direction control.
+   */
+  function expectNoRawControl(root: HTMLElement): void {
+    expect(root.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(root.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
+  }
+
+  it('shows each control as a visible escape in the chip, the hidden copy and every control name', () => {
+    const { container } = render(
+      <ModificationsList modifications={[SPOOFED]} onOpenFile={vi.fn()} />,
+    );
+
+    const item = itemAt(container, 0);
+    const chip = item.querySelector('.dgv-path');
+    expect(chip?.getAttribute('dir')).toBe('ltr');
+    expect(chip?.textContent).toBe(revealed(FILE));
+    expect(chip?.getAttribute('title')).toBe(revealed(FILE));
+    expect(chip?.querySelector('.dgv-path__lead')?.textContent).toBe(
+      'src/spoof/\\u202E</td><script>alert(7)</',
+    );
+    expect(chip?.querySelector('.dgv-path__name')?.textContent).toBe('script>\\u202C.ts');
+    expect(item.querySelector('.dgv-modifications__head .dg-visually-hidden')?.textContent).toBe(
+      revealed(FILE),
+    );
+
+    // AAP 0.5.5's sentence, composed from the record's own values.
+    expect(item.querySelector('.dgv-modifications__message')?.textContent).toBe(
+      `${revealed(FILE)} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${revealed(BACKUP)}.`,
+    );
+
+    expect(screen.getByRole('button', { name: `View diff of ${revealed(FILE)}` })).toBeDefined();
+    expect(screen.getByRole('button', { name: `Open file ${revealed(FILE)}` })).toBeDefined();
+    expect(
+      screen.getByRole('button', {
+        name: `Copy path of the saved original of ${revealed(FILE)}`,
+      }),
+    ).toBeDefined();
+
+    expectNoRawControl(container);
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+  });
+
+  it('reveals the service’s own message and the opened diff’s region name', async () => {
+    const user = userEvent.setup();
+    const conflict = conflictWithoutDiffs({
+      recordId: SPOOFED.id,
+      file: FILE,
+      backupPath: BACKUP,
+      reason: 'file-missing',
+      message: MESSAGE,
+    });
+    const { container } = render(
+      <ModificationsList modifications={[SPOOFED]} conflicts={[conflict]} />,
+    );
+
+    const item = itemAt(container, 0);
+    expect(item.querySelector('.dgv-modifications__message')?.textContent).toBe(revealed(MESSAGE));
+
+    await user.click(screen.getByRole('button', { name: `View diff of ${revealed(FILE)}` }));
+
+    const region = within(onlyDetail(container)).getByRole('region', {
+      name: `Diff of ${revealed(FILE)} (Change made by Debug Generator)`,
+    });
+    expect(region.textContent).toContain(`--- a/${revealed(FILE)}`);
+    expectNoRawControl(container);
+  });
+
+  it('opens the raw file and copies the raw backup path, controls included', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
+    stubClipboard(writeText);
+    render(<ModificationsList modifications={[SPOOFED]} onOpenFile={onOpenFile} />);
+
+    await user.click(screen.getByRole('button', { name: `Open file ${revealed(FILE)}` }));
+    fireEvent.click(
+      screen.getByRole('button', { name: `Copy path of the saved original of ${revealed(FILE)}` }),
+    );
+    await settleCopy();
+
+    expect(onOpenFile.mock.calls).toEqual([[FILE]]);
+    expect(onOpenFile.mock.calls[0]?.[0]).toMatch(RAW_CONTROL);
+    expect(writeText.mock.calls).toEqual([[BACKUP]]);
+    expect(writeText.mock.calls[0]?.[0]).toMatch(RAW_CONTROL);
   });
 });
 

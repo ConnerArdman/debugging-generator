@@ -72,6 +72,11 @@
  *   - **The three states of a query-backed view** and the **click-to-source
  *     payload**, the contracts every query-backed component in this folder is
  *     held to.
+ *   - **Captured text displays its logical order.** A Unicode direction
+ *     control in a span name, a lineage value or the node's title is drawn as
+ *     its visible escape (`\u202E`) in the bar's label, its SVG `<title>`, its
+ *     accessible name, the table and its caption — nowhere raw, never as
+ *     markup — while the selection a bar raises still carries the raw event id.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -156,6 +161,7 @@ import {
   KIND_LABELS,
   NOT_AVAILABLE_LABEL,
   TIER_LABELS,
+  containsDirectionControl,
   createEstimateMeasure,
   formatCount,
   formatDuration,
@@ -6011,5 +6017,171 @@ describe('Timeline chart accessible names', () => {
       expect(bar.getAttribute('aria-label')).toContain(`tier, ${NOT_AVAILABLE_LABEL} at`);
       expect(bar.getAttribute('aria-label')).not.toContain(`tier, ${formatDuration(0)} at`);
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * The QA report's payload: an escaped script tag behind a right-to-left
+ * override, which a browser draws backwards while `textContent` still holds the
+ * logical string. Written with escapes, never with the characters.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A span name carrying an override and its pop around escaped markup. */
+const BIDI_NAME = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** That name as it must display: both controls as their printable escapes. */
+const BIDI_SHOWN = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** The span's event id, carrying an override that must reach the host raw. */
+const BIDI_EVENT_ID = 'event-\u202Ebidi-0002';
+
+/** A lineage value carrying an override, and how it must display. */
+const BIDI_LINEAGE = 'async\u202E-continuation';
+const BIDI_LINEAGE_SHOWN = 'async\\u202E-continuation';
+
+/** The request whose name carries the payload. */
+const BIDI_EVENT = makeEvent({
+  id: BIDI_EVENT_ID,
+  spanId: spanIdFor(2),
+  parentSpanId: spanIdFor(1),
+  kind: 'fetch',
+  name: BIDI_NAME,
+  tier: 'browser',
+  startTime: BASE_START_MS + 8,
+  duration: 400,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/**
+ * A commit attributed across an asynchronous boundary with the hostile request
+ * as its other candidate, so its description names that request — and the
+ * lineage value it carries — in words.
+ */
+const BIDI_CONTINUATION = makeEvent({
+  id: 'event-example-0003',
+  spanId: spanIdFor(3),
+  parentSpanId: spanIdFor(1),
+  kind: 'render',
+  name: 'example.commit',
+  tier: 'browser',
+  startTime: BASE_START_MS + 600,
+  duration: 47,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 2,
+  ingestSeq: 3,
+  attributes: {
+    lineage: BIDI_LINEAGE,
+    lineageAmbiguous: true,
+    lineageCandidates: [spanIdFor(2)],
+  },
+});
+
+/** The interaction, the hostile request and the commit, as one correlated tree. */
+function bidiTree(): TraceTree {
+  return makeTree([
+    makeTraceNode(INTERACTION_EVENT, {
+      depth: 0,
+      children: [
+        makeTraceNode(BIDI_EVENT, { depth: 1 }),
+        makeTraceNode(BIDI_CONTINUATION, {
+          depth: 1,
+          lineage: { value: BIDI_LINEAGE, ambiguous: true, candidateSpanIds: [spanIdFor(2)] },
+        }),
+      ],
+    }),
+  ]);
+}
+
+/**
+ * Asserts nothing in the document displays a raw direction control — not its
+ * text, which includes every SVG `<title>` and `<text>`, and not a `title` or
+ * `aria-label` — and that the payload's escaped markup never became an element.
+ */
+function expectNothingReorders(): void {
+  const root = document.body;
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of Array.from(root.querySelectorAll('*'))) {
+    for (const attribute of ['title', 'aria-label']) {
+      const value = element.getAttribute(attribute);
+      if (value !== null) {
+        expect(containsDirectionControl(value)).toBe(false);
+      }
+    }
+  }
+  expect(root.querySelector('script')).toBeNull();
+}
+
+describe('Timeline direction controls in captured text', () => {
+  it('draws, names and lists a hostile span in its logical order, and selects it raw', async () => {
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ title: `Timeline ${BIDI_NAME}` }), {
+      provider: resolvingTrace(bidiTree()).provider,
+      actions: spies.actions,
+    });
+
+    const canvas = await findCanvas();
+
+    // The bar's accessible name and its SVG title are the same revealed
+    // sentence, opening with the revealed name.
+    const bar = barTitled(canvas, BIDI_SHOWN);
+    expect(bar.getAttribute('aria-label')).toBe(bar.querySelector('title')?.textContent);
+    expect(bar.getAttribute('aria-label')?.startsWith(`${BIDI_SHOWN} — `)).toBe(true);
+
+    // The commit's description names the hostile request as its other
+    // candidate, and its own lineage value, both revealed.
+    const commit = barTitled(canvas, BIDI_CONTINUATION.name);
+    const commitName = commit.getAttribute('aria-label') ?? '';
+    expect(commitName).toContain(`(${BIDI_LINEAGE_SHOWN})`);
+    expect(commitName).toContain(`${BIDI_SHOWN} (${spanIdFor(2)})`);
+
+    // The visible label beside or inside the bar is revealed too, whether it
+    // was drawn whole or shortened.
+    const labels = barLabelsOf(canvas);
+    expect(labels.some((label) => label.startsWith('QA_BIDI \\u202E'))).toBe(true);
+
+    // The equivalent lists the row by its revealed name, and the grid is
+    // named by the revealed node title.
+    expect(renderedNames()).toContain(BIDI_SHOWN);
+    screen.getByRole('grid', { name: (name) => name.startsWith(`Timeline ${BIDI_SHOWN}: `) });
+
+    expectNothingReorders();
+
+    // Selecting the bar hands the host the raw coordinates of the record.
+    await user.click(bar);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_EVENT_ID,
+      spanId: BIDI_EVENT.spanId,
+      traceId: BIDI_EVENT.traceId,
+    });
+
+    // The detail strip now shows the selection, revealed like everything else.
+    expectNothingReorders();
+  });
+
+  it('draws a short hostile name whole, as its revealed text, where it fits', async () => {
+    // A root short enough to be labelled whole inside its bar, which is the
+    // path that does not go through the fitting helper.
+    const root: TelemetryEvent = { ...INTERACTION_EVENT, name: 'example.\u202Eclick\u202C' };
+
+    renderComponent(makeNode(), {
+      provider: resolvingTrace(makeTree([makeTraceNode(root, { depth: 0 })])).provider,
+      actions: makeActions().actions,
+    });
+
+    const canvas = await findCanvas();
+    expect(barLabelsOf(canvas)).toEqual([
+      `example.\\u202Eclick\\u202C · ${formatDuration(root.duration)}`,
+    ]);
+    expect(barLabelPlacementsOf(canvas)).toEqual(['inside']);
+    expectNothingReorders();
   });
 });

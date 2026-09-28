@@ -84,7 +84,11 @@ import type {
   PanelHostActions,
 } from '../host/PanelActions';
 import { SummaryHeader } from '../layout/SummaryHeader';
-import { NOT_AVAILABLE_LABEL } from '../utils/format';
+import {
+  NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
+  formatUntrustedText,
+} from '../utils/format';
 import { SourceLink, sourceLinkAccessibleName } from './SourceLink';
 import type { SourceLinkTextInputs } from './SourceLink';
 
@@ -1049,6 +1053,156 @@ describe('SourceLink purity', () => {
     expect(errorSpy).toHaveBeenCalledTimes(0);
     expect(warnSpy).toHaveBeenCalledTimes(0);
     expect(logSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in a location
+ *
+ * A path, a symbol and a caption are untrusted, and an invisible right-to-left
+ * override (U+202E) in one of them would draw the characters after it
+ * backwards, so a chip could read as one place and open another. The chip
+ * prints every such control as its visible escape — `\u202E` — in its runs, its
+ * tooltip and its name, weighs display text only against display text, and
+ * still hands the host the very location object it was given.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escapes the chip prints in their place. */
+const RLO_MARKER = '\\u202E';
+const PDF_MARKER = '\\u202C';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered container.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('SourceLink direction controls', () => {
+  it('prints every control as its escape and forwards the raw location', async () => {
+    const location = makeLocation({
+      file: `src/${RLO}exe.txt${PDF}/example/widget.ts`,
+      symbol: `handle${RLO}noitcA${PDF}`,
+    });
+    const snapshot = cloneLocation(location);
+    const onOpenSource = makeOpenSourceSpy();
+
+    const { container } = render(<SourceLink location={location} onOpenSource={onOpenSource} />);
+
+    // Nothing a reader sees, hovers or hears carries a raw control.
+    expect(rawDirectionSinks(container)).toEqual([]);
+
+    // The runs show the markers where the controls were, in captured order.
+    const shownSymbol = `handle${RLO_MARKER}noitcA${PDF_MARKER}`;
+    expect(screen.getByText(shownSymbol).textContent).toBe(shownSymbol);
+
+    // The name is the exported rule's own answer, and it is display text too.
+    const name = sourceLinkAccessibleName({ location });
+    expect(containsDirectionControl(name)).toBe(false);
+    expect(name).toContain(RLO_MARKER);
+    const chip = screen.getByRole('button', { name });
+    expect(chip.getAttribute('aria-label')).toBe(name);
+
+    // The tooltip is the symbol-first form, revealed.
+    expect(screen.getByRole('tooltip', { hidden: true }).textContent).toBe(
+      formatUntrustedText(`${location.symbol ?? ''} — ${formatSourceLocation(location)}`),
+    );
+
+    // The click hands over the very object, raw code points and all.
+    await userEvent.setup().click(chip);
+    expect(soleLocation(onOpenSource)).toBe(location);
+    expect(location).toEqual(snapshot);
+    expect(location.file).toContain(RLO);
+  });
+
+  it('does not call a short path abbreviated merely because it carries a control', () => {
+    const location = makeLocation({ file: `src/wid${RLO}get.ts` });
+
+    render(<SourceLink location={location} onOpenSource={makeOpenSourceSpy()} />);
+
+    // Two segments survive compaction, and the symbol is on screen: the chip
+    // shows everything its description would, so no bubble repeats it.
+    expect(screen.queryByRole('tooltip', { hidden: true })).toBeNull();
+
+    const shownPath = `src/wid${RLO_MARKER}get.ts:${String(LOCATION_LINE)}`;
+    expect(screen.getByText(shownPath).textContent).toBe(shownPath);
+    expect(
+      screen.getByRole('button', {
+        name: `${LOCATION_SYMBOL} ${shownPath} — open ${formatUntrustedText(formatSourceLocation(location))}`,
+      }),
+    ).toBeDefined();
+  });
+
+  it("recognises a caption with a control inside the location's own description", () => {
+    const symbol = `Row${RLO}Panel`;
+    const location = makeLocation({ symbol });
+
+    render(
+      <SourceLink
+        location={location}
+        label={symbol}
+        labelDescription={symbol}
+        onOpenSource={makeOpenSourceSpy()}
+      />,
+    );
+
+    // The symbol-first description already names the caption, so it is not
+    // said twice — the comparison is made between the two revealed forms.
+    expect(screen.getByRole('tooltip', { hidden: true }).textContent).toBe(
+      formatUntrustedText(`${symbol} — ${formatSourceLocation(location)}`),
+    );
+    expect(
+      screen.getByRole('button', {
+        name: formatUntrustedText(`${symbol} — open ${formatSourceLocation(location)}`),
+      }),
+    ).toBeDefined();
+  });
+
+  it('names a compact chip with a control in its plain form, revealed', () => {
+    const location = makeLocation({ file: `src/example/wid${RLO}get.ts` });
+
+    const { container } = render(
+      <SourceLink location={location} compact onOpenSource={makeOpenSourceSpy()} />,
+    );
+
+    const name = sourceLinkAccessibleName({ location, compact: true });
+    expect(name).toBe(`Open ${formatUntrustedText(formatSourceLocation(location))}`);
+    expect(screen.getByRole('button', { name }).getAttribute('aria-label')).toBe(name);
+    expect(rawDirectionSinks(container)).toEqual([]);
+  });
+
+  it('reveals the inert chip exactly as the interactive one', () => {
+    const location = makeLocation({ file: `src/${RLO}example/widget.ts` });
+
+    const { container } = render(<SourceLink location={location} />);
+
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(rawDirectionSinks(container)).toEqual([]);
+    expect(container.textContent).toContain(RLO_MARKER);
   });
 });
 

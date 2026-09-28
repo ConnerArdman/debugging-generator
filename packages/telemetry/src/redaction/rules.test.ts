@@ -316,6 +316,55 @@ const CONNECTION_USERINFO = 'demo_user' + ':' + cycle(LOWER_LETTERS, 12);
 /** A credentialed connection string: scheme, userinfo, authority, database. */
 const CONNECTION_STRING = CONNECTION_SCHEME + CONNECTION_USERINFO + '@' + CONNECTION_AUTHORITY;
 
+// --- Personal data and labelled values ------------------------------------
+
+/** An e-mail address on a reserved test domain. */
+const EMAIL_ADDRESS = 'alice.buyer+orders@mail.example.test';
+
+/**
+ * `payload` followed by its Luhn check digit, computed here rather than
+ * written out so every card number below is visibly valid (or, where a test
+ * says so, visibly off by one).
+ */
+function withCheckDigit(payload: string): string {
+  let sum = 0;
+  for (let index = 0; index < payload.length; index += 1) {
+    let digit = Number(payload.charAt(payload.length - 1 - index));
+    if (index % 2 === 0) {
+      digit *= 2;
+      if (digit > 9) {
+        digit -= 9;
+      }
+    }
+    sum += digit;
+  }
+  return payload + String((10 - (sum % 10)) % 10);
+}
+
+/** Inserts `separator` every `size` digits, the way a card number is printed. */
+function grouped(digits: string, size: number, separator: string): string {
+  const groups: string[] = [];
+  for (let start = 0; start < digits.length; start += size) {
+    groups.push(digits.slice(start, start + size));
+  }
+  return groups.join(separator);
+}
+
+/** A 16-digit card number starting with 4, Luhn-valid. */
+const CARD_NUMBER = withCheckDigit('411111111111111');
+
+/** A second 16-digit card number starting with 5, Luhn-valid. */
+const SECOND_CARD_NUMBER = withCheckDigit('555555555555444');
+
+/** A 15-digit card number starting with 3, Luhn-valid, printed 4-6-5. */
+const FIFTEEN_DIGIT_CARD = withCheckDigit('37828224631000');
+
+/** The card number as a card prints it: four groups of four, space-separated. */
+const SPACED_CARD_NUMBER = grouped(CARD_NUMBER, 4, ' ');
+
+/** A value introduced by a credential word, the way prose and logs write one. */
+const LABELLED_VALUE = 'k3y-' + cycle(LOWER_LETTERS, 6) + '-2026';
+
 /**
  * Every credential-shaped fixture, driven as a set by the property suites
  * (idempotence, non-leakage, detector agreement) so a class added to
@@ -337,6 +386,11 @@ const SECRET_FIXTURES: readonly Fixture[] = [
     label: 'two credential classes in one value',
     value: 'first ' + JWT_SIGNED + ' then ' + ACCESS_KEY_ID + ' done',
   },
+  { label: 'an e-mail address in prose', value: 'Order for ' + EMAIL_ADDRESS + ' failed' },
+  { label: 'a spaced card number in element text', value: 'Pay with ' + SPACED_CARD_NUMBER },
+  { label: 'an unspaced card number', value: CARD_NUMBER },
+  { label: 'a spaced labelled value', value: 'token ' + LABELLED_VALUE },
+  { label: 'an assigned labelled value', value: 'DB_PASSWORD=' + LABELLED_VALUE },
 ];
 
 // --- Clean fixtures -------------------------------------------------------
@@ -364,12 +418,29 @@ const CLEAN_FIXTURES: readonly Fixture[] = [
     label: 'a statement whose literals are already masked',
     value: 'SELECT id FROM items WHERE sku = ' + REDACTION_MASK,
   },
+  // Near misses of the personal-data and labelled-value rules: the evidence a
+  // panel is built from, which must not be taken for an address, a card
+  // number or a labelled secret.
+  { label: 'an epoch-millisecond timestamp', value: 'captured at 1727466000000' },
+  { label: 'a random fraction', value: 'ratio 0.' + CARD_NUMBER },
+  {
+    label: 'a hexadecimal identifier opening with digits',
+    value: CARD_NUMBER + 'abcdef0123456789',
+  },
+  { label: 'package version specifiers', value: 'react-dom@19.3.0 and @scope/pkg' },
+  {
+    label: 'a stack frame naming its function',
+    value: 'handleClick@http://localhost:3000/a.js:1:2',
+  },
+  { label: 'credential words in prose', value: 'Invalid token provided; password: Required' },
+  { label: 'a token count', value: 'max_tokens: 2048' },
   { label: 'the redaction marker itself', value: REDACTION_MARKER },
   {
     label: 'an already-redacted bearer header value',
     value: BEARER_SCHEME + ' ' + REDACTION_MARKER,
   },
   { label: 'an already-redacted header line', value: 'Cookie: ' + REDACTION_MARKER },
+  { label: 'an already-redacted labelled value', value: 'token: ' + REDACTION_MARKER },
   { label: 'an empty string', value: '' },
 ];
 
@@ -441,7 +512,10 @@ describe('redaction constants', () => {
 });
 
 describe('REDACTION_RULE_IDS', () => {
-  it('lists the eight documented rule classes in reporting order', () => {
+  it('lists the eleven documented rule classes in reporting order', () => {
+    // The eight credential classes of AAP 0.5.2, plus the three ingest-only
+    // classes for personal data and labelled values in free text, placed after
+    // `connection-string` because that is also the order they run in.
     expect([...REDACTION_RULE_IDS]).toEqual([
       'sensitive-header',
       'provider-key',
@@ -449,6 +523,9 @@ describe('REDACTION_RULE_IDS', () => {
       'jwt',
       'private-key',
       'connection-string',
+      'email-address',
+      'payment-card',
+      'labelled-secret',
       'url-query-value',
       'entropy',
     ]);
@@ -802,6 +879,255 @@ describe('scrub', () => {
       const plain = 'http://127.0.0.1:3000/v1/items';
 
       expect(scrub(plain)).toBe(plain);
+    });
+  });
+
+  describe('e-mail addresses', () => {
+    it('replaces an address in element text or an error message whole, keeping the prose', () => {
+      expect(scrub('Order for ' + EMAIL_ADDRESS + ' failed')).toBe(
+        'Order for ' + REDACTION_MARKER + ' failed',
+      );
+      expect(scrub('mailto:' + EMAIL_ADDRESS)).toBe('mailto:' + REDACTION_MARKER);
+      expect(scrub('<' + EMAIL_ADDRESS + '>')).toBe('<' + REDACTION_MARKER + '>');
+    });
+
+    it('replaces an address in a URL path segment, which no URL rule masks', () => {
+      expect(scrub('GET https://shop.example.test/users/' + EMAIL_ADDRESS + '/orders')).toBe(
+        'GET https://shop.example.test/users/' + REDACTION_MARKER + '/orders',
+      );
+    });
+
+    it('replaces every address in a list', () => {
+      expect(scrub('to ' + EMAIL_ADDRESS + ', ops@example.test')).toBe(
+        'to ' + REDACTION_MARKER + ', ' + REDACTION_MARKER,
+      );
+    });
+
+    it('does not take a version specifier, a scoped package or a stack frame for an address', () => {
+      for (const value of [
+        'react-dom@19.3.0',
+        'import x from "@scope/pkg"',
+        'handleClick@http://localhost:3000/_next/static/chunks/app.js:10:5',
+        'user@localhost',
+      ]) {
+        expect(scrub(value), value).toBe(value);
+        expect(findDeniedRules(value), value).toEqual([]);
+      }
+    });
+
+    it('leaves userinfo inside a URL authority to the rules that own it', () => {
+      // `//demo:pw@host.test/p` would otherwise lose its host and keep its user.
+      const protocolRelative = '//demo:pw@host.example.test/p';
+      const userOnly = 'https://alice@example.test/cart';
+
+      expect(scrub(protocolRelative)).toBe(protocolRelative);
+      expect(scrub(userOnly)).toBe(userOnly);
+      expect(findDeniedRules(CONNECTION_SCHEME + 'demo_user:pw12345678@db.example.test/x')).toEqual(
+        ['connection-string'],
+      );
+    });
+  });
+
+  describe('payment card numbers', () => {
+    it('replaces a card number printed whole, in groups of four, or with hyphens', () => {
+      for (const printed of [
+        CARD_NUMBER,
+        SPACED_CARD_NUMBER,
+        grouped(SECOND_CARD_NUMBER, 4, '-'),
+        FIFTEEN_DIGIT_CARD.slice(0, 4) +
+          ' ' +
+          FIFTEEN_DIGIT_CARD.slice(4, 10) +
+          ' ' +
+          FIFTEEN_DIGIT_CARD.slice(10),
+      ]) {
+        expect(scrub('Pay with card ' + printed + ' now'), printed).toBe(
+          'Pay with card ' + REDACTION_MARKER + ' now',
+        );
+      }
+    });
+
+    it('keeps a security code or a second card apart from the number it follows', () => {
+      expect(scrub(SPACED_CARD_NUMBER + ' 123 exp 12/29')).toBe(
+        REDACTION_MARKER + ' 123 exp 12/29',
+      );
+      expect(scrub('cards ' + CARD_NUMBER + ' ' + SECOND_CARD_NUMBER)).toBe(
+        'cards ' + REDACTION_MARKER + ' ' + REDACTION_MARKER,
+      );
+    });
+
+    it('leaves a digit run whose check digit is wrong', () => {
+      const lastDigit = Number(CARD_NUMBER.slice(-1));
+      const offByOne = CARD_NUMBER.slice(0, -1) + String((lastDigit + 1) % 10);
+
+      expect(scrub('ref ' + offByOne)).toBe('ref ' + offByOne);
+      expect(findDeniedRules(offByOne)).toEqual([]);
+    });
+
+    it('leaves a checksum-valid number outside the card networks, such as a timestamp', () => {
+      // Epoch milliseconds and microseconds start with 1; 7 to 9 are not card
+      // network identifiers either.
+      for (const payload of ['172746600000012', '711111111111111', '911111111111111']) {
+        const number = withCheckDigit(payload);
+
+        expect(scrub('at ' + number), number).toBe('at ' + number);
+      }
+    });
+
+    it('leaves the digits of a decimal and the digits that open a word', () => {
+      for (const value of [
+        '0.' + CARD_NUMBER,
+        CARD_NUMBER + '.50',
+        CARD_NUMBER + 'ab12cd34',
+        'id_' + CARD_NUMBER,
+        CARD_NUMBER + '1111',
+      ]) {
+        expect(scrub(value), value).toBe(value);
+      }
+    });
+  });
+
+  describe('labelled secrets', () => {
+    it('replaces a value introduced by a credential word and keeps the word', () => {
+      const cases: readonly (readonly [string, string])[] = [
+        ['token ' + LABELLED_VALUE, 'token '],
+        ['token: ' + LABELLED_VALUE, 'token: '],
+        ['password=' + LABELLED_VALUE, 'password='],
+        ['DB_PASSWORD = ' + LABELLED_VALUE, 'DB_PASSWORD = '],
+        ['clientSecret: "' + LABELLED_VALUE, 'clientSecret: "'],
+        ['api_key=' + LABELLED_VALUE, 'api_key='],
+        ['X-Access-Key: ' + LABELLED_VALUE, 'X-Access-Key: '],
+      ];
+      for (const [value, label] of cases) {
+        expect(scrub(value), value).toBe(label + REDACTION_MARKER);
+        expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+      }
+    });
+
+    it('replaces a labelled value inside JSON text, plain or escaped', () => {
+      expect(scrub('{"token":"' + LABELLED_VALUE + '"}')).toBe(
+        '{"token":"' + REDACTION_MARKER + '"}',
+      );
+      expect(scrub('{\\"token\\":\\"' + LABELLED_VALUE + '\\"}')).toBe(
+        '{\\"token\\":\\"' + REDACTION_MARKER + '\\"}',
+      );
+    });
+
+    it('leaves prose after a credential word when the word introduces no digit-bearing value', () => {
+      for (const value of [
+        'Invalid token provided',
+        'token expired at 12',
+        'password: Required',
+        'the secret sauce 2',
+        'max_tokens: 2048',
+        'passwords 1234abcd',
+      ]) {
+        expect(scrub(value), value).toBe(value);
+      }
+    });
+
+    it('leaves a query or fragment parameter to the URL handler', () => {
+      // `./url.ts` masks these values positionally to `?`.
+      for (const value of [
+        '/reset?token=' + LABELLED_VALUE,
+        '/cb?state=1&access_token=' + LABELLED_VALUE,
+        '/cb#access_token=' + LABELLED_VALUE,
+      ]) {
+        expect(scrub(value), value).toBe(value);
+      }
+    });
+
+    it('leaves the header lines the sensitive-header rule already owns, so each is one finding', () => {
+      for (const value of ['X-Api-Key: ' + LABELLED_VALUE, 'x-auth-token: ' + LABELLED_VALUE]) {
+        expect(findDeniedRules(value), value).toEqual(['sensitive-header']);
+      }
+    });
+  });
+
+  describe('personal data, labelled values and credentials together', () => {
+    it('reports each class once, in vocabulary order', () => {
+      const value =
+        'Pay with card ' +
+        SPACED_CARD_NUMBER +
+        ' token ' +
+        LABELLED_VALUE +
+        ' for ' +
+        EMAIL_ADDRESS +
+        ' via ' +
+        BEARER_HEADER_VALUE;
+
+      expect(findDeniedRules(value)).toEqual([
+        'bearer-token',
+        'email-address',
+        'payment-card',
+        'labelled-secret',
+      ]);
+      expect(scrub(value)).toBe(
+        'Pay with card ' +
+          REDACTION_MARKER +
+          ' token ' +
+          REDACTION_MARKER +
+          ' for ' +
+          REDACTION_MARKER +
+          ' via ' +
+          BEARER_SCHEME +
+          ' ' +
+          REDACTION_MARKER,
+      );
+    });
+
+    it('masks the QA reproduction text', () => {
+      // The element text and error message the QA report relayed (QSA-F05).
+      expect(scrub('Pay with card ' + SPACED_CARD_NUMBER + ' token secret-token-123')).toBe(
+        'Pay with card ' + REDACTION_MARKER + ' token ' + REDACTION_MARKER,
+      );
+      expect(scrub('Order for ' + EMAIL_ADDRESS + ' failed with card ' + SECOND_CARD_NUMBER)).toBe(
+        'Order for ' + REDACTION_MARKER + ' failed with card ' + REDACTION_MARKER,
+      );
+    });
+
+    it('writes the query mask for a value inside a URL query or fragment', () => {
+      // There the replacement is what `./url.ts` writes for a query value, so
+      // the text is already a fixed point of the URL maskers that read it next
+      // — a marker ending a query would be read as a cut, or lose its
+      // bracket to a masker that strips trailing punctuation.
+      const cases: readonly (readonly [string, string, RedactionRuleId])[] = [
+        [
+          'GET /items?email=' + EMAIL_ADDRESS + ' failed',
+          'GET /items?email=' + REDACTION_MASK + ' failed',
+          'email-address',
+        ],
+        [
+          'https://h.example.test/notify?to=' + EMAIL_ADDRESS,
+          'https://h.example.test/notify?to=' + REDACTION_MASK,
+          'email-address',
+        ],
+        ['/p#contact=' + EMAIL_ADDRESS, '/p#contact=' + REDACTION_MASK, 'email-address'],
+        [
+          '/pay?card=' + CARD_NUMBER + '&step=2',
+          '/pay?card=' + REDACTION_MASK + '&step=2',
+          'payment-card',
+        ],
+        [
+          '/search?q=token:' + LABELLED_VALUE,
+          '/search?q=token:' + REDACTION_MASK,
+          'labelled-secret',
+        ],
+      ];
+      for (const [value, expected, rule] of cases) {
+        expect(scrub(value), value).toBe(expected);
+        expect(scrub(expected), value).toBe(expected);
+        expect(findDeniedRules(value), value).toEqual([rule]);
+      }
+
+      // Outside a query the marker is written, including before a query that
+      // follows the value in the same token.
+      expect(scrub('mailto:' + EMAIL_ADDRESS + '?subject=hi')).toBe(
+        'mailto:' + REDACTION_MARKER + '?subject=hi',
+      );
+      expect(scrub('see https://h.example.test/users/' + EMAIL_ADDRESS)).toBe(
+        'see https://h.example.test/users/' + REDACTION_MARKER,
+      );
+      expect(scrub('Why? ' + EMAIL_ADDRESS)).toBe('Why? ' + REDACTION_MARKER);
     });
   });
 
@@ -1654,6 +1980,36 @@ const CROSSING_CASES: readonly CrossingCase[] = [
     // replacement, so a cut line reads `Cookie: [redacted]`.
     keeps: 'Cookie: ',
     secret: COOKIE_VALUE,
+  },
+  {
+    label: 'an e-mail address cut inside its local part',
+    credential: EMAIL_ADDRESS,
+    inHead: 7,
+    keeps: '',
+    secret: EMAIL_ADDRESS,
+  },
+  {
+    label: 'an e-mail address cut inside its domain',
+    credential: EMAIL_ADDRESS,
+    inHead: EMAIL_ADDRESS.indexOf('@') + 6,
+    keeps: '',
+    secret: EMAIL_ADDRESS,
+  },
+  {
+    label: 'a spaced card number',
+    credential: SPACED_CARD_NUMBER,
+    inHead: 7,
+    keeps: '',
+    secret: SPACED_CARD_NUMBER,
+  },
+  {
+    label: 'a labelled value',
+    credential: 'token: ' + LABELLED_VALUE,
+    inHead: 'token: '.length + 3,
+    // The label and separator survive a cut exactly as they survive a
+    // replacement, so a cut value reads `token: [redacted]`.
+    keeps: 'token: ',
+    secret: LABELLED_VALUE,
   },
 ];
 

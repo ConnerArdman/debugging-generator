@@ -560,6 +560,21 @@ function randomHighEntropyValue(): string {
 }
 
 /**
+ * A random 16-digit card number with a valid Luhn check digit, starting with
+ * `4` so it sits in the issuer range the `payment-card` rule recognises.
+ */
+function randomCardNumber(): string {
+  const payload = assemble('4', Array.from(randomBytes(14), (byte) => String(byte % 10)).join(''));
+  let sum = 0;
+  for (let index = 0; index < payload.length; index += 1) {
+    const digit = Number(payload.charAt(payload.length - 1 - index));
+    const doubled = index % 2 === 0 ? digit * 2 : digit;
+    sum += doubled > 9 ? doubled - 9 : doubled;
+  }
+  return assemble(payload, String((10 - (sum % 10)) % 10));
+}
+
+/**
  * Assembles fresh material for one sentinel, chosen by its `ruleId` — so a new
  * sentinel with an existing rule is a fixture edit, not new code.
  *
@@ -568,6 +583,10 @@ function randomHighEntropyValue(): string {
  * - `url-query-value`: an opaque, URL-safe token.
  * - `provider-key`, `jwt`, `connection-string`: the harness's shapes.
  * - `private-key`: a PEM block.
+ * - `email-address`: an address with a random local part.
+ * - `payment-card`: a random, checksum-valid card number.
+ * - `labelled-secret`: an opaque value holding a digit; the fixture slot
+ *   supplies the label (`token: {{…}}`) the rule keys on.
  * - `entropy`: a dense opaque value above the entropy threshold.
  * - `null` (positional, any material): a neutral random literal free of quotes.
  */
@@ -608,6 +627,19 @@ function materialFor(spec: SentinelSpec): Substitution {
     case 'private-key': {
       const block = randomPrivateKeyBlock();
       return { spec, value: block.value, fingerprints: [block.value, block.body] };
+    }
+    case 'email-address': {
+      const local = assemble('buyer.', randomHex(6));
+      const value = assemble(local, '@', 'mail.example.test');
+      return { spec, value, fingerprints: [value, local] };
+    }
+    case 'payment-card': {
+      const value = randomCardNumber();
+      return { spec, value, fingerprints: [value, value.slice(4)] };
+    }
+    case 'labelled-secret': {
+      const value = assemble('k3y-', randomHex(8));
+      return { spec, value, fingerprints: [value] };
     }
     case 'entropy': {
       const value = randomHighEntropyValue();

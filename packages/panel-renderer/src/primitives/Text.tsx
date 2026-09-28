@@ -10,13 +10,30 @@
  *
  * ## Tier 1 atom
  *
- * It imports nothing from this folder and nothing from the layers above it — no
- * layout primitive, no visualization component, no host module, no panel schema
- * and no transport. Its only dependencies are React's types and `clsx`, which
- * is what lets every other module in the package compose it freely without
- * risking a cycle. The reverse direction is what would be wrong: a primitive
- * that knew about a panel node, a data query or a socket would drag the whole
- * design system into the product's data flow (AAP 0.4.2, 0.6.2).
+ * It imports nothing from the layers above it — no layout primitive, no
+ * visualization component, no host module, no panel schema and no transport —
+ * and from this folder only the untrusted-text helper (`./untrusted-text`),
+ * which is a pure function over strings rather than a component. Beyond that
+ * its dependencies are React and `clsx`, which is what lets every other module
+ * in the package compose it freely without risking a cycle. The reverse
+ * direction is what would be wrong: a primitive that knew about a panel node, a
+ * data query or a socket would drag the whole design system into the product's
+ * data flow (AAP 0.4.2, 0.6.2).
+ *
+ * ## What is on screen is the logical text
+ *
+ * Almost everything this primitive prints — a span name, a statement, a path,
+ * a model-written sentence — is untrusted, and an invisible Unicode
+ * direction control inside it (U+202E and its eleven siblings) would reorder
+ * the glyphs after it, so the screen would show a sequence that was never
+ * captured. Every string child, and a string `title` or `aria-label`, is
+ * therefore rendered through `formatUntrustedNode`/`formatUntrustedText`, which
+ * print each control as its visible escape (`\u202E`) and change nothing else.
+ * That is not a transformation of the content: it is the guarantee that the
+ * glyphs shown are the characters held, in the order held. The native tooltip
+ * and the accessible name are revealed with the same definition, so they match
+ * the visible label (WCAG 2.5.3). Keys, `data-*` attributes and handlers are
+ * the caller's and stay raw.
  *
  * ## The fixed vocabulary
  *
@@ -83,6 +100,8 @@
 import clsx from 'clsx';
 import { createElement } from 'react';
 import type { HTMLAttributes, ReactElement, ReactNode, Ref } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * The four type roles, named after the tokens that back them: `lg` for the
@@ -224,8 +243,9 @@ export interface TextProps extends Omit<HTMLAttributes<HTMLElement>, 'color'> {
    *
    * Because the ellipsis hides characters from a sighted reader, a caller that
    * truncates also supplies the full value another way — the usual form is a
-   * `title` passed straight through, and a `dg-visually-hidden` sibling where
-   * the full value must be announced rather than hovered.
+   * `title`, revealed exactly as the children are so the two read alike, and a
+   * `dg-visually-hidden` sibling where the full value must be announced rather
+   * than hovered.
    *
    * @default false
    */
@@ -235,6 +255,9 @@ export interface TextProps extends Omit<HTMLAttributes<HTMLElement>, 'color'> {
    * The text to render. A node rather than a string, so a run can carry an
    * inline `Code` fragment, a glyph or a count — never so it can nest a
    * control, which belongs in `Button` or a link.
+   *
+   * Every string in it, directly or in an array, is rendered with its
+   * direction controls revealed; an element in it renders its own text.
    */
   children?: ReactNode;
 
@@ -289,6 +312,8 @@ export function Text(props: TextProps): ReactElement {
     truncate = false,
     children,
     className,
+    title,
+    'aria-label': label,
     ref,
     ...rest
   } = props;
@@ -305,10 +330,15 @@ export function Text(props: TextProps): ReactElement {
 
   // The caller's attributes come first so the composed class name, the ref and
   // the children cannot be displaced by a stray passthrough of the same name.
+  // The children and the two string attributes a reader sees or hears are
+  // revealed (see "What is on screen is the logical text" above); an absent
+  // attribute stays absent.
   return createElement<HTMLAttributes<HTMLElement>, HTMLElement>(element, {
     ...rest,
+    title: title === undefined ? title : formatUntrustedText(title),
+    'aria-label': label === undefined ? label : formatUntrustedText(label),
     ref,
     className: classes,
-    children,
+    children: formatUntrustedNode(children),
   });
 }

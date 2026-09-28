@@ -95,14 +95,17 @@ const ICON_SIZES = ['16', '32', '48', '128'] as const;
 /**
  * Top-level manifest keys that must stay absent. `manifest.config.ts` lists the
  * surfaces the extension deliberately does not have (`action`, `options_page`,
- * `omnibox`, `commands`, `externally_connectable`, `content_security_policy`);
+ * `omnibox`, `commands`, `externally_connectable`, `web_accessible_resources`);
  * `options_ui` is the other spelling of the options surface, and
  * `optional_permissions` / `optional_host_permissions` would let the extension
  * request at run time what the exact permission assertions below forbid.
- * `web_accessible_resources` is not listed: crxjs may add an entry for a chunk
- * it bundles. It bundles no content script today - the bridge is a
- * self-contained IIFE `vite.config.ts` builds itself - but that key is crxjs's
- * to manage, not a surface `manifest.config.ts` authors.
+ * `web_accessible_resources` is asserted absent from the BUILT manifest, not
+ * only from the authored one, because crxjs adds an entry for any
+ * content-script chunk it bundles. It bundles none today - the bridge is a
+ * self-contained IIFE `vite.config.ts` builds itself - so a build change that
+ * would need an entry (a content-script loader chunk, for example) fails here
+ * instead of silently making extension files fetchable by web pages.
+ * `content_security_policy` is declared, and is asserted in its own block below.
  */
 const UNDECLARED_SURFACES = [
   'action',
@@ -111,10 +114,42 @@ const UNDECLARED_SURFACES = [
   'omnibox',
   'commands',
   'externally_connectable',
-  'content_security_policy',
+  'web_accessible_resources',
   'optional_permissions',
   'optional_host_permissions',
 ] as const;
+
+/**
+ * `EXTENSION_PAGES_CSP`: the `content_security_policy.extension_pages` value,
+ * character for character. `docs/SECURITY.md` quotes the same string.
+ */
+const EXTENSION_PAGES_CSP =
+  "default-src 'none'; script-src 'self'; object-src 'none'; style-src 'self'; img-src 'self'; " +
+  "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; " +
+  "base-uri 'none'; form-action 'none'";
+
+/**
+ * The only hosts any source of the policy may name: the two loopback hosts
+ * `src/background/auth.ts` (`SERVICE_ENDPOINT_HOSTNAMES`) accepts as the
+ * service address.
+ */
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost'] as const;
+
+/**
+ * `connect-src`: the extension itself, and the local service over HTTP and its
+ * WebSocket on either loopback host, on any port (`DEBUGGEN_PORT` is
+ * configurable).
+ */
+const CONNECT_SOURCES = [
+  "'self'",
+  'http://127.0.0.1:*',
+  'http://localhost:*',
+  'ws://127.0.0.1:*',
+  'ws://localhost:*',
+] as const;
+
+/** The source keywords that would let an extension page run inline code or `eval`. */
+const UNSAFE_SOURCE_KEYWORDS = ["'unsafe-inline'", "'unsafe-eval'", "'wasm-unsafe-eval'"] as const;
 
 /** How deep the diagnostic search for a misplaced panel document descends. */
 const PANEL_SEARCH_MAX_DEPTH = 4;
@@ -143,6 +178,15 @@ interface BuiltBackground {
 }
 
 /**
+ * The `content_security_policy` object: every policy key it declares, and the
+ * `extension_pages` policy (`undefined` when the key is absent).
+ */
+interface BuiltContentSecurityPolicy {
+  readonly keys: readonly string[];
+  readonly extensionPages: string | undefined;
+}
+
+/**
  * Only the fields this spec asserts. A present field with the wrong JSON type
  * is rejected while parsing (Chrome would refuse such a manifest outright); an
  * absent field is `undefined`, so the case that requires it fails on its own.
@@ -159,6 +203,7 @@ interface BuiltManifest {
   readonly hostPermissions: readonly string[] | undefined;
   readonly icons: Readonly<Record<string, string>> | undefined;
   readonly contentScripts: readonly BuiltContentScript[] | undefined;
+  readonly contentSecurityPolicy: BuiltContentSecurityPolicy | undefined;
 }
 
 /*
@@ -262,6 +307,62 @@ function parseBackground(record: JsonRecord): BuiltBackground | undefined {
   };
 }
 
+function parseContentSecurityPolicy(record: JsonRecord): BuiltContentSecurityPolicy | undefined {
+  const policy = readOptional(record, 'content_security_policy', '', isRecord, 'an object');
+  if (policy === undefined) {
+    return undefined;
+  }
+  return {
+    keys: Object.keys(policy),
+    extensionPages: readOptional(
+      policy,
+      'extension_pages',
+      'content_security_policy.',
+      isString,
+      'a string',
+    ),
+  };
+}
+
+/** One directive of a serialized policy: its lower-cased name and its source expressions. */
+interface CspDirective {
+  readonly name: string;
+  readonly sources: readonly string[];
+}
+
+/**
+ * Splits a serialized policy into its directives the way CSP Level 3 parses
+ * one: on `;`, each token trimmed, empty tokens dropped, the name lower-cased
+ * and the rest split on ASCII whitespace. Duplicates are kept, so the case that
+ * forbids them can see them (a browser silently ignores every repeat).
+ */
+function parseCspDirectives(policy: string): readonly CspDirective[] {
+  return policy
+    .split(';')
+    .map((token) => token.trim())
+    .filter((token) => token !== '')
+    .map((token) => {
+      const [name = '', ...sources] = token.split(/[\t\n\f\r ]+/);
+      return { name: name.toLowerCase(), sources };
+    });
+}
+
+/** Whether a source expression is a quoted keyword such as `'self'` or `'none'`. */
+function isKeywordSource(source: string): boolean {
+  return source.startsWith("'") && source.endsWith("'");
+}
+
+/** A scheme-only source (`https:`, `http:`, `data:`, `blob:`, `ws:`...): every host of that scheme. */
+const SCHEME_ONLY_SOURCE = /^[a-z][a-z0-9+.-]*:$/i;
+
+/** A host source: optional `scheme://`, the host, an optional `:port` or `:*`, an optional path. */
+const HOST_SOURCE = /^(?:[a-z][a-z0-9+.-]*:\/\/)?([^/:?#]+)(?::(?:\d+|\*))?(?:\/[^?#]*)?$/i;
+
+/** The host a host source names, or `undefined` for anything that is not a host source. */
+function hostOf(source: string): string | undefined {
+  return HOST_SOURCE.exec(source)?.[1]?.toLowerCase();
+}
+
 function parseManifest(raw: unknown): BuiltManifest {
   if (!isRecord(raw)) {
     throw new Error(
@@ -288,6 +389,7 @@ function parseManifest(raw: unknown): BuiltManifest {
     ),
     icons: readOptional(raw, 'icons', '', isStringRecord, 'an object of string paths'),
     contentScripts: scripts?.map((entry, index) => parseContentScript(entry, index)),
+    contentSecurityPolicy: parseContentSecurityPolicy(raw),
   };
 }
 
@@ -562,6 +664,165 @@ describe('Debug Generator extension build (dist/manifest.json)', () => {
         'these manifest keys are not declared by manifest.config.ts and would widen the ' +
           'permission boundary docs/SECURITY.md documents',
       ).toEqual([]);
+    });
+  });
+
+  describe('extension-page content-security policy', () => {
+    /** `content_security_policy.extension_pages`, or a failure explaining its absence. */
+    const extensionPagesPolicy = (): string => {
+      const policy = built().contentSecurityPolicy?.extensionPages;
+      if (policy === undefined) {
+        throw new Error(
+          'dist/manifest.json declares no "content_security_policy.extension_pages", so every ' +
+            "extension page runs under Chrome's default policy, which leaves image loads and " +
+            'CORS fetch to any web origin open. manifest.config.ts declares it as ' +
+            `EXTENSION_PAGES_CSP; rebuild with: ${BUILD_COMMAND}`,
+        );
+      }
+      return policy;
+    };
+
+    /** Every directive of the built policy, in declaration order. */
+    const directives = (): readonly CspDirective[] => parseCspDirectives(extensionPagesPolicy());
+
+    /** The sources of one directive, or `undefined` when the policy does not declare it. */
+    const sourcesOf = (name: string): readonly string[] | undefined =>
+      directives().find((directive) => directive.name === name)?.sources;
+
+    /** `<directive> <source>` for every source of every directive, for failure messages. */
+    const everySource = (): readonly { readonly directive: string; readonly source: string }[] =>
+      directives().flatMap(({ name, sources }) =>
+        sources.map((source) => ({ directive: name, source })),
+      );
+
+    it('declares content_security_policy.extension_pages as exactly the documented policy', () => {
+      expect(
+        extensionPagesPolicy(),
+        '"content_security_policy.extension_pages" must equal EXTENSION_PAGES_CSP in ' +
+          'manifest.config.ts, the string docs/SECURITY.md quotes',
+      ).toBe(EXTENSION_PAGES_CSP);
+    });
+
+    it('declares only the extension_pages policy, and no sandbox policy', () => {
+      expect(
+        built().contentSecurityPolicy?.keys,
+        '"content_security_policy" must hold exactly one key, "extension_pages": the ' +
+          'extension has no sandboxed page',
+      ).toEqual(['extension_pages']);
+    });
+
+    it('declares each directive once', () => {
+      const names = directives().map((directive) => directive.name);
+      expect(
+        names.filter((name, index) => names.indexOf(name) !== index),
+        'a repeated directive is ignored by the browser, so the policy it appears to add is ' +
+          'not enforced',
+      ).toEqual([]);
+    });
+
+    it("denies every resource type by default: default-src 'none'", () => {
+      expect(
+        sourcesOf('default-src'),
+        "default-src must be exactly 'none', so fonts, frames, media and any directive not " +
+          'named fall back to loading nothing',
+      ).toEqual(["'none'"]);
+    });
+
+    it("loads scripts only from the extension package: script-src exactly 'self'", () => {
+      expect(
+        sourcesOf('script-src'),
+        "script-src must be exactly 'self': no inline script, no eval of any kind and no " +
+          'remote script',
+      ).toEqual(["'self'"]);
+    });
+
+    it('connects only to the extension itself and the local service on the loopback hosts', () => {
+      expect(
+        sorted(sourcesOf('connect-src')),
+        `connect-src must be exactly ${CONNECT_SOURCES.join(' ')}: the service addresses ` +
+          'src/background/auth.ts accepts, over HTTP and WebSocket, on any port',
+      ).toEqual(sorted(CONNECT_SOURCES));
+    });
+
+    it.each(['img-src', 'style-src'])(
+      "loads %s only from the extension package: exactly 'self'",
+      (name) => {
+        const kind = name === 'img-src' ? 'image' : 'stylesheet';
+        expect(
+          sourcesOf(name),
+          `${name} must be exactly 'self': only packaged ${kind}s, never an inline or remote ` +
+            `one - a remote ${kind} load is a request to a web origin the host permissions do ` +
+            'not govern',
+        ).toEqual(["'self'"]);
+      },
+    );
+
+    it.each(['object-src', 'base-uri', 'form-action'])("declares %s 'none'", (name) => {
+      expect(sourcesOf(name), `${name} must be exactly 'none'`).toEqual(["'none'"]);
+    });
+
+    it("allows no 'unsafe-inline', 'unsafe-eval' or 'wasm-unsafe-eval' in any directive", () => {
+      expect(
+        everySource()
+          .filter(({ source }) =>
+            UNSAFE_SOURCE_KEYWORDS.some((keyword) => keyword === source.toLowerCase()),
+          )
+          .map(({ directive, source }) => `${directive} ${source}`),
+        'no extension page may run inline code or eval; src/shared/csp-runtime.ts keeps Zod ' +
+          'jitless so none is needed',
+      ).toEqual([]);
+    });
+
+    it('names no wildcard host in any directive', () => {
+      expect(
+        everySource()
+          .filter(({ source }) => hostOf(source)?.startsWith('*') === true)
+          .map(({ directive, source }) => `${directive} ${source}`),
+        'a "*" or "*." host admits web origins; name the loopback hosts explicitly',
+      ).toEqual([]);
+    });
+
+    it('names no scheme-only source such as https:, http:, data: or blob: in any directive', () => {
+      expect(
+        everySource()
+          .filter(({ source }) => SCHEME_ONLY_SOURCE.test(source))
+          .map(({ directive, source }) => `${directive} ${source}`),
+        'a scheme-only source admits every host of that scheme',
+      ).toEqual([]);
+    });
+
+    it('names no host other than 127.0.0.1 and localhost in any directive', () => {
+      expect(
+        everySource()
+          .filter(({ source }) => !isKeywordSource(source) && !SCHEME_ONLY_SOURCE.test(source))
+          .filter(({ source }) => {
+            const host = hostOf(source);
+            return host === undefined || !LOOPBACK_HOSTS.some((loopback) => loopback === host);
+          })
+          .map(({ directive, source }) => `${directive} ${source}`),
+        `every host source must name ${LOOPBACK_HOSTS.join(' or ')}, the loopback hosts the ` +
+          'local service is reached on',
+      ).toEqual([]);
+    });
+
+    it.each([
+      {
+        name: 'frame-ancestors',
+        why: 'DevTools hosts the panel document in a frame of its own, so restricting its ancestors stops the panel from rendering',
+      },
+      {
+        name: 'upgrade-insecure-requests',
+        why: "it would rewrite the service's plain-HTTP loopback address to https:",
+      },
+      {
+        name: 'sandbox',
+        why: 'a sandboxed extension page loses its origin and with it the extension APIs',
+      },
+    ])('does not declare $name', ({ name, why }) => {
+      expect(
+        directives().map((directive) => directive.name),
+        `the policy must not declare ${name}: ${why}`,
+      ).not.toContain(name);
     });
   });
 

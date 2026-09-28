@@ -63,8 +63,10 @@
  *
  * Around all of it sits the **response-header policy**: every reply — success,
  * refusal, `404`, `5xx`, the `503` after close and the Node listener's own
- * fallbacks — carries `Cache-Control: no-store` and
- * `X-Content-Type-Options: nosniff`, set by a middleware registered ahead of
+ * fallbacks — carries `Cache-Control: no-store`,
+ * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+ * `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
+ * ({@link RESPONSE_POLICY_HEADERS}), set by a middleware registered ahead of
  * the origin guard, re-asserted at the dispatch guard's exit and stamped on the
  * Node response itself, so no writer of a reply can leave it out.
  *
@@ -299,19 +301,62 @@ const CONTENT_TYPE_OPTIONS_HEADER = 'x-content-type-options';
 const NOSNIFF = 'nosniff';
 
 /**
+ * The legacy response header that forbids any page from framing a reply
+ * (CWE-1021), for the browsers that predate CSP `frame-ancestors`.
+ */
+const FRAME_OPTIONS_HEADER = 'x-frame-options';
+
+/** The {@link FRAME_OPTIONS_HEADER} value on every response this module renders: no framing by any origin. */
+const FRAME_DENY = 'DENY';
+
+/** The response header that carries the Content Security Policy of every reply. */
+const CONTENT_SECURITY_POLICY_HEADER = 'content-security-policy';
+
+/**
+ * The {@link CONTENT_SECURITY_POLICY_HEADER} value on every response this
+ * module renders. `default-src 'none'` grants a reply rendered as a document
+ * no script, style, image, frame or connection of any kind, so even a body a
+ * browser were somehow made to display stays inert; `frame-ancestors 'none'`
+ * — which `default-src` does not cover — forbids every page from embedding it,
+ * the standard form of {@link FRAME_DENY}.
+ */
+const CONTENT_SECURITY_POLICY = "default-src 'none'; frame-ancestors 'none'";
+
+/**
  * The response-header policy every reply of this service carries — success,
  * refusal, `404`, `5xx` and the listener's own fallbacks alike: never cached,
- * never content-sniffed. It is deliberately these two headers and nothing
- * more: no `Access-Control-Allow-Origin` (its absence is what keeps web pages
- * from reading any reply) and no `Server` banner.
+ * never content-sniffed, never framed, and inert if rendered. Every name is
+ * lower-case, as `Headers` and `ServerResponse.setHeader` store them.
+ *
+ * `X-Frame-Options: DENY` and CSP `frame-ancestors 'none'` together keep any
+ * page — old browsers read the first, current ones the second — from framing
+ * a JSON reply under its own UI (clickjacking, CWE-1021), and CSP
+ * `default-src 'none'` leaves a reply rendered as a document nothing to load
+ * or run. The replies are JSON read by `fetch`, which neither header
+ * constrains, so no client of the service is affected.
+ *
+ * It is deliberately these headers and nothing more: no
+ * `Access-Control-Allow-Origin` (its absence is what keeps web pages from
+ * reading any reply) and no `Server` or `X-Powered-By` banner.
  *
  * Applied by {@link withResponsePolicy} at the application's exits and
  * stamped on the Node response by {@link HttpApp.requestListener}; the error
- * `Response`s this module builds carry it from construction.
+ * `Response`s this module builds carry it from construction. Exported so the
+ * raw `clientError` answers `main.ts` writes below the application carry the
+ * same values from this one definition.
+ *
+ * @example
+ * ```ts
+ * for (const [name, value] of Object.entries(RESPONSE_POLICY_HEADERS)) {
+ *   response.setHeader(name, value); // 'x-frame-options' → 'DENY', …
+ * }
+ * ```
  */
-const RESPONSE_POLICY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+export const RESPONSE_POLICY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   [CACHE_CONTROL_HEADER]: NO_STORE,
   [CONTENT_TYPE_OPTIONS_HEADER]: NOSNIFF,
+  [FRAME_OPTIONS_HEADER]: FRAME_DENY,
+  [CONTENT_SECURITY_POLICY_HEADER]: CONTENT_SECURITY_POLICY,
 });
 
 /** The response header a body's media type is read from by the response verifier. */
@@ -785,15 +830,17 @@ export interface HttpApp {
   /**
    * The Node request listener: `createServer(app.requestListener)`. It never
    * throws and never rejects; a request it cannot parse is answered with
-   * protocol's error body. Every reply it writes carries
-   * `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+   * protocol's error body. Every reply it writes carries every header of
+   * {@link RESPONSE_POLICY_HEADERS}: `Cache-Control: no-store`,
+   * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+   * `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`.
    */
   readonly requestListener: RequestListener;
 
   /**
    * Dispatches one WHATWG `Request` in-process, through exactly the pipeline
    * the listener uses, for the unit and integration suites. Never rejects;
-   * every reply carries the same two policy headers.
+   * every reply carries the same {@link RESPONSE_POLICY_HEADERS}.
    */
   readonly fetch: (request: Request) => Promise<Response>;
 
@@ -1036,7 +1083,7 @@ function errorResponse(
  * immutable — `Response.redirect`, `Response.error`, a `fetch` reply — cannot
  * take a header; it is re-wrapped instead: the same body stream (moved, never
  * read or buffered), status, status text and headers, plus the policy. A reply
- * that already carries both values is returned untouched.
+ * that already carries every value of the policy is returned untouched.
  *
  * @param response The reply.
  * @returns `response` itself, or its re-wrapped equivalent.

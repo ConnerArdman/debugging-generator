@@ -864,11 +864,12 @@ describe('schema version 4 creates and backfills the cleanup summary', () => {
     });
 
     // A version-3 store climbs the whole ladder: step 4 (this summary),
-    // step 5 (telemetry_events.clock_offset_ms) and step 6
-    // (session_root_identities), which leave every session row and summary
-    // as step 4 wrote them.
+    // step 5 (telemetry_events.clock_offset_ms), step 6
+    // (session_root_identities) and step 7 (the tab bindings re-keyed by
+    // holder and tab), which leave every session row and summary as step 4
+    // wrote them.
     expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
-    expect(STORE_SCHEMA_VERSION).toBe(6);
+    expect(STORE_SCHEMA_VERSION).toBe(7);
     expect(summaryOf(store.db, conflicted)).toEqual({
       status: 'conflict',
       completed_at: BASE_TIME + 6,
@@ -946,7 +947,7 @@ describe('schema version 4 creates and backfills the cleanup summary', () => {
       expect(outcome).toEqual({
         fromVersion: 0,
         toVersion: STORE_SCHEMA_VERSION,
-        applied: [2, 3, 4, 5, 6],
+        applied: [2, 3, 4, 5, 6, 7],
         adopted: true,
       });
       expect(summaryOf(legacy, conflicted)).toEqual({

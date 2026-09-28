@@ -17,8 +17,21 @@
  * its own and can never print `undefined` beside a figure. And the joined form
  * is exactly the split form's `text` for every input, so moving a surface from
  * one to the other can never change what a reader sees.
+ *
+ * The untrusted-text reveal is what keeps captured and model-authored text
+ * from displaying a sequence it does not contain. Pinned: each of the twelve
+ * Unicode bidirectional formatting controls becomes its exact `\uXXXX`
+ * marker, and no other code point changes; text without a control comes back
+ * as the same string; revealing is idempotent; and every display helper that
+ * returns captured text — the one-line preview, the width fit, the compact
+ * path, the source chip and its title, and the humanized label — reveals, with
+ * a marker never split and a preview's privacy bound still counted in
+ * captured code points. Every control below is written as an escape, never as
+ * the character, so this suite is not itself a carrier of one.
  */
 
+import type { SourceLocation } from '@debuggen/shared';
+import type { TelemetryKind } from '@debuggen/telemetry';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -26,18 +39,29 @@ import {
   ELLIPSIS,
   ESTIMATE_NARROW_ADVANCE_EM,
   ESTIMATE_WIDE_ADVANCE_EM,
+  MAX_PREVIEW_LENGTH,
   NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
+  containsDirectionControl,
   createEstimateMeasure,
   estimateTextWidth,
   fitTextToWidth,
   formatBytes,
   formatBytesParts,
+  formatCompactPath,
   formatDuration,
   formatDurationCompact,
   formatDurationParts,
+  formatKindLabel,
   formatMetric,
   formatOffset,
+  formatSourceChipLabel,
+  formatSourceTooltip,
+  formatUntrustedText,
+  humanizeLabel,
+  oneLinePreview,
   splitGraphemes,
+  truncate,
 } from './format';
 import type { TextMeasure } from './format';
 
@@ -358,5 +382,254 @@ describe('fitTextToWidth', () => {
       fitTextToWidth('abcdefghijkl', room, measure),
     );
     expect(fitTextToWidth('abcdef', room, measure)?.truncated).toBe(false);
+  });
+});
+
+/*
+ * The untrusted-text reveal. The controls and the QA payload are built from
+ * escapes; an expected marker is the six printable characters `\uXXXX`,
+ * written with a doubled backslash.
+ */
+
+/** The twelve Unicode bidirectional formatting controls, and the marker each becomes. */
+const DIRECTION_CONTROLS = [
+  { name: 'ALM', control: '\u061C', marker: '\\u061C' },
+  { name: 'LRM', control: '\u200E', marker: '\\u200E' },
+  { name: 'RLM', control: '\u200F', marker: '\\u200F' },
+  { name: 'LRE', control: '\u202A', marker: '\\u202A' },
+  { name: 'RLE', control: '\u202B', marker: '\\u202B' },
+  { name: 'PDF', control: '\u202C', marker: '\\u202C' },
+  { name: 'LRO', control: '\u202D', marker: '\\u202D' },
+  { name: 'RLO', control: '\u202E', marker: '\\u202E' },
+  { name: 'LRI', control: '\u2066', marker: '\\u2066' },
+  { name: 'RLI', control: '\u2067', marker: '\\u2067' },
+  { name: 'FSI', control: '\u2068', marker: '\\u2068' },
+  { name: 'PDI', control: '\u2069', marker: '\\u2069' },
+] as const;
+
+/** The QA report's payload: an override that draws a script tag backwards. */
+const QA_PAYLOAD = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** What the payload displays once revealed: both controls as printable markers. */
+const QA_PAYLOAD_REVEALED = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** The right-to-left override on its own, and its marker. */
+const RLO = '\u202E';
+const RLO_MARKER = '\\u202E';
+
+/** Unicode's own definition of the set, as an independent oracle for the scan below. */
+const BIDI_CONTROL_PROPERTY = /\p{Bidi_Control}/u;
+
+/** A validated source location whose file and symbol carry an override. */
+const OVERRIDDEN_LOCATION: SourceLocation = {
+  file: `src/features/${RLO}stx.tropxe/handler.ts`,
+  line: 12,
+  column: 3,
+  symbol: `load${RLO}Orders`,
+  resolvedBy: 'code-graph',
+  confidence: 0.9,
+};
+
+/**
+ * A kind this build has no label for, as a producer newer than it would send
+ * one: typed through `unknown` exactly as `NULL_DURATION` is above.
+ */
+const UNKNOWN_KIND: unknown = `custom.${RLO}kind`;
+
+/**
+ * Whether every backslash in `text` begins a complete marker — the property a
+ * cut through a marker would break.
+ */
+function markersAreWhole(text: string): boolean {
+  return text.split('\\').every((part, index) => index === 0 || /^u[0-9A-F]{4}/u.test(part));
+}
+
+describe('formatUntrustedText', () => {
+  it.each(DIRECTION_CONTROLS)('reveals $name as $marker', ({ control, marker }) => {
+    const revealed = formatUntrustedText(`a${control}b`);
+
+    expect(revealed).toBe(`a${marker}b`);
+    expect(containsDirectionControl(revealed)).toBe(false);
+    expect(containsDirectionControl(`a${control}b`)).toBe(true);
+  });
+
+  it('reveals every control in a string, however many and wherever they sit', () => {
+    const every = DIRECTION_CONTROLS.map(({ control }) => control).join('x');
+    const expected = DIRECTION_CONTROLS.map(({ marker }) => marker).join('x');
+
+    expect(formatUntrustedText(every)).toBe(expected);
+    expect(formatUntrustedText(`${RLO}${RLO}`)).toBe(`${RLO_MARKER}${RLO_MARKER}`);
+  });
+
+  it('reveals the QA payload into its logical, printable text', () => {
+    expect(formatUntrustedText(QA_PAYLOAD)).toBe(QA_PAYLOAD_REVEALED);
+    expect(containsDirectionControl(formatUntrustedText(QA_PAYLOAD))).toBe(false);
+  });
+
+  it('changes exactly the twelve Bidi_Control code points, and no other code point', () => {
+    // Collected rather than asserted per code point, so the scan of all
+    // 1,114,112 code points costs one assertion rather than a million.
+    const changed: number[] = [];
+    const disagreements: number[] = [];
+    for (let point = 0; point <= 0x10ffff; point += 1) {
+      const character = String.fromCodePoint(point);
+      const isChanged = formatUntrustedText(character) !== character;
+
+      if (isChanged) {
+        changed.push(point);
+      }
+      if (isChanged !== BIDI_CONTROL_PROPERTY.test(character)) {
+        disagreements.push(point);
+      }
+    }
+
+    expect(disagreements).toEqual([]);
+    expect(changed).toEqual(DIRECTION_CONTROLS.map(({ control }) => control.charCodeAt(0)));
+  });
+
+  it.each([
+    { reading: 'plain text', text: 'SELECT id FROM orders WHERE id = $1' },
+    { reading: 'the empty string', text: '' },
+    { reading: 'whitespace and newlines', text: ' a\n\tb ' },
+    { reading: 'right-to-left letters with no control', text: '\u05E9\u05DC\u05D5\u05DD abc' },
+    { reading: 'an emoji ZWJ sequence', text: '\u{1F469}\u200D\u{1F4BB}' },
+    {
+      reading: 'a zero width non-joiner',
+      text: '\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645',
+    },
+    { reading: 'text that already shows a marker', text: QA_PAYLOAD_REVEALED },
+  ])('returns $reading as the same string', ({ text }) => {
+    expect(formatUntrustedText(text)).toBe(text);
+    expect(containsDirectionControl(text)).toBe(false);
+  });
+
+  it('is idempotent', () => {
+    const once = formatUntrustedText(QA_PAYLOAD);
+
+    expect(formatUntrustedText(once)).toBe(once);
+  });
+
+  it('answers the same on every call, so no regular expression carries state between strings', () => {
+    for (let call = 0; call < 3; call += 1) {
+      expect(containsDirectionControl(QA_PAYLOAD)).toBe(true);
+      expect(containsDirectionControl(`${RLO}`)).toBe(true);
+      expect(formatUntrustedText(QA_PAYLOAD)).toBe(QA_PAYLOAD_REVEALED);
+    }
+  });
+});
+
+describe('the display helpers reveal what they return', () => {
+  it('oneLinePreview collapses, truncates and then reveals', () => {
+    expect(oneLinePreview(`SELECT\n  ${RLO}1`)).toBe(`SELECT ${RLO_MARKER}1`);
+    expect(oneLinePreview(QA_PAYLOAD)).toBe(QA_PAYLOAD_REVEALED);
+  });
+
+  it('oneLinePreview counts a control as one captured code point of the privacy bound', () => {
+    // 118 letters, the override, then three more: 122 captured code points,
+    // so the bound keeps 119 of them and the ellipsis.
+    const captured = `${'a'.repeat(118)}${RLO}bcd`;
+    const preview = oneLinePreview(captured);
+
+    expect(preview).toBe(`${'a'.repeat(118)}${RLO_MARKER}${ELLIPSIS}`);
+    expect(preview).toBe(formatUntrustedText(truncate(collapseWhitespace(captured))));
+    expect(containsDirectionControl(preview)).toBe(false);
+    // Longer on screen than the bound, never longer in captured content.
+    expect(Array.from(preview).length).toBeGreaterThan(MAX_PREVIEW_LENGTH);
+    expect(Array.from(truncate(captured)).length).toBe(MAX_PREVIEW_LENGTH);
+  });
+
+  it('oneLinePreview drops a control the bound cuts off whole, never half a marker', () => {
+    const preview = oneLinePreview(`${'a'.repeat(119)}${RLO}b`);
+
+    expect(preview).toBe(`${'a'.repeat(119)}${ELLIPSIS}`);
+    expect(markersAreWhole(preview)).toBe(true);
+  });
+
+  it('fitTextToWidth reveals a label that fits whole, and it is not truncated', () => {
+    expect(fitTextToWidth(`a${RLO}b`, 100, tenPerGrapheme)).toEqual({
+      text: `a${RLO_MARKER}b`,
+      width: 80,
+      truncated: false,
+    });
+  });
+
+  it('fitTextToWidth measures the marker, so a label that fits raw may not fit revealed', () => {
+    const label = `ab${RLO}cdef`;
+
+    // Seven graphemes raw (70 units), twelve revealed (120 units).
+    expect(tenPerGrapheme(label)).toBe(70);
+    const fit = fitTextToWidth(label, 100, tenPerGrapheme);
+
+    expect(fit).toEqual({ text: `ab${RLO_MARKER}c${ELLIPSIS}`, width: 100, truncated: true });
+
+    const estimate = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
+    const revealedWidth = estimateTextWidth(formatUntrustedText(label), DEFAULT_LABEL_FONT_SIZE);
+    expect(fitTextToWidth(label, revealedWidth, estimate)).toEqual({
+      text: formatUntrustedText(label),
+      width: revealedWidth,
+      truncated: false,
+    });
+  });
+
+  it('fitTextToWidth never splits a marker and never exceeds the width, at any width', () => {
+    const label = `ab${RLO}cdef${RLO}gh`;
+
+    for (let room = 1; room <= 200; room += 1) {
+      const fit = fitTextToWidth(label, room, tenPerGrapheme);
+      if (fit === undefined) {
+        continue;
+      }
+
+      expect(fit.width).toBeLessThanOrEqual(room);
+      expect(tenPerGrapheme(fit.text)).toBe(fit.width);
+      expect(markersAreWhole(fit.text)).toBe(true);
+      expect(containsDirectionControl(fit.text)).toBe(false);
+    }
+
+    // Between the prefix before the marker and the prefix through it, nothing
+    // in between is ever drawn.
+    expect(fitTextToWidth(label, 89, tenPerGrapheme)?.text).toBe(`ab${ELLIPSIS}`);
+    expect(fitTextToWidth(label, 90, tenPerGrapheme)?.text).toBe(`ab${RLO_MARKER}${ELLIPSIS}`);
+  });
+
+  it('fitTextToWidth counts a marker as one grapheme of minGraphemes', () => {
+    expect(fitTextToWidth(`${RLO}abcdef`, 70, tenPerGrapheme, { minGraphemes: 1 })?.text).toBe(
+      `${RLO_MARKER}${ELLIPSIS}`,
+    );
+    expect(fitTextToWidth(`${RLO}abcdef`, 70, tenPerGrapheme, { minGraphemes: 2 })).toBeUndefined();
+  });
+
+  it('formatCompactPath reveals after normalising, so a marker is not read as a separator', () => {
+    expect(formatCompactPath(OVERRIDDEN_LOCATION.file)).toBe(
+      `${ELLIPSIS}/${RLO_MARKER}stx.tropxe/handler.ts`,
+    );
+    expect(formatCompactPath(`src\\app\\${RLO}x.ts`, 3)).toBe(`src/app/${RLO_MARKER}x.ts`);
+    expect(formatCompactPath(`${RLO}.ts`)).toBe(`${RLO_MARKER}.ts`);
+  });
+
+  it('formatSourceChipLabel and formatSourceTooltip reveal the file and the symbol', () => {
+    const label = formatSourceChipLabel(OVERRIDDEN_LOCATION);
+    const title = formatSourceTooltip(OVERRIDDEN_LOCATION);
+
+    expect(label).toBe(`${ELLIPSIS}/${RLO_MARKER}stx.tropxe/handler.ts:12`);
+    expect(title).toBe(
+      `load${RLO_MARKER}Orders — src/features/${RLO_MARKER}stx.tropxe/handler.ts:12:3`,
+    );
+    expect(containsDirectionControl(label)).toBe(false);
+    expect(containsDirectionControl(title)).toBe(false);
+    // Presentation only: the location a click hands on keeps its raw value.
+    expect(OVERRIDDEN_LOCATION.file).toContain(RLO);
+  });
+
+  it('humanizeLabel, and the vocabulary labels that fall back to it, reveal', () => {
+    expect(humanizeLabel(`custom.${RLO}kind`)).toBe(`Custom ${RLO_MARKER}kind`);
+    expect(humanizeLabel(`${RLO}kind`)).toBe(`${RLO_MARKER}kind`);
+    expect(formatKindLabel(UNKNOWN_KIND as TelemetryKind)).toBe(`Custom ${RLO_MARKER}kind`);
+    expect(humanizeLabel('perf.longtask')).toBe('Perf longtask');
+  });
+
+  it('leave truncate and collapseWhitespace as plain building blocks', () => {
+    expect(truncate(`${RLO}abc`, 10)).toBe(`${RLO}abc`);
+    expect(collapseWhitespace(` ${RLO} a `)).toBe(`${RLO} a`);
   });
 });

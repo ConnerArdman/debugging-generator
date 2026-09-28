@@ -297,6 +297,7 @@ import {
   formatOffset,
   formatStatusLabel,
   formatTierLabel,
+  formatUntrustedText,
   pluralize,
 } from '../utils/format';
 import type { CountedNoun, TextMeasure } from '../utils/format';
@@ -1976,6 +1977,14 @@ function labelInSlot(slot: LabelSlot, text: string, width: number): BarLabelGeom
  * Places one bar's label on its row (see "Bar labels" above), or returns
  * `undefined` when no recognisable form of it fits.
  *
+ * The label is captured text, so every Unicode direction control in it is
+ * drawn as its visible escape (`formatUntrustedText`) rather than obeyed. The
+ * whole label is revealed here, before it is measured, so the width decided is
+ * the width drawn. A shortened label is revealed by `fitTextToWidth` itself,
+ * which is handed the RAW name on purpose: it reveals grapheme by grapheme and
+ * keeps each escape whole, where a name revealed beforehand could be cut in
+ * the middle of one.
+ *
  * @param bar The bar to label.
  * @param row The bar's row: every bar on it and every label already placed.
  * @param frame The canvas width and the label measure.
@@ -1988,7 +1997,7 @@ function placeBarLabel(
   const { measureText } = frame;
   const name = collapseWhitespace(bar.row.name);
   const suffix = `${BAR_LABEL_SEPARATOR}${formatDuration(bar.row.durationMs)}`;
-  const whole = `${name}${suffix}`;
+  const whole = `${formatUntrustedText(name)}${suffix}`;
   const wholeWidth = measureText(whole);
 
   const plotEnd = frame.width - CANVAS_RIGHT_GUTTER;
@@ -2820,7 +2829,13 @@ function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefi
  *
  * Used for the bar's own description, for the detail strip and for the tooltip
  * on the row's name, so the three cannot drift apart. Values arrive redacted
- * and truncated and are rendered exactly as given.
+ * and truncated and are rendered exactly as given, except that every Unicode
+ * direction control in them — in the name, the orphan reason, the lineage or a
+ * candidate's name or id — is returned as its visible escape
+ * (`formatUntrustedText`). The sentence exists only to be displayed: the bar
+ * writes it into its `aria-label` and SVG `<title>`, which no primitive
+ * reveals for it, so it is revealed here once for every carrier. The row it
+ * describes, and every key and callback derived from that row, stay raw.
  *
  * @param row The row to describe.
  * @param origin The window start its offset is measured from.
@@ -2835,7 +2850,7 @@ function describeBar(row: TimelineBar, origin: number, spanNames: SpanNames): st
   )}. Reported: ${formatStatusLabel(row.status)}.`;
   const note = lineageNoteFor(row, spanNames);
 
-  return note === undefined ? sentence : `${sentence} ${note}`;
+  return formatUntrustedText(note === undefined ? sentence : `${sentence} ${note}`);
 }
 
 /** The verb that agrees with a count of spans: "is" or "are". */
@@ -3036,7 +3051,11 @@ interface TimelineCanvasProps {
    * detail strip, and the parent ends it (see `TimelineView`).
    */
   readonly onHover: (eventId: string) => void;
-  /** The canvas's text alternative. */
+  /**
+   * The canvas's text alternative. Written into the `<svg>`'s own
+   * `aria-label`, which no primitive reveals, so the canvas prints any
+   * direction control in it as its visible escape itself.
+   */
   readonly label: string;
 }
 
@@ -3086,7 +3105,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
       ref={canvasRef}
       className="dg-timeline__canvas"
       role="figure"
-      aria-label={label}
+      aria-label={formatUntrustedText(label)}
       width="100%"
       height={geometry.height}
       viewBox={`0 0 ${String(geometry.width)} ${String(geometry.height)}`}

@@ -145,13 +145,16 @@ import {
   MAX_PREVIEW_LENGTH,
   NOT_AVAILABLE_LABEL,
   collapseWhitespace,
+  containsDirectionControl,
   formatCount,
   formatKindLabel,
   formatOffset,
   formatStatusLabel,
+  formatUntrustedText,
   oneLinePreview,
 } from '../utils/format';
 import { EventLog } from './EventLog';
+import { sourceLinkAccessibleName } from './SourceLink';
 
 /**
  * How many times the code primitive — the attribute strip's chip — has
@@ -3615,5 +3618,185 @@ describe('EventLog cell rendering', () => {
     });
 
     expect(codeRenders.count).toBe(settled);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * A record's name, its attribute values and its location are captured text,
+ * and an invisible right-to-left override (U+202E) in one of them draws the
+ * characters after it backwards: escaped markup still reads reversed. Every
+ * place this log puts such text — the name and its title, the attribute chips
+ * and their titles, the disclosure's name, the detail, the source chip and the
+ * grid's name — prints each control as its visible escape (`\u202E`); a short
+ * value is not called cut merely because it carries one; and every value
+ * handed back to the host stays as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered tree.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('EventLog direction controls', () => {
+  const bidiName = `QA_BIDI ${RLO}</td><script>alert(7)</script>${PDF}`;
+  const bidiSource: SourceLocation = {
+    file: `src/example/${RLO}handler.ts`,
+    line: 12,
+    column: 3,
+    symbol: `on${RLO}Click`,
+    resolvedBy: 'source-map',
+    confidence: 0.8,
+  };
+  const bidiRecord = makeEvent({
+    id: `event-${RLO}example-0001`,
+    name: bidiName,
+    status: 'error',
+    attributes: { target: `#${RLO}buy${PDF}` },
+    source: bidiSource,
+  });
+
+  it('prints every control as its escape and keeps the markup inert', async () => {
+    const title = `Events ${RLO}logged`;
+    const stub = resolvingProvider('events', [bidiRecord]);
+
+    renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('grid', { name: formatUntrustedText(title) });
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    // The name and its title are the logical text, markers and all.
+    const name = row.querySelector<HTMLElement>('.dg-event-log__name');
+    expect(name?.textContent).toBe(formatUntrustedText(bidiName));
+    expect(name?.getAttribute('title')).toBe(formatUntrustedText(bidiName));
+
+    // The one short attribute is shown whole, so the row offers no detail for
+    // it: a control is not a cut.
+    const chip = row.querySelector<HTMLElement>('.dg-event-log__attr');
+    expect(chip?.textContent).toBe(`target=#${RLO_MARKER}buy\\u202C`);
+    expect(within(row).queryByRole('button', { name: /^Show the full attributes of / })).toBeNull();
+
+    // Nothing a reader sees, hovers or hears carries a raw control, and the
+    // markup in the name is only text.
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+    expect(document.body.querySelector('script, td')).toBeNull();
+  });
+
+  it('still discloses a long value with a control, revealed in full', async () => {
+    const long = `${'redacted-value-'.repeat(9)}${RLO}tail`;
+    const stub = resolvingProvider('events', [
+      makeEvent({ name: `example${RLO}.click`, attributes: { target: long } }),
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(
+      screen.getByRole('button', {
+        name: `Show the full attributes of ${formatUntrustedText(`example${RLO}.click`)}`,
+      }),
+    );
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+    expect(detailEntries(attributeDetailOf(row))).toEqual([['target', formatUntrustedText(long)]]);
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+  });
+
+  it('hands the host the raw record id and the raw location', async () => {
+    const stub = resolvingProvider('events', [bidiRecord]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(
+      within(row).getByRole('button', {
+        name: sourceLinkAccessibleName({ location: bidiSource, compact: true }),
+      }),
+    );
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toEqual(bidiSource);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]?.file).toContain(RLO);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    await user.click(row);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls[0]?.[0]).toEqual({
+      eventId: bidiRecord.id,
+      spanId: bidiRecord.spanId,
+      traceId: bidiRecord.traceId,
+    });
+    expect(containsDirectionControl(bidiRecord.id)).toBe(true);
+  });
+
+  it('filters on the marker a reader sees, and on a pasted raw control alike', async () => {
+    // The control sits only in the name, so a match can come from nowhere else.
+    const marked = makeEvent({ id: 'event-marked-0001', name: `example${RLO}.click` });
+    const plain = makeEvent({ id: 'event-plain-0002', name: 'example.plain' });
+    const stub = resolvingProvider('events', [marked, plain]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    await user.type(searchField(), RLO_MARKER);
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([formatUntrustedText(marked.name)]);
+    });
+
+    await user.clear(searchField());
+    await user.type(searchField(), RLO);
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([formatUntrustedText(marked.name)]);
+    });
   });
 });

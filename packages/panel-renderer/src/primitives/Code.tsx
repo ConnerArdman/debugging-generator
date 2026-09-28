@@ -9,10 +9,11 @@
  * overflow rules.
  *
  * TIER 1 ATOM
- * It imports nothing from this folder, nothing from `../layout`, `../components` or `../host`,
- * and no workspace package - React's types and `clsx` are its entire dependency surface. That is
- * what lets every other primitive and every component above them use it without a cycle, and it
- * is why this file has no notion of a panel, a query, a transport or a session.
+ * It imports nothing from `../layout`, `../components` or `../host`, and no workspace package; from
+ * this folder it imports only the untrusted-text helper (`./untrusted-text`), a pure function over
+ * strings rather than a component. React's types, `clsx` and that helper are its entire dependency
+ * surface. That is what lets every other primitive and every component above them use it without
+ * a cycle, and it is why this file has no notion of a panel, a query, a transport or a session.
  *
  * INLINE VERSUS BLOCK
  * The default form is a single `<code>`: a phrase-level element that flows inside a sentence, a
@@ -23,13 +24,34 @@
  * copy affordance, no line numbers.
  *
  * IT MUST NOT TRANSFORM WHAT IT IS GIVEN
- * `children` is rendered straight through. No trimming, no whitespace collapsing, no re-quoting,
- * no re-indenting, no case folding, no ellipsis, no line numbering and no syntax highlighting -
- * this package deliberately carries no highlighting dependency, because a tokenizer that
- * mis-lexes captured text would be indistinguishable, on screen, from data that really looked
- * that way. Whitespace and newlines survive byte-for-byte; the block form's `white-space`
- * handling is a stylesheet concern, not a string concern. A caller that needs a shortened value
- * shortens it before passing it in and says so with a `title`.
+ * `children` is rendered straight through, with one sanctioned exception described below. No
+ * trimming, no whitespace collapsing, no re-quoting, no re-indenting, no case folding, no
+ * ellipsis, no line numbering and no syntax highlighting - this package deliberately carries no
+ * highlighting dependency, because a tokenizer that mis-lexes captured text would be
+ * indistinguishable, on screen, from data that really looked that way. Whitespace and newlines
+ * survive byte-for-byte; the block form's `white-space` handling is a stylesheet concern, not a
+ * string concern. A caller that needs a shortened value shortens it before passing it in and says
+ * so with a `title`.
+ *
+ * THE ONE EXCEPTION: DIRECTION CONTROLS ARE SHOWN, NOT OBEYED
+ * The same argument that forbids highlighting demands this. The twelve Unicode bidirectional
+ * formatting controls (U+202E RIGHT-TO-LEFT OVERRIDE and its siblings) are invisible and reorder
+ * the glyphs after them, so a statement, a path or a span name that carries one would be drawn as
+ * a sequence the capture never contained - `</td><script>` read backwards - while its
+ * `textContent` still held the truth (the "Trojan Source" class, CVE-2021-42574). Every string
+ * child, and a string `title` or `aria-label`, is therefore rendered through
+ * `formatUntrustedNode`/`formatUntrustedText` from `./untrusted-text`, which print each control as
+ * its visible escape (`\u202E`) and change no other character. That is not a transformation of
+ * meaning: it is the guarantee that the glyphs on screen are the characters captured, in the
+ * order captured. The native tooltip and the accessible name use the same definition, so they
+ * match the visible text (WCAG 2.5.3).
+ *
+ * Both forms also carry a default `dir="ltr"`, placed before the rest props so a caller can
+ * still pass its own. Machine text - SQL, a path, a URL, a span name - is left-to-right whatever
+ * the surrounding interface, and an element with a `dir` attribute is bidi-isolated by the HTML
+ * user-agent stylesheet (`[dir] { unicode-bidi: isolate }`), so right-to-left letters inside the
+ * value cannot reorder the punctuation around them, and nothing inside the value can reorder the
+ * text around the element. It is an HTML attribute, not a style: no CSS value is set here.
  *
  * PRIVACY: THIS IS THE END OF THE PIPELINE, NOT A STAGE IN IT (see docs/SECURITY.md)
  * Everything reaching this component has already been redacted and truncated upstream - once in
@@ -79,6 +101,8 @@
 import clsx from 'clsx';
 
 import type { HTMLAttributes, ReactElement, ReactNode, Ref, RefCallback, RefObject } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * The two monospace type roles of the design system, and deliberately the only two:
@@ -220,11 +244,12 @@ export interface CodeProps extends HTMLAttributes<HTMLElement> {
   wrap?: boolean | undefined;
 
   /**
-   * The text to render, rendered exactly as given. Redeclared from the inherited attributes only
-   * to carry that guarantee: whitespace, indentation and newlines are preserved byte-for-byte and
-   * nothing here reformats, highlights or shortens them (see the file notes on transformation and
-   * privacy). A node rather than a string so a caller may emphasise a fragment of it - never so
-   * it can nest an interactive control.
+   * The text to render, rendered exactly as given except that every direction control in a string
+   * is printed as its visible escape. Redeclared from the inherited attributes only to carry that
+   * guarantee: whitespace, indentation and newlines are preserved byte-for-byte and nothing here
+   * reformats, highlights or shortens them (see the file notes on transformation, direction
+   * controls and privacy). A node rather than a string so a caller may emphasise a fragment of it -
+   * never so it can nest an interactive control.
    */
   children?: ReactNode;
 
@@ -244,7 +269,8 @@ export interface CodeProps extends HTMLAttributes<HTMLElement> {
  * Renders monospace text.
  *
  * @param props See {@link CodeProps}.
- * @returns A `<code>`, or a `<pre><code>` when `block` is set.
+ * @returns A `<code>`, or a `<pre><code>` when `block` is set; the root carries `dir="ltr"`
+ *   unless the caller passes its own `dir`.
  *
  * @example
  * // An identifier inside running text, and a dense numeric cell.
@@ -268,17 +294,26 @@ export function Code(props: CodeProps): ReactElement {
     wrap = false,
     children,
     className,
+    title,
+    'aria-label': label,
     ref,
     ...rest
   } = props;
 
   const sizeClass = SIZE_CLASS[size];
 
+  // What a reader sees, hovers or hears is revealed; everything else in `rest` reaches the element
+  // untouched (see the file note on direction controls). An absent attribute stays absent.
+  const shown = formatUntrustedNode(children);
+  const hint = title === undefined ? title : formatUntrustedText(title);
+  const spoken = label === undefined ? label : formatUntrustedText(label);
+
   if (block) {
     return (
-      // `tabIndex` is placed before the rest props on purpose: the focusable default is what a
-      // scrollable box needs, and a caller that has a reason to change it - a block inside a
-      // composite widget that manages its own focus order - can still pass its own.
+      // `tabIndex` and `dir` are placed before the rest props on purpose: the focusable default is
+      // what a scrollable box needs and the left-to-right isolate is what machine text needs, and a
+      // caller that has a reason to change either - a block inside a composite widget that manages
+      // its own focus order, a value known to be right-to-left prose - can still pass its own.
       <pre
         className={clsx(
           'dg-code',
@@ -289,10 +324,13 @@ export function Code(props: CodeProps): ReactElement {
           className,
         )}
         tabIndex={0}
+        dir="ltr"
+        title={hint}
+        aria-label={spoken}
         ref={blockRef(ref)}
         {...rest}
       >
-        <code>{children}</code>
+        <code>{shown}</code>
       </pre>
     );
   }
@@ -306,10 +344,13 @@ export function Code(props: CodeProps): ReactElement {
         wrap && 'dg-code--wrap',
         className,
       )}
+      dir="ltr"
+      title={hint}
+      aria-label={spoken}
       ref={ref}
       {...rest}
     >
-      {children}
+      {shown}
     </code>
   );
 }

@@ -236,6 +236,8 @@ function throwingLogger(): Logger {
 /** Every call the fake repository received, per method, in call order. */
 interface RepoCalls {
   readonly getBindingByTab: number[];
+  /** The holder each `getBindingByTab` call named, `undefined` for a read by tab id alone. */
+  readonly getBindingByTabHolders: (string | undefined)[];
   readonly get: SessionId[];
   readonly getActiveCapture: SessionId[];
   readonly list: CapturingSessionsQuery[];
@@ -253,7 +255,7 @@ interface FakeRepoSpec {
   readonly listed?: readonly ListedSessionLike[];
   /** `false` omits `list` entirely, as a repository without it would. */
   readonly withList?: boolean;
-  readonly getBindingByTab?: (tabId: number) => Result<BindingLike | undefined>;
+  readonly getBindingByTab?: (tabId: number, boundBy?: string) => Result<BindingLike | undefined>;
   readonly get?: (id: SessionId) => Result<SessionLike | undefined>;
   readonly getActiveCapture?: (sessionId: SessionId) => Result<ActiveCaptureLike | undefined>;
   readonly list?: (query: CapturingSessionsQuery) => Result<SessionPageLike>;
@@ -269,7 +271,13 @@ interface FakeRepo extends SessionsRepoLike {
  * missing row exactly as the real repository does, and recording every call.
  */
 function fakeRepo(spec: FakeRepoSpec = {}): FakeRepo {
-  const calls: RepoCalls = { getBindingByTab: [], get: [], getActiveCapture: [], list: [] };
+  const calls: RepoCalls = {
+    getBindingByTab: [],
+    getBindingByTabHolders: [],
+    get: [],
+    getActiveCapture: [],
+    list: [],
+  };
   const bindings = new Map<number, SessionId>(spec.bindings ?? []);
   const records = new Map<SessionId, SessionLike>(
     (spec.sessions ?? []).map((record) => [record.id, record] as const),
@@ -290,10 +298,11 @@ function fakeRepo(spec: FakeRepoSpec = {}): FakeRepo {
 
   return {
     calls,
-    getBindingByTab: (tabId: number): Result<BindingLike | undefined> => {
+    getBindingByTab: (tabId: number, boundBy?: string): Result<BindingLike | undefined> => {
       calls.getBindingByTab.push(tabId);
+      calls.getBindingByTabHolders.push(boundBy);
       if (spec.getBindingByTab !== undefined) {
-        return spec.getBindingByTab(tabId);
+        return spec.getBindingByTab(tabId, boundBy);
       }
       const sessionId = bindings.get(tabId);
       return ok(sessionId === undefined ? undefined : { sessionId });
@@ -712,6 +721,58 @@ describe('resolveBatch: browser origin', () => {
     expect(world.repo.calls.getActiveCapture).toStrictEqual([world.sessionId]);
     // The server-origin fallback is never consulted for a browser batch.
     expect(world.repo.calls.list).toStrictEqual([]);
+    // No holder was named, so the tab's row was read by tab id alone.
+    expect(world.repo.calls.getBindingByTabHolders).toStrictEqual([undefined]);
+  });
+
+  it('reads the verified holder’s binding of the tab when the relay names it, never another browser’s', async () => {
+    // Two paired browsers bound a tab with the same id, each to its own session.
+    const firstHolder = 'a'.repeat(64);
+    const secondHolder = 'b'.repeat(64);
+    const firstSession = newSessionId();
+    const secondSession = newSessionId();
+    const firstCapture = newCaptureId();
+    const secondCapture = newCaptureId();
+    const holders = new Map<string, SessionId>([
+      [firstHolder, firstSession],
+      [secondHolder, secondSession],
+    ]);
+    const repo = fakeRepo({
+      getBindingByTab: (_tabId, boundBy) => {
+        const sessionId = boundBy === undefined ? undefined : holders.get(boundBy);
+        return ok(sessionId === undefined ? undefined : { sessionId });
+      },
+      sessions: [
+        { id: firstSession, projectRoot: PROJECT_ONE },
+        { id: secondSession, projectRoot: PROJECT_ONE },
+      ],
+      activeCaptures: [
+        [firstSession, firstCapture],
+        [secondSession, secondCapture],
+      ],
+    });
+    const log = recordingLogger();
+    const attributor = createIngestAttributor({
+      sessions: repo,
+      logger: log.logger,
+      now: fixedClock,
+    });
+
+    const first = expectResolved(
+      await attributor.resolveBatch({ ...browserContext(), boundBy: firstHolder }),
+    );
+    const second = expectResolved(
+      await attributor.resolveBatch({ ...browserContext(), boundBy: secondHolder }),
+    );
+
+    expect([first.sessionId, first.captureId]).toStrictEqual([firstSession, firstCapture]);
+    expect([second.sessionId, second.captureId]).toStrictEqual([secondSession, secondCapture]);
+    expect(repo.calls.getBindingByTab).toStrictEqual([TAB_ID, TAB_ID]);
+    expect(repo.calls.getBindingByTabHolders).toStrictEqual([firstHolder, secondHolder]);
+    // The holder is compared, never logged or reported.
+    expect(JSON.stringify(first)).not.toContain(firstHolder);
+    expect(log.text()).not.toContain(firstHolder);
+    expect(log.text()).not.toContain(secondHolder);
   });
 
   it('reports the bound session’s project root in normalised form', async () => {

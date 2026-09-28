@@ -87,7 +87,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { SQLInputValue, SQLOutputValue, StatementSync } from 'node:sqlite';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   CODE_INDEX_SCHEMA_VERSION,
@@ -126,7 +126,8 @@ import { SECURE_DIR_MODE, sha256OfFileSync } from '@debuggen/shared/node';
 
 import { canonicalizePath } from '../config.js';
 import { openStore } from './db.js';
-import type { Store } from './db.js';
+import type * as DbModule from './db.js';
+import type { Store, WalCheckpointer } from './db.js';
 import {
   SELECT_SESSION_BACKUP_REFERENCES_SQL,
   createModificationsRepo,
@@ -166,6 +167,42 @@ import {
 import type { ListRetentionCandidatesOptions, SessionsRepo } from './sessions-repo.js';
 import { DEFAULT_PURGE_BATCH_SIZE, createTelemetryRepo } from './telemetry-repo.js';
 import type { PersistableTelemetryEvent, TelemetryRepo } from './telemetry-repo.js';
+
+/**
+ * How many of the sweep's next background checkpoints answer as if another
+ * connection held the checkpoint lock, the way the store's own background
+ * checkpointer does when its interval meets a sweep's wait. `0` everywhere but
+ * the test that sets it, so every other checkpoint passes through untouched.
+ */
+const walContention = vi.hoisted(() => ({ remaining: 0 }));
+
+vi.mock('./db.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof DbModule>();
+  return {
+    ...actual,
+    openWalCheckpointer: (store: Store): WalCheckpointer | undefined => {
+      const real = actual.openWalCheckpointer(store);
+      if (real === undefined) {
+        return undefined;
+      }
+      return {
+        walBytes: () => real.walBytes(),
+        checkpoint: async () => {
+          if (walContention.remaining > 0) {
+            walContention.remaining -= 1;
+            return {
+              status: 'failed',
+              reason: actual.CONCURRENT_CHECKPOINT_REASON,
+              durationMs: 0,
+            };
+          }
+          return real.checkpoint();
+        },
+        close: () => real.close(),
+      };
+    },
+  };
+});
 
 /* -------------------------------------------------------------------------------------------------
  * Time
@@ -4388,6 +4425,14 @@ const DEFAULT_AUTOCHECKPOINT_PAGES = 1_000;
 const BACKGROUND_CHECKPOINT_MESSAGE =
   'checkpointed the session store write-ahead log off the event loop';
 
+/** The debug record of a wait another connection's checkpoint pre-empted. */
+const CONTENDED_CHECKPOINT_MESSAGE =
+  'another connection was checkpointing the session store write-ahead log; the sweep waits again after its next batch';
+
+/** The warning of a background checkpoint that failed, which hands the log back. */
+const FAILED_CHECKPOINT_MESSAGE =
+  'the background checkpoint of the session store failed; the sweep continues with the connection’s own checkpoints';
+
 /** The store connection's `wal_autocheckpoint`, as the pragma answers it. */
 function autoCheckpointOf(harness: Harness): unknown {
   return harness.store.db.prepare('PRAGMA wal_autocheckpoint').get()?.['wal_autocheckpoint'];
@@ -4440,6 +4485,56 @@ describe('the write-ahead log during a sweep', () => {
       }
       expect(finishedFields(h)).toMatchObject({ walCheckpoints: waited.length });
       // The last wait left nothing for the closing truncation but the truncation.
+      expect(walFileBytes(h)).toBe(0);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'keeps its own checkpoints when another connection was checkpointing the log, and waits again after its next batch',
+    async () => {
+      const { sessionId } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const seen: unknown[] = [];
+
+      walContention.remaining = 1;
+      let report: RetentionReport;
+      try {
+        report = await sweep(
+          h,
+          { walCheckpointBytes: 0 },
+          {
+            isSessionInUse: () => {
+              seen.push(autoCheckpointOf(h));
+              return false;
+            },
+          },
+        );
+        // The collision was answered, and to the first wait.
+        expect(walContention.remaining).toBe(0);
+      } finally {
+        walContention.remaining = 0;
+      }
+
+      expect(report.sessionsDeleted).toBe(1);
+      expect(report.errors).toEqual([]);
+      expect(sessionExists(h, sessionId)).toBe(false);
+      // Every drain after the pre-empted wait still ran with the commit-time
+      // checkpoint suspended: the collision did not hand it back.
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(seen)).toEqual(new Set([0]));
+      expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+
+      const contended = h.logs.filter((log) => log.message === CONTENDED_CHECKPOINT_MESSAGE);
+      expect(contended).toHaveLength(1);
+      expect(contended[0]?.level).toBe('debug');
+      expect(contended[0]?.fields).toMatchObject({ subsystem: 'store', checkpoint: 'failed' });
+      expect(h.logs.filter((log) => log.message === FAILED_CHECKPOINT_MESSAGE)).toEqual([]);
+
+      // The next batch waited again, and only completed waits are counted.
+      const waited = h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE);
+      expect(waited.length).toBeGreaterThan(0);
+      expect(finishedFields(h)).toMatchObject({ walCheckpoints: waited.length });
       expect(walFileBytes(h)).toBe(0);
     },
     LARGE_FIXTURE_TEST_TIMEOUT_MS,

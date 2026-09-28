@@ -165,11 +165,13 @@ import type { TokenKey, TokenValues } from '../tokens/tokens';
 import { RENDER_TRIGGER_TOKEN_KEYS } from '../utils/color';
 import {
   MAX_PREVIEW_LENGTH,
+  containsDirectionControl,
   formatCount,
   formatDuration,
   formatOffset,
   formatRenderTriggerLabel,
   formatSourceTooltip,
+  formatUntrustedText,
   truncate,
 } from '../utils/format';
 import { RenderTable } from './RenderTable';
@@ -5298,5 +5300,161 @@ describe('RenderTable shared selection', () => {
       SECOND_RENDER.eventId,
       FIRST_RENDER.eventId,
     ]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured names
+ *
+ * A component name, a changed prop key, a context name and a location are
+ * captured text, and an invisible right-to-left override (U+202E) in one of
+ * them draws the characters after it backwards. Every place this table puts
+ * such text — the name chip and its tooltip, the unlinked name, the toggle and
+ * occurrence names, the changed props and contexts, the detail — prints each
+ * control as its visible escape (`\u202E`), and every value handed back to the
+ * host stays as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered tree.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('RenderTable direction controls', () => {
+  const linked = `Example${RLO}Widget${PDF}`;
+  const unlinked = `Example${RLO}List`;
+  const propKey = `on${RLO}Change`;
+  const contextName = `Theme${RLO}Context`;
+
+  /** A location whose symbol is the component itself, with a control in its path. */
+  const bidiSource: SourceLocation = {
+    ...WIDGET_SOURCE,
+    file: `src/example/${RLO}widget.tsx`,
+    symbol: linked,
+  };
+
+  const occurrence = makeOccurrence({
+    eventId: `event-${RLO}example-0001`,
+    trigger: 'context',
+    changedPropKeys: [propKey],
+    changedContexts: [contextName],
+    source: bidiSource,
+  });
+
+  const linkedRow = makeRenderStat({
+    component: linked,
+    changedPropKeys: [propKey],
+    changedPropCounts: { [propKey]: 2 },
+    changedContexts: [contextName],
+    changedContextCounts: { [contextName]: 1 },
+    occurrences: [occurrence],
+    occurrencesTruncated: false,
+    source: bidiSource,
+  });
+
+  const unlinkedRow = makeRenderStat({ component: unlinked, occurrences: [] });
+
+  it('prints every control as its escape, in the rows and the detail', async () => {
+    const stub = resolvingProvider([linkedRow, unlinkedRow]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Both names are shown revealed: one captions its chip, one is plain text.
+    expect(renderedNames()).toEqual([formatUntrustedText(linked), formatUntrustedText(unlinked)]);
+
+    // The chip is named by its own rule, revealed, and its tooltip does not
+    // repeat the caption the symbol-first description already names.
+    const chip = within(rowFor(formatUntrustedText(linked))).getByRole('button', {
+      name: nameChipName(linked, bidiSource),
+    });
+    expect(chip.getAttribute('aria-label')).toContain(RLO_MARKER);
+    const bubble = chip.closest('.dg-tooltip')?.querySelector('[role="tooltip"]');
+    expect(bubble?.textContent).toBe(formatSourceTooltip(bidiSource));
+
+    await user.click(toggleOf(formatUntrustedText(linked)));
+
+    const detail = onlyDetailRow();
+    expect(detail.textContent).toContain(formatUntrustedText(linked));
+    expect(detail.textContent).toContain(`on${RLO_MARKER}Change`);
+    expect(detail.textContent).toContain(`Theme${RLO_MARKER}Context`);
+    expect(
+      within(detail).getByRole('button', {
+        name: selectOccurrenceNameOf(
+          formatUntrustedText(linked),
+          formatOffset(occurrence.startTime, linkedRow.firstStartTime),
+        ),
+      }),
+    ).toBeDefined();
+
+    // Nothing a reader sees, hovers or hears carries a raw control.
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+  });
+
+  it('hands the host the raw location and the raw event id', async () => {
+    const stub = resolvingProvider([linkedRow]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await user.click(
+      within(rowFor(formatUntrustedText(linked))).getByRole('button', {
+        name: nameChipName(linked, bidiSource),
+      }),
+    );
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toEqual(bidiSource);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]?.file).toContain(RLO);
+
+    await user.click(toggleOf(formatUntrustedText(linked)));
+    await user.click(
+      within(onlyDetailRow()).getByRole('button', {
+        name: selectOccurrenceNameOf(
+          formatUntrustedText(linked),
+          formatOffset(occurrence.startTime, linkedRow.firstStartTime),
+        ),
+      }),
+    );
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: occurrence.eventId,
+      spanId: occurrence.spanId,
+      traceId: occurrence.traceId,
+    });
+    expect(containsDirectionControl(occurrence.eventId)).toBe(true);
   });
 });

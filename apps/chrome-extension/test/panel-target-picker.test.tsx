@@ -24,6 +24,10 @@
  *     disclosure; the disclosure stays operable while the element-targeting controls are busy or
  *     unavailable; the picker toggle, its badge and the single status region behave as before.
  *   - **A clean console.** Rendering and toggling make React warn about nothing.
+ *   - **Hostile page text stays legible (QA-SEC F02).** Markup and a right-to-left override pair in
+ *     the selector, the visible text, the component chain and the page URL render as text, each
+ *     direction control printed as its visible `\u202E`-style escape in the chips, their titles
+ *     and the details, and every code-like value isolated left-to-right.
  *
  * ## Harness
  *
@@ -34,6 +38,7 @@
  * (AAP 0.5.4).
  */
 
+import { containsDirectionControl } from '@debuggen/panel-renderer';
 import type { SelectedTarget } from '@debuggen/protocol';
 import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -415,5 +420,85 @@ describe('TargetPicker — what the summary leaves unchanged', () => {
     expect(root?.classList.contains('picker-under-test')).toBe(true);
     expect(root?.classList.contains('dg-stack--vertical')).toBe(true);
     expect(container.querySelectorAll('.picker-under-test')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hostile page text: markup and direction controls (QA-SEC F02)
+// ---------------------------------------------------------------------------
+
+/**
+ * The label QA-SEC F02 ingested: markup wrapped in U+202E RIGHT-TO-LEFT OVERRIDE and U+202C POP
+ * DIRECTIONAL FORMATTING, which drew its tail reversed while `textContent` stayed logical.
+ */
+const BIDI_LABEL = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** The same label as the picker prints it: each control as its visible escape. */
+const REVEALED_LABEL = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** A target whose every page-controlled field carries {@link BIDI_LABEL}. */
+const BIDI_TARGET: SelectedTarget = Object.freeze({
+  selector: `main > [data-label="${BIDI_LABEL}"]`,
+  tagName: 'span',
+  text: `Visible ${BIDI_LABEL}`,
+  componentChain: [`Nearest ${BIDI_LABEL}`, `Outer ${BIDI_LABEL}`],
+  url: `http://127.0.0.1:4100/workspace?label=${BIDI_LABEL}`,
+});
+
+/**
+ * Asserts that no text a reader sees, hovers or hears under `root` carries a raw direction
+ * control: its text content, and every attribute but the `data-*` ones, which are data rather
+ * than presentation and keep raw values by contract.
+ *
+ * @param root The subtree to read; the document body, so a portalled tooltip is read too.
+ */
+function expectNoRawDirectionControl(root: Element): void {
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of [root, ...root.querySelectorAll('*')]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-')) {
+        expect(
+          containsDirectionControl(attribute.value),
+          `${element.tagName.toLowerCase()}[${attribute.name}]`,
+        ).toBe(false);
+      }
+    }
+  }
+}
+
+describe('TargetPicker — hostile page text', () => {
+  it('prints each direction control as its visible escape in the summary and the details', async () => {
+    // The fixture is hostile: the raw controls are in the descriptor the picker receives.
+    expect(containsDirectionControl(BIDI_TARGET.selector)).toBe(true);
+    const user = userEvent.setup();
+    render(<TargetPicker {...props({ target: BIDI_TARGET })} />);
+
+    // The summary's two clipped chips: text and title both revealed, each isolated.
+    const chips = Array.from(summaryLine().querySelectorAll<HTMLElement>('code'));
+    const selector = `main > [data-label="${REVEALED_LABEL}"]`;
+    const nearest = `Nearest ${REVEALED_LABEL}`;
+    expect(chips.map((chip) => chip.textContent)).toEqual([nearest, selector]);
+    expect(chips.map((chip) => chip.getAttribute('title'))).toEqual([nearest, selector]);
+    for (const chip of chips) {
+      expect(chip.closest('[dir="ltr"]')).not.toBeNull();
+    }
+
+    await user.click(detailsToggle());
+    const details = detailsRegion().textContent;
+    for (const shown of [
+      selector,
+      `Visible ${REVEALED_LABEL}`,
+      nearest,
+      `Outer ${REVEALED_LABEL}`,
+      `http://127.0.0.1:4100/workspace?label=${REVEALED_LABEL}`,
+    ]) {
+      expect(details, shown).toContain(shown);
+    }
+
+    // The markup stayed text: nothing was parsed out of it.
+    expect(document.querySelector('script')).toBeNull();
+    expect(document.querySelector('td')).toBeNull();
+    expectNoRawDirectionControl(document.body);
+    expectCleanConsole();
   });
 });

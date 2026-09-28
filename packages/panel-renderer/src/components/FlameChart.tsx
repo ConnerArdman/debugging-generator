@@ -321,6 +321,7 @@ import {
   formatOffset,
   formatStatusLabel,
   formatTierLabel,
+  formatUntrustedText,
   pluralize,
   truncate,
 } from '../utils/format';
@@ -1184,6 +1185,11 @@ function provenanceOf(frame: FlameFrame): string | undefined {
  * reader through the frame's accessible name ({@link frameDescription}), and a
  * keyboard user through the row's own tooltip and cells in the text
  * equivalent, which is the representation that must be complete.
+ *
+ * It is written into an SVG `<title>`, which no primitive reveals, so every
+ * Unicode direction control in the captured parts — the name, the ancestors'
+ * names, the orphan reason and the lineage — is returned as its visible escape
+ * (`formatUntrustedText`) rather than left to reorder the tooltip.
  */
 function frameTooltipText(frame: FlameFrame): string {
   const lines: string[] = [frame.name];
@@ -1205,7 +1211,7 @@ function frameTooltipText(frame: FlameFrame): string {
     lines.push(provenance);
   }
 
-  return lines.join('\n');
+  return formatUntrustedText(lines.join('\n'));
 }
 
 /**
@@ -1325,6 +1331,11 @@ function compactionSentence(model: FlameModel): string | undefined {
  * describes samples, stacks or a profile — see the note at the top of this
  * module. A drawing in which a crowded depth gathered operations into marks
  * says so in the words of the note above it ({@link compactionSentence}).
+ *
+ * It becomes the `<svg>`'s own `aria-label`, which no primitive reveals, and it
+ * carries untrusted text — the node's model-authored title and the names of
+ * the context band's operations — so every Unicode direction control in it is
+ * returned as its visible escape (`formatUntrustedText`).
  */
 function canvasTextAlternative(model: FlameModel, title: string | undefined): string {
   const heading = title === undefined ? CATALOG_ENTRY.label : title;
@@ -1353,7 +1364,9 @@ function canvasTextAlternative(model: FlameModel, title: string | undefined): st
     partial.push('The trace itself arrived incomplete.');
   }
 
-  return partial.length === 0 ? described : `${described} ${partial.join(' ')}`;
+  return formatUntrustedText(
+    partial.length === 0 ? described : `${described} ${partial.join(' ')}`,
+  );
 }
 
 /*
@@ -2763,6 +2776,12 @@ interface TreeItemHit {
  *
  * It names recorded operations and measured durations only — see the note at
  * the top of this module.
+ *
+ * It is written straight into `aria-label` attributes — the frame's `<rect>`,
+ * a context bar's and the tree row's — which no primitive reveals, so every
+ * Unicode direction control in its captured parts (the name, the ancestors'
+ * names, the orphan reason and the lineage) is returned as its visible escape
+ * (`formatUntrustedText`). The frame it describes stays raw.
  */
 function frameDescription(frame: FlameFrame): string {
   const parts: string[] = [
@@ -2785,7 +2804,7 @@ function frameDescription(frame: FlameFrame): string {
 
   const provenance = provenanceOf(frame);
   const facts = parts.join(' · ');
-  return provenance === undefined ? facts : `${facts}. ${provenance}`;
+  return formatUntrustedText(provenance === undefined ? facts : `${facts}. ${provenance}`);
 }
 
 /**
@@ -4161,9 +4180,11 @@ export function FlameChart(props: FlameChartProps): ReactElement {
   const partialSentences = partialSentencesFor(model);
   const windowed = isWindowed(rowWindow);
   const contextStatement = contextSentence(model.context);
-  const listLabel = `${node.title ?? CATALOG_ENTRY.label}: ${pluralOperations(
-    model.frames.length,
-  )}, innermost last`;
+  // The tree's `aria-label`, which no primitive reveals, opens with the node's
+  // model-authored title: a direction control in it is printed as its escape.
+  const listLabel = formatUntrustedText(
+    `${node.title ?? CATALOG_ENTRY.label}: ${pluralOperations(model.frames.length)}, innermost last`,
+  );
 
   // The selected frame when an overflow mark gathered it instead of a sub-row
   // drawing it. Its bar is drawn on the overflow row, over its mark, so the

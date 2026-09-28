@@ -16,8 +16,8 @@
  * file-local property holds it in the same `var()` form, so every literal in this file sits inside
  * a fallback. Hex is lowercase because Prettier normalises it and `pnpm format:check` is blocking.
  *
- * The exported class names are `root`, `body` and `term`: exactly the three CatalogEmptyNotice.tsx
- * imports, and each of the three is declared below.
+ * The exported class names are `root`, `body`, `term` and `control`: exactly the four
+ * CatalogEmptyNotice.tsx imports, and each of the four is declared below.
  */
 
 /* The field: a centred column holding the BlankSlate block, outlined and recessed so the message
@@ -59,8 +59,27 @@
 }
 
 /* The search term echoed back inside that sentence: monospaced and in the primary text colour, so
- * a reader can see exactly what was searched for, spacing and punctuation included. */
+ * a reader can see exactly what was searched for, spacing and punctuation included. The term is a
+ * bidirectional isolate: `unicode-bidi: isolate` restates the default of the `<bdi>` that carries
+ * this class, so the class itself guarantees that the term's characters cannot reorder the
+ * quotation marks or the sentence around them. */
 .term {
   color: var(--ls-text, #0f172a);
   font-family: var(--ls-font-mono, ui-monospace);
+  unicode-bidi: isolate;
+}
+
+/* One Unicode direction control inside the echoed term, printed as its escape (`\u202E`) instead
+ * of applied. The dashed hairline and the warning colour set it apart from the characters the
+ * reader typed; that colour measures 4.8:1 on the recessed surface, so the marker clears WCAG AA
+ * as text. `white-space: nowrap` keeps the six characters of the escape on one line when a long
+ * term wraps. The hairline width is the field's own `--notice-hairline`, inherited from `root`. */
+.control {
+  --notice-control-inset: var(--ls-space-1, 4px);
+
+  padding-inline: var(--notice-control-inset);
+  border: var(--notice-hairline) dashed var(--ls-warning, #b45309);
+  border-radius: var(--ls-radius-sm, 4px);
+  color: var(--ls-warning, #b45309);
+  white-space: nowrap;
 }

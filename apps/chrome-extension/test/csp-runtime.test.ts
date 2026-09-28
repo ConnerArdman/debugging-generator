@@ -2,15 +2,18 @@
  * Spec for the extension's CSP runtime, `../src/shared/csp-runtime.ts`, and for the build ordering
  * it depends on.
  *
- * Manifest V3 pages and the ISOLATED-world bridge run under policies without `'unsafe-eval'`, so
- * Zod 4's `new Function('')` probe raises a CSP issue on every load unless Zod is switched to its
- * jitless path before its first object schema is built. The module does the switching; the build
- * decides whether it runs early enough. The panel and the devtools page share Zod through a chunk
- * of its own, and ES modules evaluate a chunk's static imports, in order, before its body - so the
- * setting is effective only if each page's entry chunk imports the CSP runtime chunk ahead of every
- * chunk that reaches Zod. `../vite.config.ts` pins the module into its own chunk and refuses to
- * emit a bundle that breaks the order; this spec checks the emitted `dist/` independently of that
- * guard, the same way `./manifest.test.ts` checks the built manifest.
+ * The extension pages run under the policy the manifest declares as
+ * `content_security_policy.extension_pages`, whose `script-src` is exactly `'self'` - no eval of
+ * any kind, which `./manifest.test.ts` asserts on the built manifest - and the ISOLATED-world bridge
+ * runs under an equally eval-free policy, so Zod 4's `new Function('')` probe raises a CSP issue
+ * on every load unless Zod is switched to its jitless path before its first object schema is
+ * built. The module does the switching; the build decides whether it runs early enough. The panel
+ * and the devtools page share Zod through a chunk of its own, and ES modules evaluate a chunk's
+ * static imports, in order, before its body - so the setting is effective only if each page's
+ * entry chunk imports the CSP runtime chunk ahead of every chunk that reaches Zod.
+ * `../vite.config.ts` pins the module into its own chunk and refuses to emit a bundle that breaks
+ * the order; this spec checks the emitted `dist/` independently of that guard, the same way
+ * `./manifest.test.ts` checks the built manifest.
  *
  * Harness. Collected by the root `vitest.config.ts` into the `chrome-extension` project.
  * Hermetic: module evaluation, filesystem reads and one `node:vm` context - no browser, no network,

@@ -377,6 +377,7 @@ import {
   formatDurationCompact,
   formatKindLabel,
   formatTierLabel,
+  formatUntrustedText,
   pluralize,
   truncate,
 } from '../utils/format';
@@ -1731,13 +1732,19 @@ function overflowMetaText(overflow: PositionedGraphOverflow): string {
  * The pointer title of an overflow box: how many participants it gathers, the
  * first {@link OVERFLOW_TITLE_LABELS} of them by name, their summed time, and
  * where each is listed in full.
+ *
+ * It is an SVG `<title>`, which no primitive reveals, and it names captured
+ * participants, so every Unicode direction control in their labels is returned
+ * as its visible escape (`formatUntrustedText`).
  */
 function overflowTitle(overflow: PositionedGraphOverflow): string {
   const { nodes } = overflow;
   const named = nodes.slice(0, OVERFLOW_TITLE_LABELS).map((node) => node.label);
   const rest =
     nodes.length > named.length ? ` and ${formatCount(nodes.length - named.length)} more` : '';
-  return `${formatCountOf(nodes.length, PARTICIPANT_NOUN)} gathered here: ${named.join(', ')}${rest} · Summed time ${formatDurationCompact(overflowTotalMs(overflow))}. Each is listed in the table below.`;
+  return formatUntrustedText(
+    `${formatCountOf(nodes.length, PARTICIPANT_NOUN)} gathered here: ${named.join(', ')}${rest} · Summed time ${formatDurationCompact(overflowTotalMs(overflow))}. Each is listed in the table below.`,
+  );
 }
 
 /**
@@ -1910,6 +1917,10 @@ function openSourceHint(file: string): string {
  * with a location, in a surface that can open one — that a click opens it in
  * the editor.
  *
+ * It is an SVG `<title>`, which no primitive reveals, and it carries captured
+ * text — the label and the source path — so every Unicode direction control in
+ * it is returned as its visible escape (`formatUntrustedText`).
+ *
  * @param row The participant's row: its datum and its validated roles.
  * @param canOpenSource Whether the host supplied the action a click would raise.
  */
@@ -1928,9 +1939,11 @@ function participantTitle(row: ParticipantRow, canOpenSource: boolean): string {
   // with a location, drawn in a surface whose host can open one. Promising a
   // navigation the click would not perform is the pointer-side form of a
   // control that does nothing.
-  return canOpenSource && node.source !== undefined
-    ? `${identity}. ${openSourceHint(node.source.file)}`
-    : identity;
+  return formatUntrustedText(
+    canOpenSource && node.source !== undefined
+      ? `${identity}. ${openSourceHint(node.source.file)}`
+      : identity,
+  );
 }
 
 /**
@@ -2755,7 +2768,12 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                     y={labelY(row.box)}
                     textAnchor="middle"
                   >
-                    {truncate(row.node.label, labelBudget(row.box.width))}
+                    {/* Captured text in a raw SVG `<text>`: cut to the box's
+                        budget first — which counts captured code points, so
+                        no cut splits an escape — then every direction control
+                        printed as its visible escape. The whole label is in
+                        the title above and in the grid. */}
+                    {formatUntrustedText(truncate(row.node.label, labelBudget(row.box.width)))}
                   </text>
                   <text
                     className="dg-dependency-graph__node-meta"

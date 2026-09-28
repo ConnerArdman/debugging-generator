@@ -138,10 +138,12 @@ import {
 } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
   formatBytes,
   formatBytesParts,
   formatCount,
   formatDurationParts,
+  formatUntrustedText,
   humanizeLabel,
 } from '../utils/format';
 import { MetricCards } from './MetricCards';
@@ -2038,5 +2040,81 @@ describe('MetricCards tile presentation', () => {
     // node rather than shrink-wrapped at its inline start.
     expect(declarationsFor('.dg-metric-cards__empty')).toContain('flex-direction: column');
     expect(declarationsFor('.dg-metric-cards__empty > .dg-empty-state')).toContain('flex: auto');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in a tile's heading
+ *
+ * A tile's heading and note arrive over the wire with the value, and an
+ * invisible right-to-left override (U+202E) in one of them would draw the
+ * characters after it backwards. The heading is printed through `Text`, and
+ * the tile's name is written onto its raw `<li>` — both must print each
+ * control as its visible escape (`\u202E`), so what is announced is what is
+ * shown.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered container.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('MetricCards direction controls', () => {
+  it('reveals a heading and a note in the tile, its tooltip and its name', async () => {
+    const label = `Requests ${RLO}</li><script>alert(7)</script>${PDF}`;
+    const note = `Counted ${RLO}once${PDF}.`;
+    const container = renderCards(makeNode(['request_count']), {
+      provider: resolvingProvider([makeMetric('request_count', { label, value: 3, note })])
+        .provider,
+    });
+
+    const [card] = await findCards(1);
+    if (card === undefined) {
+      throw new Error('no tile was rendered');
+    }
+
+    // The heading shows the marker where the control was, and the tile is named
+    // with the same revealed heading.
+    expect(textOf(card, 'label')).toBe(formatUntrustedText(label));
+    expect(card.getAttribute('aria-label')).toBe(`${formatUntrustedText(label)}: 3`);
+    expect(card.getAttribute('aria-label')).toContain(RLO_MARKER);
+    expect(within(card).getByRole('tooltip', { hidden: true }).textContent).toBe(
+      formatUntrustedText(note),
+    );
+
+    // Nothing a reader sees, hovers or hears carries a raw control, and the
+    // markup in the heading is only text.
+    expect(rawDirectionSinks(container)).toEqual([]);
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelectorAll('li')).toHaveLength(1);
   });
 });

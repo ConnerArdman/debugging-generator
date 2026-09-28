@@ -21,10 +21,11 @@
  * keeps a multi-line statement out of a table row's height; the grapheme-safe
  * fitting of an SVG label to a width in logical units ({@link fitTextToWidth},
  * over a deterministic advance estimate, so no view measures a font or reads
- * layout); the compact path and source-chip labels; and the readable labels
+ * layout); the compact path and source-chip labels; the readable labels
  * for the closed telemetry
  * vocabularies (`./color` delegates those here explicitly, so a legend and a
- * table cannot drift apart).
+ * table cannot drift apart); and the one definition of how untrusted text is
+ * made to display its logical order ({@link formatUntrustedText}, below).
  *
  * It owns no visual decision. There is no colour, no token, no length and no
  * style value here: every CSS value in this package resolves to a `--dg-*`
@@ -40,6 +41,30 @@
  * a zero, a dash, an empty cell or the text `NaN`. A zero would turn an absence
  * into an observation, and the product presents as observed only what captured
  * evidence supports.
+ *
+ * ## Direction controls are revealed, never obeyed
+ *
+ * Every captured string — a span name, a statement, a URL, a path, a preview —
+ * and every model-authored sentence is untrusted, and escaping its markup is
+ * not enough to display it honestly. The twelve Unicode bidirectional
+ * formatting controls (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069)
+ * are invisible, survive HTML escaping as ordinary text, and reorder the
+ * glyphs around them: a span named `QA \u202E</td><script>…` draws its tail
+ * backwards, so a developer reads a sequence that was never captured (the
+ * "Trojan Source" class, CVE-2021-42574). {@link formatUntrustedText} replaces
+ * each control with its visible six-character escape (`\u202E`), so what is on
+ * screen is the logical text and nothing is left to reorder it.
+ *
+ * The guarantee is folded into every helper here that returns captured text
+ * for display — {@link oneLinePreview}, {@link fitTextToWidth},
+ * {@link formatCompactPath}, {@link formatSourceChipLabel},
+ * {@link formatSourceTooltip} and {@link humanizeLabel} (and so every
+ * vocabulary label that falls back to it) — so a view that already formats
+ * through them is covered without a second call. {@link truncate} and
+ * {@link collapseWhitespace} are the building blocks and keep their plain
+ * semantics. Revealing is presentation, exactly as collapsing whitespace is:
+ * the stored event keeps the raw code points, and so do the keys, `data-*`
+ * attributes and callback arguments a view derives from them.
  *
  * ## Layering
  *
@@ -58,7 +83,13 @@
  *   comes from typing a table as a `Record` over the union rather than from
  *   importing a runtime tuple.
  * - No platform builtin, no React, no transport. `src/index.ts` does not
- *   re-export `./utils`, so this surface is package-internal.
+ *   re-export `./utils`, so this surface is package-internal — with one
+ *   deliberate exception: {@link containsDirectionControl} and
+ *   {@link formatUntrustedText} are re-exported by
+ *   `../primitives/untrusted-text` (and published through the barrel from
+ *   there), because both consumer surfaces render untrusted strings into
+ *   elements and attributes of their own and must reveal them with this one
+ *   definition.
  *
  * Every export is a pure function or a frozen table, and importing this module
  * reads nothing, writes nothing and touches no global — which is what keeps
@@ -81,7 +112,9 @@
  * `FlameChart.tsx` (notes, disclosure names and the list label) and
  * `DependencyGraph.tsx` (notes and the canvas's text alternative); any other
  * view that counts something in words uses the same three rather than an
- * inline `count === 1 ? … : …`.
+ * inline `count === 1 ? … : …`. {@link formatUntrustedText} is additionally
+ * applied by `../primitives/untrusted-text` to every string the `Text`,
+ * `Code`, `Heading`, `Badge`, `Button` and `Tooltip` primitives render.
  */
 
 import {
@@ -877,6 +910,118 @@ export function formatShare(part: number, total: number): string {
 
 /*
  * ---------------------------------------------------------------------------
+ * Text: direction controls in untrusted text
+ *
+ * The twelve code points Unicode lists as Bidi_Control (UAX #9, §2), and only
+ * those: U+061C ARABIC LETTER MARK; U+200E and U+200F, the left-to-right and
+ * right-to-left marks; U+202A–U+202E, the embeddings (LRE, RLE), the pop
+ * (PDF) and the overrides (LRO, RLO); and U+2066–U+2069, the isolates (LRI,
+ * RLI, FSI) and their pop (PDI). Each one changes the order in which the
+ * characters after it are drawn without drawing anything itself, which is what
+ * lets captured text display a sequence it does not contain.
+ *
+ * Deliberately NOT included: U+200C ZERO WIDTH NON-JOINER and U+200D ZERO
+ * WIDTH JOINER. They carry legitimate shaping — emoji sequences, Indic and
+ * Persian orthography — and reorder nothing, so revealing them would corrupt
+ * honest text and protect against nothing. Every other character, whitespace
+ * included, is equally untouched.
+ *
+ * Two regular expressions over one class, because a global (`g`) expression
+ * is stateful: `RegExp.prototype.test` resumes from, and advances, its
+ * `lastIndex`, so sharing one between the presence test and the replacement
+ * would make the answer for a string depend on the string tested before it.
+ * The non-global one answers presence; the global one is used only by
+ * `String.prototype.replace`, which resets `lastIndex` itself. Every code
+ * point is written as an escape, never as the character, so this source file
+ * is not itself a carrier of what it defends against.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Any one of the twelve direction controls, for a presence test. */
+const DIRECTION_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+/** Every direction control in a string, for `String.prototype.replace` only. */
+const DIRECTION_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+
+/** The base of the digits in a revealed marker. */
+const MARKER_RADIX = 16;
+
+/** The digits in a revealed marker: four, so every marker is exactly `\uXXXX`. */
+const MARKER_DIGITS = 4;
+
+/**
+ * Whether `text` contains any of the twelve Unicode bidirectional formatting
+ * controls — the invisible characters that make {@link formatUntrustedText}
+ * change a string.
+ *
+ * For a consumer that must decide something about the raw value rather than
+ * display it: a surface that shows a revealed label beside the original, or a
+ * test asserting that a raw control reached (or did not reach) the DOM.
+ *
+ * @example
+ * ```ts
+ * containsDirectionControl('orders\u202Etxt.exe'); // true
+ * containsDirectionControl('plain text'); // false
+ * ```
+ */
+export function containsDirectionControl(text: string): boolean {
+  return DIRECTION_CONTROL.test(text);
+}
+
+/**
+ * Makes every direction control in untrusted text visible, so the text
+ * displays in its logical order.
+ *
+ * Each of the twelve Unicode bidirectional formatting controls is replaced by
+ * the literal six-character marker `\uXXXX` — a backslash, `u` and four
+ * uppercase hexadecimal digits, so U+202E becomes `\u202E` — and nothing else
+ * changes. The marker is the JavaScript and JSON escape of the same code
+ * point, so a developer can read it, search for it and paste it back into a
+ * test. A reader sees that a control was captured and where; the glyphs after
+ * it are drawn in the order they were captured. This is the remedy for the
+ * "Trojan Source" reordering class (CVE-2021-42574): HTML escaping keeps
+ * captured text from becoming markup, and this keeps it from rearranging
+ * itself once it is text.
+ *
+ * Presentation only. The stored event, the aggregate and every key, `data-*`
+ * attribute and callback argument keep the raw value; call this at the point
+ * text is put on screen — as a child, a `title`, an `aria-label` or an SVG
+ * label — and nowhere upstream of it.
+ *
+ * Properties a caller may rely on:
+ * - Text without a control is returned as the very same string, after one
+ *   presence test and with no allocation.
+ * - Idempotent: a marker contains no control, so revealing twice is revealing
+ *   once.
+ * - Zero width joiners and non-joiners, whitespace and every other character
+ *   are untouched (see the section note above).
+ *
+ * @param text Untrusted text, as captured or as a model wrote it.
+ * @returns The text with every direction control replaced by its marker.
+ *
+ * @example
+ * ```ts
+ * formatUntrustedText('QA \u202E</td><script>alert(7)</script>\u202C');
+ * // 'QA \\u202E</td><script>alert(7)</script>\\u202C' — the markers print as \u202E and \u202C
+ * formatUntrustedText('checkout'); // 'checkout' (the same string)
+ * ```
+ */
+export function formatUntrustedText(text: string): string {
+  if (!DIRECTION_CONTROL.test(text)) {
+    return text;
+  }
+
+  // Every control is one BMP code point, so its single UTF-16 unit is its
+  // code point and the padded hex of that unit is the whole marker.
+  return text.replace(
+    DIRECTION_CONTROLS,
+    (control) =>
+      `\\u${control.charCodeAt(0).toString(MARKER_RADIX).toUpperCase().padStart(MARKER_DIGITS, '0')}`,
+  );
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Text: collapsing and the privacy-bounded preview
  * ---------------------------------------------------------------------------
  */
@@ -943,19 +1088,31 @@ export function truncate(text: string, maxLength: number = MAX_PREVIEW_LENGTH): 
 }
 
 /**
- * Collapses text to one line and truncates it to the preview budget.
+ * Collapses text to one line, truncates it to the preview budget and reveals
+ * its direction controls.
  *
  * The formatter every table cell that shows captured text uses: a redacted
  * statement in the query table, an error message in the event log, a value
  * summary in the state-transition view. Equivalent to
- * `truncate(collapseWhitespace(text), maxLength)`, named so that a cell cannot
- * accidentally apply one half without the other.
+ * `formatUntrustedText(truncate(collapseWhitespace(text), maxLength))`, named
+ * so that a cell cannot accidentally apply one part without the others.
+ *
+ * The reveal comes last on purpose. `maxLength` is the privacy bound, and it
+ * counts CAPTURED code points: a direction control is one of them and costs
+ * one unit of the budget like any other, and truncation — which works in whole
+ * code points — can never cut one in half. Its six-character marker is then
+ * display, not data: it shows no captured content beyond the one code point it
+ * stands for. So a preview of text that carried controls may be longer than
+ * `maxLength` characters on screen, and still never presents more than
+ * `maxLength` code points of what was captured. Revealing first would instead
+ * charge six units per control and could cut a marker mid-escape.
  *
  * @param text The captured text.
- * @param maxLength Maximum code points; defaults to {@link MAX_PREVIEW_LENGTH}.
+ * @param maxLength Maximum captured code points; defaults to
+ * {@link MAX_PREVIEW_LENGTH}.
  */
 export function oneLinePreview(text: string, maxLength: number = MAX_PREVIEW_LENGTH): string {
-  return truncate(collapseWhitespace(text), maxLength);
+  return formatUntrustedText(truncate(collapseWhitespace(text), maxLength));
 }
 
 /*
@@ -1092,11 +1249,18 @@ export function createEstimateMeasure(fontSize: number = DEFAULT_LABEL_FONT_SIZE
 
 /** A string that fits a width, as {@link fitTextToWidth} returns it. */
 export interface TextFit {
-  /** The text to draw: the input unchanged, or a prefix ending in {@link ELLIPSIS}. */
+  /**
+   * The text to draw: the input with its direction controls revealed by
+   * {@link formatUntrustedText} — whole, or as a grapheme prefix ending in
+   * {@link ELLIPSIS}. Input without a control is drawn exactly as given.
+   */
   readonly text: string;
-  /** Its advance width in user units, never more than the width asked for. */
+  /** Its advance width in user units, markers included; never more than the width asked for. */
   readonly width: number;
-  /** Whether the input was shortened. */
+  /**
+   * Whether the input was shortened. Revealing a control is not shortening: a
+   * whole label whose only change is a marker is `false`.
+   */
   readonly truncated: boolean;
 }
 
@@ -1133,7 +1297,16 @@ function measured(measure: TextMeasure, text: string): number {
  * that is not finite and positive, and when not even `minGraphemes` graphemes
  * and the ellipsis fit.
  *
- * @param text The label.
+ * Direction controls are revealed ({@link formatUntrustedText}) grapheme by
+ * grapheme BEFORE anything is measured, so the width decided is the width of
+ * what is drawn, markers included, and a marker is one unit of the search: a
+ * prefix either keeps the whole `\u202E` or none of it, and a cut can never
+ * leave a stray `\u20` that reads as a different code point. A control is a
+ * grapheme of its own under UAX #29 (it has the Control break property), so
+ * revealing per grapheme is the same text as revealing the whole label, and
+ * `minGraphemes` still counts user-perceived characters of the input.
+ *
+ * @param text The label, as captured.
  * @param maxWidth The room available, in user units.
  * @param measure Measures a string in the label's font.
  * @param options The shortest acceptable prefix.
@@ -1148,12 +1321,13 @@ export function fitTextToWidth(
     return undefined;
   }
 
-  const whole = measured(measure, text);
+  const shown = formatUntrustedText(text);
+  const whole = measured(measure, shown);
   if (whole <= maxWidth) {
-    return { text, width: whole, truncated: false };
+    return { text: shown, width: whole, truncated: false };
   }
 
-  const graphemes = splitGraphemes(text);
+  const graphemes = splitGraphemes(text).map((grapheme) => formatUntrustedText(grapheme));
   const requested = options.minGraphemes;
   const minimum =
     typeof requested === 'number' && Number.isInteger(requested) && requested > 0 ? requested : 1;
@@ -1339,6 +1513,13 @@ export const DEFAULT_PATH_SEGMENTS = 2;
  * final component is taken with the shared `basenamePosix`, so a trailing
  * separator is ignored. Nothing here touches a filesystem.
  *
+ * Direction controls in the path are revealed ({@link formatUntrustedText}),
+ * so a file named with a right-to-left override cannot display a different
+ * name or extension. The reveal happens after separators are normalised and
+ * before the path is split: normalising afterwards would turn each marker's
+ * backslash into a separator, and splitting afterwards could not change the
+ * segments, because a marker contains no `/`.
+ *
  * Degenerate inputs: the empty string returns the empty string; a path with no
  * final component (the root separator) is returned as-is; a `maxSegments` below
  * one is treated as one; a path with no more segments than the budget is
@@ -1359,7 +1540,7 @@ export function formatCompactPath(
   file: string,
   maxSegments: number = DEFAULT_PATH_SEGMENTS,
 ): string {
-  const posix = toPosix(file);
+  const posix = formatUntrustedText(toPosix(file));
   if (basenamePosix(posix).length === 0) {
     return posix;
   }
@@ -1387,6 +1568,9 @@ export function formatCompactPath(
  * carries {@link formatSourceTooltip} as its accessible title, so nothing is
  * lost.
  *
+ * The label is revealed ({@link formatUntrustedText}): a direction control in
+ * the file name prints as its marker instead of reordering the chip.
+ *
  * @param location A validated source location.
  * @param maxSegments Trailing path segments to keep; defaults to
  * {@link DEFAULT_PATH_SEGMENTS}.
@@ -1395,7 +1579,9 @@ export function formatSourceChipLabel(
   location: SourceLocation,
   maxSegments: number = DEFAULT_PATH_SEGMENTS,
 ): string {
-  return `${formatCompactPath(location.file, maxSegments)}:${String(location.line)}`;
+  return formatUntrustedText(
+    `${formatCompactPath(location.file, maxSegments)}:${String(location.line)}`,
+  );
 }
 
 /**
@@ -1409,6 +1595,12 @@ export function formatSourceChipLabel(
  *
  * Used as the title of a source chip and of any row that links to source.
  *
+ * The result is revealed ({@link formatUntrustedText}), so the title a reader
+ * hovers and the name assistive technology announces print a direction control
+ * in the symbol or the path as its marker, exactly as the chip's label does.
+ * Only the display is revealed: the location object itself, which is what a
+ * click hands to the editor, is untouched.
+ *
  * @param location A validated source location.
  * @returns `'symbol — file:line:column'`, or just `'file:line:column'` when the
  * location carries no symbol.
@@ -1416,7 +1608,9 @@ export function formatSourceChipLabel(
 export function formatSourceTooltip(location: SourceLocation): string {
   const canonical = formatSourceLocation(location);
 
-  return location.symbol === undefined ? canonical : `${location.symbol} — ${canonical}`;
+  return formatUntrustedText(
+    location.symbol === undefined ? canonical : `${location.symbol} — ${canonical}`,
+  );
 }
 
 /*
@@ -1447,6 +1641,10 @@ export function formatSourceTooltip(location: SourceLocation): string {
  * entry for, which is what lets an unrecognised value still render as words
  * rather than as raw text or not at all.
  *
+ * An unrecognised value is by definition text this build did not author, so
+ * the result is revealed ({@link formatUntrustedText}): a direction control
+ * in it prints as its marker.
+ *
  * @example
  * ```ts
  * humanizeLabel('perf.longtask'); // 'Perf longtask'
@@ -1461,7 +1659,9 @@ export function humanizeLabel(value: string): string {
   const sentence = words.join(' ');
   const first = sentence.slice(0, 1);
 
-  return first.length === 0 ? '' : `${first.toUpperCase()}${sentence.slice(1)}`;
+  return first.length === 0
+    ? ''
+    : formatUntrustedText(`${first.toUpperCase()}${sentence.slice(1)}`);
 }
 
 /**

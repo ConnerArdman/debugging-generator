@@ -9,7 +9,10 @@
       manifest key names it; vite.config.ts builds it as an explicit input emitted at
       dist/src/panel/panel.html, and that path is a contract. No theme attribute (not even
       data-theme="dark") belongs on the html element: dark is the :root token set, and
-      main.tsx applies the resolved DevTools theme before first paint.
+      main.tsx applies the resolved DevTools theme before first paint. This page's
+      content-security policy is the manifest's content_security_policy.extension_pages
+      (manifest.config.ts), which Chrome applies to every extension page; it is deliberately
+      not repeated in a meta tag, where a second copy could drift from the one the tests assert.
     -->
   </head>
   <body>

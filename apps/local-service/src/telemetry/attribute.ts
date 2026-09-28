@@ -454,6 +454,16 @@ export interface BrowserIngestContext {
    * DevTools connection — never from the page. A non-negative integer.
    */
   readonly tabId: number;
+  /**
+   * The holder of the tab's binding: the `tokenHash` of the DevTools
+   * credential whose live binding of `tabId` the relay path verified
+   * (`../server/routes/telemetry.ts`). A tab id is unique only within one
+   * browser, so it selects which durable row of the tab id attribution reads
+   * — that credential's, never another browser's. Omitted, the tab's row is
+   * read by tab id alone, which answers only while a single credential holds a
+   * row of it. A digest, never a credential; compared, never logged or echoed.
+   */
+  readonly boundBy?: string | undefined;
   /** The page document the agent reported in `agent.ready`. Diagnostic only. */
   readonly documentId?: string | undefined;
   /**
@@ -650,8 +660,11 @@ export interface SessionPageLike {
  * @see ../store/sessions-repo.js — `SessionsRepo`, the implementation.
  */
 export interface SessionsRepoLike {
-  /** The binding of one inspected tab (`SessionsRepo.getBindingByTab`). */
-  getBindingByTab(tabId: number): Result<BindingLike | undefined>;
+  /**
+   * The binding of one inspected tab (`SessionsRepo.getBindingByTab`): with
+   * `boundBy`, that holder's view of the tab; without it, the tab's only row.
+   */
+  getBindingByTab(tabId: number, boundBy?: string): Result<BindingLike | undefined>;
   /** One session record (`SessionsRepo.get`). */
   get(id: SessionId): Result<SessionLike | undefined>;
   /** The open capture of one session (`SessionsRepo.getActiveCapture`). */
@@ -1297,8 +1310,14 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
       return refuse({ reason: 'no-binding', origin, fault: 'invalid-tab-id' });
     }
 
+    // The verified holder's row of the tab id, when the relay path named one:
+    // another browser's binding of the same tab id is another tab.
+    const { boundBy } = context;
     const binding = readStore(
-      () => sessions.getBindingByTab(tabId),
+      () =>
+        boundBy === undefined
+          ? sessions.getBindingByTab(tabId)
+          : sessions.getBindingByTab(tabId, boundBy),
       (value): unknown => (value === undefined ? undefined : value.sessionId),
     );
 

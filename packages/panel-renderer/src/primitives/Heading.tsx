@@ -57,14 +57,28 @@
  *
  * ## Position in the package
  *
- * A tier-one atom: it imports `clsx` and React's types and nothing else — no
- * sibling primitive, no layout primitive, no component, no host module, no
- * workspace package, no transport. It is presentational, so it reads no data
- * and holds no state, and every attribute it does not own is forwarded
- * untouched. That forwarding is load-bearing rather than incidental: the
- * layout primitives and the panel host give a heading an `id` and then point
- * their region's `aria-labelledby` at it, so swallowing unknown props would
- * leave those regions unnamed.
+ * A tier-one atom: it imports `clsx`, React's types and the untrusted-text
+ * helper `./untrusted-text` (a pure function over strings, not a component)
+ * and nothing else — no sibling primitive, no layout primitive, no component,
+ * no host module, no workspace package, no transport. It is presentational, so
+ * it reads no data and holds no state, and every attribute it does not own is
+ * forwarded untouched. That forwarding is load-bearing rather than incidental:
+ * the layout primitives and the panel host give a heading an `id` and then
+ * point their region's `aria-labelledby` at it, so swallowing unknown props
+ * would leave those regions unnamed.
+ *
+ * ## What is on screen is the logical text
+ *
+ * A heading can carry untrusted text — a generated panel's title, a section
+ * named after a captured route — and an invisible Unicode direction control in
+ * it (U+202E and its eleven siblings) would draw the glyphs after it in an
+ * order that was never written. Every string child, and a string `title` or
+ * `aria-label`, is therefore rendered through
+ * `formatUntrustedNode`/`formatUntrustedText`, which print each control as its
+ * visible escape (`\u202E`) and change nothing else. That is not truncating,
+ * transforming or re-casing the heading: it is the guarantee that the glyphs
+ * shown are the characters given, in the order given, and the tooltip and the
+ * accessible name match the visible heading (WCAG 2.5.3).
  *
  * @example A titled region whose heading is three levels deep but small
  * ```tsx
@@ -87,6 +101,8 @@
 
 import clsx from 'clsx';
 import type { HTMLAttributes, ReactElement, ReactNode, Ref } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * The heading element this primitive renders, and therefore the node's depth in
@@ -158,7 +174,9 @@ export interface HeadingProps extends Omit<HTMLAttributes<HTMLHeadingElement>, '
   /**
    * The heading text. Forwarded verbatim: this primitive never truncates,
    * transforms or re-cases what it is given. Clamping is a decision of the
-   * component that owns the surrounding layout.
+   * component that owns the surrounding layout. The one change is display
+   * only — a direction control in a string is printed as its visible escape
+   * (see the module header).
    */
   children?: ReactNode | undefined;
 
@@ -231,18 +249,31 @@ const CLASS_BY_TONE: Record<HeadingTone, string> = {
  * contradictory at worst.
  *
  * Unknown props are spread onto the element unchanged, so `id`, `aria-*` and
- * `data-*` all pass through, and any `className` a caller supplies is appended
- * after the system's own classes rather than replacing them.
+ * `data-*` all pass through (a string `title` and `aria-label` with their
+ * direction controls revealed), and any `className` a caller supplies is
+ * appended after the system's own classes rather than replacing them.
  *
  * @param props - See {@link HeadingProps}.
  * @returns The heading element for `props.level`.
  */
 export function Heading(props: HeadingProps): ReactElement {
-  const { level, size, tone = 'primary', visuallyHidden, className, children, ...rest } = props;
+  const {
+    level,
+    size,
+    tone = 'primary',
+    visuallyHidden,
+    className,
+    children,
+    title,
+    'aria-label': label,
+    ...rest
+  } = props;
 
   const Tag = TAG_BY_LEVEL[level];
   const resolvedSize = size ?? DEFAULT_SIZE_BY_LEVEL[level];
 
+  // The heading text and the two string attributes a reader hovers or hears
+  // are revealed (see the module header); an absent attribute stays absent.
   return (
     <Tag
       className={clsx(
@@ -252,9 +283,11 @@ export function Heading(props: HeadingProps): ReactElement {
         visuallyHidden && 'dg-visually-hidden',
         className,
       )}
+      title={title === undefined ? title : formatUntrustedText(title)}
+      aria-label={label === undefined ? label : formatUntrustedText(label)}
       {...rest}
     >
-      {children}
+      {formatUntrustedNode(children)}
     </Tag>
   );
 }

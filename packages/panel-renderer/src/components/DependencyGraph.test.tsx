@@ -53,6 +53,12 @@
  * beside it covers every participant, states its column, names its outgoing
  * relationships in text and is operable by keyboard.
  *
+ * `direction controls` holds captured labels to their logical order: a Unicode
+ * direction control in a participant's label is drawn as its visible escape
+ * (`\u202E`) in its box, in its shape's title, in an overflow box's title that
+ * names it and in the grid — never raw, never as markup — while the selection
+ * a click raises still carries the raw event id.
+ *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
  *   - **Test API imported explicitly** from `vitest`, with `afterEach(cleanup)`
@@ -174,6 +180,7 @@ import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { dependencyNodeColorVar } from '../utils/color';
 import {
   DEFAULT_LABEL_FONT_SIZE,
+  containsDirectionControl,
   estimateTextWidth,
   formatCount,
   formatDurationCompact,
@@ -5105,5 +5112,146 @@ describe('DependencyGraph hover and focus detail dismissal', () => {
     expect(hoveredShapeLabels()).toEqual([ROUTE_LABEL]);
     expect(inlineDetailLabels()).toEqual(CHAIN_PARTICIPANT_LABELS);
     expect(participantCellMarkup()).toEqual(before);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured labels
+ *
+ * The QA report's payload — an escaped script tag behind a right-to-left
+ * override, which a browser draws backwards while `textContent` still holds the
+ * logical string — as a participant's label. Written with escapes, never with
+ * the characters.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('DependencyGraph direction controls', () => {
+  /** A participant label carrying an override and its pop around escaped markup. */
+  const BIDI_LABEL = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+  /** That label as it must display: both controls as their printable escapes. */
+  const BIDI_SHOWN = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+  /** The start every drawn form of it shares, whole or cut to its box. */
+  const BIDI_SHOWN_START = 'QA_BIDI \\u202E';
+
+  /** The hostile participant's event id, carrying an override that must reach the host raw. */
+  const BIDI_EVENT_ID = 'event-\u202Egraph-0002';
+
+  /** The participant the flow starts at. */
+  const ORIGIN = makeParticipant({
+    id: 'dep:ui-event|browser|example.origin',
+    kind: 'ui-event',
+    label: 'example.origin',
+    spanIds: [spanIdFor(1)],
+    totalDurationMs: 90,
+    layer: 0,
+  });
+
+  /** The hostile participant: one record, so it declares a selectable event. */
+  const HOSTILE = makeParticipant({
+    id: 'dep:function|browser|qa.bidi',
+    kind: 'function',
+    label: BIDI_LABEL,
+    spanIds: [spanIdFor(2)],
+    totalDurationMs: 18,
+    layer: 1,
+    eventId: BIDI_EVENT_ID,
+    traceId: TRACE_ID,
+  });
+
+  /**
+   * Asserts nothing in the document displays a raw direction control — not its
+   * text, which includes every SVG `<title>` and `<text>`, and not a `title` or
+   * `aria-label` — and that the payload's escaped markup never became an element.
+   */
+  function expectNothingReorders(): void {
+    const root = document.body;
+    expect(containsDirectionControl(root.textContent)).toBe(false);
+    for (const element of Array.from(root.querySelectorAll('*'))) {
+      for (const attribute of ['title', 'aria-label']) {
+        const value = element.getAttribute(attribute);
+        if (value !== null) {
+          expect(containsDirectionControl(value)).toBe(false);
+        }
+      }
+    }
+    expect(root.querySelector('script')).toBeNull();
+  }
+
+  it('draws, titles and lists a hostile participant in its logical order, and selects it raw', async () => {
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(
+        makeGraph({ nodes: [ORIGIN, HOSTILE], edges: [makeEdge(ORIGIN.id, HOSTILE.id)] }),
+      ).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('grid');
+
+    // The box's label is revealed, whether it fits whole or is cut to the box,
+    // and its shape's title opens with the whole revealed label.
+    const labels = canvasLabels();
+    const drawn = labels.findIndex((label) => label.startsWith(BIDI_SHOWN_START));
+    expect(drawn).toBeGreaterThanOrEqual(0);
+    const shape = nodeShapes()[drawn];
+    if (shape === undefined) {
+      throw new Error('the hostile participant was drawn without a shape');
+    }
+    expect(titleOfShape(shape).startsWith(`${BIDI_SHOWN} · `)).toBe(true);
+
+    // The grid lists it by its revealed label, and the caller's relationship
+    // chip names it the same way.
+    expect(participantLabels()).toContain(BIDI_SHOWN);
+    expect(
+      relationshipChips(rowNamed(ORIGIN.label)).map((chip) => chip.textContent.trim()),
+    ).toContain(`→ ${BIDI_SHOWN}`);
+
+    expectNothingReorders();
+
+    // A click on the shape selects the raw coordinate the participant declared.
+    await user.click(shape);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_EVENT_ID,
+      spanId: spanIdFor(2),
+      traceId: TRACE_ID,
+    });
+    expectNothingReorders();
+  });
+
+  it('names a hostile gathered participant in the overflow box title in its logical order', async () => {
+    // Twenty callees in one column: the five costliest get boxes of their own
+    // and the rest are gathered, the costliest of which carries the payload,
+    // so the overflow box's title names it first.
+    const targets = Array.from({ length: 20 }, (_, index) =>
+      makeParticipant({
+        id: `dep:function|browser|example.gathered.${String(index).padStart(2, '0')}`,
+        label: index === 5 ? BIDI_LABEL : `example.gathered.${String(index).padStart(2, '0')}`,
+        spanIds: [spanIdFor(100 + index)],
+        totalDurationMs: 500 - index,
+        layer: 1,
+      }),
+    );
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(
+        makeGraph({
+          nodes: [ORIGIN, ...targets],
+          edges: targets.map((target) => makeEdge(ORIGIN.id, target.id)),
+        }),
+      ).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+
+    const title = canvas().querySelector('[data-overflow] > title')?.textContent ?? '';
+    expect(title).toContain(`gathered here: ${BIDI_SHOWN}, `);
+    expect(participantLabels()).toContain(BIDI_SHOWN);
+
+    expectNothingReorders();
   });
 });

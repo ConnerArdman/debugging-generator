@@ -304,6 +304,7 @@ import {
   formatKindLabel,
   formatOffset,
   formatStatusLabel,
+  formatUntrustedText,
   oneLinePreview,
   pluralize,
 } from '../utils/format';
@@ -1070,7 +1071,15 @@ function primitiveAttribute(key: string, raw: unknown): EventLogAttributePair | 
 
   const text = oneLinePreview(value);
 
-  return { key, text, value, abbreviated: text !== collapseWhitespace(value) };
+  // The preview has its direction controls revealed, so it is weighed against
+  // the folded value revealed the same way: a control is not a cut, and a row
+  // is not offered a detail for a value its strip already shows whole.
+  return {
+    key,
+    text,
+    value,
+    abbreviated: text !== formatUntrustedText(collapseWhitespace(value)),
+  };
 }
 
 /**
@@ -1126,6 +1135,13 @@ function summariseAttributes(attributes: Record<string, unknown>): AttributeSumm
  * Lower-cased with `toLowerCase`, not its locale-sensitive sibling, so the same
  * capture filters identically on every machine.
  *
+ * Direction controls are revealed across the whole index, because that is how
+ * the row renders them: the name, the source file and the symbol are drawn
+ * through primitives that show each control as a `\uXXXX` marker, exactly as
+ * the attribute previews already are, so the marker a reader sees is the text
+ * the filter matches. The view reveals the search needle the same way before
+ * matching, so a pasted raw control still finds its row.
+ *
  * @param event The record.
  * @param seqLabel The formatted sequence number, as rendered.
  * @param offsetLabel The formatted offset, as rendered.
@@ -1157,7 +1173,7 @@ function buildSearchIndex(
     }
   }
 
-  return parts.join(SEARCH_INDEX_SEPARATOR).toLowerCase();
+  return formatUntrustedText(parts.join(SEARCH_INDEX_SEPARATOR)).toLowerCase();
 }
 
 /**
@@ -2173,7 +2189,8 @@ export function EventLog(props: EventLogProps): ReactElement {
   );
   const rows = useMemo(() => buildRowModels(events), [events]);
 
-  const needle = searchValue.trim().toLowerCase();
+  // Revealed like the index it is matched against (see `buildSearchIndex`).
+  const needle = formatUntrustedText(searchValue.trim()).toLowerCase();
   const visibleRows = useMemo(
     () => (needle === '' ? rows : rows.filter((row) => rowMatches(row, needle))),
     [needle, rows],

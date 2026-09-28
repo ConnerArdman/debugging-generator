@@ -142,13 +142,16 @@ import type { TokenKey, TokenValues } from '../tokens/tokens';
 import { httpStatusTone, statusTone } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
   formatBytes,
   formatCompactPath,
   formatCount,
   formatDuration,
   formatOffset,
   formatStatusLabel,
+  formatUntrustedText,
   humanizeLabel,
+  oneLinePreview,
 } from '../utils/format';
 import { RequestTable } from './RequestTable';
 import { sourceLinkAccessibleName } from './SourceLink';
@@ -6091,5 +6094,203 @@ describe('RequestTable duplicates filter availability', () => {
 
     expect(duplicatesToggle().getAttribute('aria-pressed')).toBe('true');
     expect(duplicatesToggle().classList.contains('dg-is-active')).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * A URL, a path, a caller's label, its creators and its stack are captured
+ * text, and an invisible right-to-left override (U+202E) in one of them draws
+ * the characters after it backwards — `/api/\u202Egpj.exe` reads as a
+ * different resource than the one requested. Every place this table puts such
+ * text — the URL and its tooltip, the disclosure's name, the callers and their
+ * tooltips, the source chips, the grid's name — prints each control as its
+ * visible escape (`\u202E`), while every value handed back to the host stays
+ * exactly as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered container.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('RequestTable direction controls', () => {
+  const bidiPath = `/example/${RLO}</td><script>alert(7)</script>${PDF}`;
+  const bidiUrl = `${bidiPath}?parameter=?`;
+  const panelCaller = `Example${RLO}Panel`;
+  const widgetCaller = `Example${RLO}Widget`;
+
+  /** The resolved caller: a location whose path and symbol carry a control. */
+  const bidiSource: SourceLocation = {
+    ...PANEL_SOURCE,
+    file: `src/example/${RLO}panel.tsx`,
+    symbol: `Example${RLO}PanelBody`,
+  };
+
+  /** A component caller with a creator chain, and a raw id and event id. */
+  const located: RequestOccurrence = {
+    ...makeOccurrence({
+      eventId: `event-${RLO}example-0001`,
+      initiator: panelCaller,
+      initiatorBasis: 'component',
+      source: bidiSource,
+    }),
+    initiatorOwners: [`Owner${RLO}Shell`],
+  };
+
+  /** A caller that resolved to no location, with the stack it came from. */
+  const unlocated = makeOccurrence({
+    eventId: eventIdFor(2),
+    spanId: spanIdFor(2),
+    startTime: BASE_START_MS + 20,
+    initiator: widgetCaller,
+    initiatorStack: `at ${widgetCaller} (src/example/${RLO}widget.tsx:3:1)`,
+  });
+
+  const bidiGroup = makeRequestGroup({
+    id: `request-group-${RLO}example`,
+    url: bidiUrl,
+    path: bidiPath,
+    count: 2,
+    duplicateCount: 1,
+    hasDuplicates: true,
+    duplicateWindows: [
+      makeDuplicateWindow({ count: 2, eventIds: [located.eventId, unlocated.eventId] }),
+    ],
+    lastStartTime: BASE_START_MS + 20,
+    initiators: [panelCaller, widgetCaller],
+    occurrences: [located, unlocated],
+  });
+
+  /** A group whose only caller is the unlocated one, so its stack is a tooltip. */
+  const stackGroup = makeRequestGroup({
+    id: 'request-group-example-0002',
+    requestKey: 'request-key-example-0002',
+    url: `/example/${RLO}other`,
+    path: `/example/${RLO}other`,
+    initiators: [widgetCaller],
+    occurrences: [unlocated],
+  });
+
+  it('prints every control as its escape and keeps the markup inert', async () => {
+    const stub = resolvingProvider([bidiGroup, stackGroup]);
+    const user = userEvent.setup();
+    const title = `Requests ${RLO}issued`;
+
+    const { container } = renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('grid', { name: formatUntrustedText(title) });
+
+    // The disclosure is named by the revealed path, and opens the occurrences.
+    await user.click(
+      screen.getByRole('button', {
+        name: `Show occurrences: ${bidiGroup.method} ${formatUntrustedText(bidiPath)}`,
+      }),
+    );
+    expect(detailRows()).toHaveLength(1);
+
+    // No text, title, name or description anywhere carries a raw control, the
+    // closed tooltips included; and the markup in the path is only text.
+    expect(rawDirectionSinks(container)).toEqual([]);
+    expect(container.querySelector('script, td')).toBeNull();
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    // The URL, its tooltip, and every caller label and disclosure are shown
+    // with the markers where the controls were.
+    expect(rowUrl(row)).toBe(oneLinePreview(bidiUrl));
+    expect(rowUrl(row)).toContain(RLO_MARKER);
+    const tips = tooltipTexts(container);
+    expect(tips).toContain(formatUntrustedText(bidiUrl));
+    expect(tips).toContain(formatUntrustedText(unlocated.initiatorStack ?? ''));
+    expect(tips.some((tip) => tip.includes(`Owner${RLO_MARKER}Shell`))).toBe(true);
+    expect(container.textContent).toContain(formatUntrustedText(widgetCaller));
+
+    // The source chips carry their own revealed names.
+    expect(
+      within(row).getByRole('button', { name: initiatorChipName(bidiSource) }).textContent,
+    ).toContain(RLO_MARKER);
+    const [detail] = detailRows();
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+    expect(
+      within(detail).getByRole('button', { name: occurrenceChipName(bidiSource) }),
+    ).toBeDefined();
+  });
+
+  it('hands the host the raw location, the raw event id and the raw group id', async () => {
+    const stub = resolvingProvider([bidiGroup]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await user.click(
+      screen.getByRole('button', {
+        name: `Show occurrences: ${bidiGroup.method} ${formatUntrustedText(bidiPath)}`,
+      }),
+    );
+
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, bidiGroup.id, true);
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(within(row).getByRole('button', { name: initiatorChipName(bidiSource) }));
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const opened = spies.onOpenSource.mock.calls[0]?.[0];
+    expect(opened).toEqual(bidiSource);
+    expect(opened?.file).toBe(bidiSource.file);
+
+    await user.click(screen.getByRole('button', { name: occurrenceName(bidiGroup, located) }));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls[0]?.[0]).toEqual({
+      eventId: located.eventId,
+      spanId: located.spanId,
+      traceId: located.traceId,
+    });
+    expect(containsDirectionControl(located.eventId)).toBe(true);
   });
 });

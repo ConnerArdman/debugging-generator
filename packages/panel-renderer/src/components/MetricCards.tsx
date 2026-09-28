@@ -253,6 +253,7 @@ import {
   formatCount,
   formatDurationParts,
   formatMetric,
+  formatUntrustedText,
   humanizeLabel,
 } from '../utils/format';
 
@@ -689,12 +690,19 @@ function offPageEmptyMessage(total: number | undefined): string {
  * its name from the author, so the qualifier drawn under the heading would
  * otherwise never reach a screen reader: `Database duration (wall clock:
  * overlapping statements counted once): 980 ms`.
+ *
+ * The heading arrives over the wire with the value, and the name is written
+ * onto a raw `<li>` rather than through a primitive, so its direction controls
+ * are revealed here (`formatUntrustedText`) exactly as the `Text` runs inside
+ * the tile reveal the same strings: what is announced matches what is shown.
  */
 function accessibleName(card: MetricCard): string {
   const heading = card.qualifier === undefined ? card.label : `${card.label} (${card.qualifier})`;
-  return card.unit === undefined
-    ? `${heading}: ${card.figure}`
-    : `${heading}: ${card.figure} ${card.unit}`;
+  return formatUntrustedText(
+    card.unit === undefined
+      ? `${heading}: ${card.figure}`
+      : `${heading}: ${card.figure} ${card.unit}`,
+  );
 }
 
 /**

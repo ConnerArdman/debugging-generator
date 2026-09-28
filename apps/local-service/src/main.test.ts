@@ -1567,8 +1567,11 @@ function rawConnection(handle: Pick<ServiceHandle, 'host' | 'port'>): Promise<Ra
 
 /**
  * Asserts that `head` is exactly one raw refusal of the server's
- * `clientError` answer: `status` with no body, not cached, not sniffed, and
- * the connection closed.
+ * `clientError` answer: `status` with no body, not cached, not sniffed, not
+ * frameable (`X-Frame-Options: DENY`, CSP `frame-ancestors 'none'`), inert
+ * as a document (CSP `default-src 'none'`), and the connection closed. The
+ * lines are literals, so the raw head is held to the same values the
+ * application's replies are.
  */
 function expectRawRefusal(head: string, status: string): void {
   expect(head.startsWith(`HTTP/1.1 ${status}\r\n`)).toBe(true);
@@ -1578,7 +1581,9 @@ function expectRawRefusal(head: string, status: string): void {
     'Cache-Control: no-store',
     'Connection: close',
     'Content-Length: 0',
+    "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'",
     'X-Content-Type-Options: nosniff',
+    'X-Frame-Options: DENY',
   ]);
 }
 
@@ -1681,6 +1686,46 @@ describe('startService — the HTTP server bounds every connection (CWE-400)', (
     await Promise.all([malformed.closed, oversized.closed]);
     expectRawRefusal(malformed.received(), '400 Bad Request');
     expectRawRefusal(oversized.received(), '431 Request Header Fields Too Large');
+    expect((await fetch(`${handle.url}/health`)).status).toBe(200);
+  });
+
+  it("answers the replies Node writes itself — an unmet Expect's 417, a Host-less request's 400 — with the response-header policy", async () => {
+    const { stateRoot } = makeStateRoot();
+    const handle = await startedWith(stateRoot, { httpLimits: SHORT_LIMITS });
+
+    // Neither request reaches the application: Node answers both before any
+    // `request` listener runs.
+    const unmet = await rawConnection(handle);
+    unmet.socket.write(
+      'GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: unmet-expectation\r\nConnection: close\r\n\r\n',
+    );
+    const hostless = await rawConnection(handle);
+    hostless.socket.write('GET /health HTTP/1.1\r\nConnection: close\r\n\r\n');
+
+    await Promise.all([unmet.closed, hostless.closed]);
+    for (const [connection, status] of [
+      [unmet, '417 Expectation Failed'],
+      [hostless, '400 Bad Request'],
+    ] as const) {
+      const [head = ''] = connection.received().split('\r\n\r\n');
+      expect(head.startsWith(`HTTP/1.1 ${status}\r\n`), head).toBe(true);
+      const fields = head
+        .split('\r\n')
+        .slice(1)
+        .map((field) => {
+          const colon = field.indexOf(':');
+          return `${field.slice(0, colon).toLowerCase()}:${field.slice(colon + 1)}`;
+        });
+      expect(fields, head).toEqual(
+        expect.arrayContaining([
+          'cache-control: no-store',
+          'x-content-type-options: nosniff',
+          'x-frame-options: DENY',
+          "content-security-policy: default-src 'none'; frame-ancestors 'none'",
+        ]),
+      );
+      expect(head.toLowerCase()).not.toContain('access-control-allow-origin');
+    }
     expect((await fetch(`${handle.url}/health`)).status).toBe(200);
   });
 

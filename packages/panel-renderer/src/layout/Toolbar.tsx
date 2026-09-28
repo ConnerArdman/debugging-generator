@@ -168,6 +168,7 @@ import { Input } from '../primitives/Input';
 import { Kbd } from '../primitives/Kbd';
 import { Select, type SelectOption } from '../primitives/Select';
 import { Text } from '../primitives/Text';
+import { formatUntrustedText } from '../primitives/untrusted-text';
 
 /**
  * Whether a caller-supplied node is worth a wrapper element.
@@ -609,7 +610,10 @@ export function Toolbar(props: ToolbarProps): ReactElement {
       )}
       id={id}
       role={isNamedGroup ? 'group' : undefined}
-      aria-label={isNamedGroup ? label : undefined}
+      // The group name is the one string this row writes onto a raw element rather than through a
+      // primitive; a caller may build it from a node title, so it is revealed like every other
+      // accessible name the design system renders.
+      aria-label={isNamedGroup ? formatUntrustedText(label) : undefined}
     >
       {search === undefined ? null : (
         <div className="dg-toolbar__search">

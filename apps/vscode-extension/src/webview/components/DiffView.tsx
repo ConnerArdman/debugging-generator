@@ -19,7 +19,15 @@
  *     ends in an ellipsis, because a clipped diff line is a misrepresented one;
  *   - the only transformation is presentational: a `+`, `-` or single-space
  *     prefix is shown in its own marker column, and the remainder of the line
- *     beside it. Joining the two gives back the recorded line exactly.
+ *     beside it. Joining the two gives back the recorded line exactly;
+ *   - direction controls are shown, never obeyed. An invisible Unicode
+ *     bidirectional control in source code (U+202E and its eleven siblings)
+ *     makes a line display in an order the compiler does not read - the
+ *     "Trojan Source" attack (CVE-2021-42574) - so `Code` prints each one as
+ *     its visible escape (`\u202E`) and changes no other character, and the
+ *     region's accessible name, which carries the file label, is revealed
+ *     with the same `formatUntrustedText`. A reviewer therefore sees exactly
+ *     the characters recorded, in the order recorded.
  *
  * ## Line classification
  *
@@ -114,6 +122,7 @@ import {
   LoadingState,
   Stack,
   Text,
+  formatUntrustedText,
 } from '@debuggen/panel-renderer';
 import { Fragment, memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
@@ -659,11 +668,13 @@ function DiffLines(props: {
           to the lines' own padding and ruled off from them by the strip's
           subtle border. */}
       <DiffHeader label={label} subject={subject} notice={notice} />
+      {/* A raw element, so its accessible name — which carries the file label —
+          is revealed here; the primitives reveal their own. */}
       <pre
         ref={regionRef}
         className="dgv-diff__scroll"
         role="region"
-        aria-label={name}
+        aria-label={formatUntrustedText(name)}
         aria-describedby={windowed ? noticeId : undefined}
         tabIndex={tabIndex}
       >

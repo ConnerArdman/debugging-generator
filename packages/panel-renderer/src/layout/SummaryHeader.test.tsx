@@ -27,9 +27,16 @@
  *   the selected event's chip, activated with Enter and Space, and described by
  *   a visually hidden keyboard hint. The title is a script focus target, never
  *   a tab stop, and inert citations stay out of the tab order altogether.
+ * - Model-authored and captured text displays its logical order: a Unicode
+ *   direction control in the title, the headline, a fact, a cause or an
+ *   evidence caption is printed as its visible escape (`\u202E`), nothing on
+ *   screen, in a `title` or in an `aria-label` carries the raw control, the
+ *   escaped markup never becomes an element, and every citation still carries
+ *   — and selects — its raw event id.
  *
  * The copy below is generic product vocabulary written for this suite; it
- * names nothing of an inspected project.
+ * names nothing of an inspected project. Every direction control is written as
+ * an escape, never as the character, so this suite carries none itself.
  */
 
 import type { Fact, Hypothesis, PanelSummary } from '@debuggen/panel-schema';
@@ -37,6 +44,7 @@ import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
+import { containsDirectionControl } from '../utils/format';
 import { SummaryHeader } from './SummaryHeader';
 
 /** The panel title every case renders. */
@@ -532,5 +540,155 @@ describe('SummaryHeader confidence badges', () => {
     const signatures = badges.map((badge) => badge.className);
     expect(badges.map((badge) => badge.textContent.trim())).toEqual([...levels]);
     expect(new Set(signatures).size).toBe(levels.length);
+  });
+});
+
+describe('SummaryHeader with direction controls in untrusted text', () => {
+  /** The QA report's payload: an override that draws an escaped script tag backwards. */
+  const PAYLOAD = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+  /** The payload as it must display: both controls as the printable characters of their escape. */
+  const REVEALED = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+  /** A cited event id carrying an override, which must reach every data path raw. */
+  const RAW_EVENT_ID = 'evt-\u202Eobserved';
+
+  /** The same id as a chip that falls back to it for a caption displays it. */
+  const SHOWN_EVENT_ID = 'evt-\\u202Eobserved';
+
+  /** The trace and span the observed citation records, raw like its id. */
+  const RAW_TRACE_ID = 'trace-\u202Ecited';
+  const RAW_SPAN_ID = 'span-\u202Ecited';
+
+  /** The two attributes a reader hovers or hears, which must match the visible text. */
+  const DISPLAY_ATTRIBUTES = ['title', 'aria-label'] as const;
+
+  /** A fact whose statement and captions carry the payload, and one caption falling back to its id. */
+  const HOSTILE_FACT: Fact = {
+    statement: `Fact ${PAYLOAD}`,
+    evidence: [
+      {
+        eventId: RAW_EVENT_ID,
+        traceId: RAW_TRACE_ID,
+        spanId: RAW_SPAN_ID,
+        label: `chip ${PAYLOAD}`,
+      },
+      { eventId: RAW_EVENT_ID },
+    ],
+  };
+
+  /** A cause whose statement and caption carry the payload. */
+  const HOSTILE_CAUSE: Hypothesis = {
+    statement: `Cause ${PAYLOAD}`,
+    evidence: [{ eventId: 'evt-cause', label: `cause chip ${PAYLOAD}` }],
+    confidence: 'high',
+  };
+
+  /** The summary every case renders: the payload in the headline, a fact and a cause. */
+  function hostileSummary(): PanelSummary {
+    return {
+      headline: `Headline ${PAYLOAD}`,
+      observed: [HOSTILE_FACT],
+      likelyCauses: [HOSTILE_CAUSE],
+    };
+  }
+
+  /**
+   * Asserts the rendered head displays nothing a direction control could
+   * reorder — no raw control in its text, a `title` or an `aria-label` — and
+   * that the payload's escaped markup stayed text.
+   *
+   * @param root The element `render` mounted into.
+   */
+  function expectNothingReorders(root: HTMLElement): void {
+    expect(containsDirectionControl(root.textContent)).toBe(false);
+    for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+      for (const attribute of DISPLAY_ATTRIBUTES) {
+        const value = element.getAttribute(attribute);
+        if (value !== null) {
+          expect(containsDirectionControl(value)).toBe(false);
+        }
+      }
+    }
+    expect(root.querySelector('script')).toBeNull();
+    expect(root.querySelector('td')).toBeNull();
+  }
+
+  it('prints every control in the title, headline, statements and inert citations as its escape', () => {
+    const { container } = render(
+      <SummaryHeader title={`Panel ${PAYLOAD}`} summary={hostileSummary()} />,
+    );
+
+    // The heading's name is the revealed title, so a screen reader hears the
+    // logical order too, and the markers are the visible text.
+    const heading = screen.getByRole('heading', { level: 2, name: `Panel ${REVEALED}` });
+    expect(heading.textContent).toBe(`Panel ${REVEALED}`);
+    expect(screen.getByText(`Headline ${REVEALED}`).tagName).toBe('P');
+
+    const observed = observedRegion();
+    const causes = screen.getByRole('region', { name: LIKELY_CAUSE_NAME });
+    expect(within(observed).getByText(`Fact ${REVEALED}`)).toBeDefined();
+    expect(within(causes).getByText(`Cause ${REVEALED}`)).toBeDefined();
+
+    // Without a selection handler every citation is an inert badge: its
+    // caption is revealed, the id it falls back to is revealed, and the
+    // `data-event-id` it carries is the raw id — data, not display.
+    const captions = Array.from(
+      observed.querySelectorAll<HTMLElement>('.dg-summary-header__evidence [data-event-id]'),
+    );
+    expect(captions.map((caption) => caption.textContent.trim())).toEqual([
+      `chip ${REVEALED}`,
+      SHOWN_EVENT_ID,
+    ]);
+    for (const caption of captions) {
+      expect(caption.classList.contains('dg-badge')).toBe(true);
+      expect(caption.getAttribute('data-event-id')).toBe(RAW_EVENT_ID);
+    }
+    expect(within(causes).getByText(`cause chip ${REVEALED}`)).toBeDefined();
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+
+    expectNothingReorders(container);
+  });
+
+  it('reveals selectable chips and still selects, and marks, the raw cited event', async () => {
+    const selectEvent = vi.fn<(eventId: string, coordinates?: object) => void>();
+    const user = userEvent.setup();
+    const { container } = render(
+      <SummaryHeader
+        title={`Panel ${PAYLOAD}`}
+        summary={hostileSummary()}
+        selectEvent={selectEvent}
+        selectedEventId={RAW_EVENT_ID}
+      />,
+    );
+
+    // Each chip is a button named by its revealed caption.
+    const labelled = screen.getByRole('button', { name: `chip ${REVEALED}` });
+    const fallback = screen.getByRole('button', { name: SHOWN_EVENT_ID });
+    const cause = screen.getByRole('button', { name: `cause chip ${REVEALED}` });
+
+    // The pressed state is decided on the raw id: both observed chips cite the
+    // selected event, the cause's chip does not.
+    expect(labelled.getAttribute('aria-pressed')).toBe('true');
+    expect(fallback.getAttribute('aria-pressed')).toBe('true');
+    expect(cause.getAttribute('aria-pressed')).toBe('false');
+    expect(labelled.getAttribute('data-event-id')).toBe(RAW_EVENT_ID);
+
+    expectNothingReorders(container);
+
+    // Activation hands the host the raw id and the raw coordinates the
+    // citation recorded, never the escaped form a reader sees.
+    await user.click(labelled);
+    expect(selectEvent).toHaveBeenLastCalledWith(RAW_EVENT_ID, {
+      traceId: RAW_TRACE_ID,
+      spanId: RAW_SPAN_ID,
+    });
+
+    await user.click(fallback);
+    expect(selectEvent).toHaveBeenLastCalledWith(RAW_EVENT_ID, {});
+
+    await user.click(cause);
+    expect(selectEvent).toHaveBeenLastCalledWith('evt-cause', {});
+    expect(selectEvent).toHaveBeenCalledTimes(3);
   });
 });

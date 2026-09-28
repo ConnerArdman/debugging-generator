@@ -3187,6 +3187,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       context = {
         origin: 'browser-agent',
         tabId: input.tabId,
+        ...(input.boundBy === undefined ? {} : { boundBy: input.boundBy }),
         ...(input.documentId === undefined ? {} : { documentId: input.documentId }),
         ...(input.producerId === undefined ? {} : { producerId: input.producerId }),
         ...(input.url === undefined ? {} : { url: input.url }),

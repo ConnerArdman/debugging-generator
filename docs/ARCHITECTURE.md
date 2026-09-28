@@ -669,7 +669,7 @@ Rejections have safe deterministic paths: a rejected plan falls back to a runtim
 | `anthropic`     | `providers/anthropic.ts`     | schema-constrained structured output, forced tool use as the fallback; model id from `DEBUGGEN_MODEL`, never hardcoded                                                                                   |
 | `deterministic` | `providers/deterministic.ts` | rules-based (`deterministic/rules.ts`, `templates.ts`), no network; builds schema-valid outputs from the structured inputs — code-graph candidates and capture aggregates. Every automated test uses it. |
 
-`providers/deterministic.test.ts` asserts that two questions differing only in wording yield the same output, so the provider cannot key on question text. Nothing leaves the machine under the deterministic provider.
+`providers/deterministic.test.ts` asserts that two questions differing only in wording yield the same output, so the provider cannot key on question text. The deterministic provider sends nothing off the machine; [SECURITY.md](SECURITY.md#4-what-may-leave-the-machine-and-when) says what else may.
 
 ### 9.4 Follow-ups
 

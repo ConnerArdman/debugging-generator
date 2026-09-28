@@ -48,6 +48,19 @@
  * without one, and refuses a blank id; deleting the session removes the row
  * through `ON DELETE CASCADE`; and no log line or error carries the path.
  *
+ * **A tab binding belongs to the credential that made it and its tab.** A
+ * Chrome tab id is unique only within one browser, so schema version 7 re-keys
+ * `bindings` by `(bound_by, tab_id)`, keeping the one-binding-per-session
+ * index. The suite pins the step — a new store carries the composite key, the
+ * step is idempotent, and a version-6 store keeps every row under no recorded
+ * holder (`''`), logged by count only — and the repository's half: two
+ * holders' bindings of one tab id coexist and are read back per holder; a read
+ * without a holder refuses to choose between them (`ambiguous-tab`); another
+ * holder's bind of a session displaces the session's row; a holder's view of a
+ * tab is its own row, else the tab's unrecorded row, which its first bind
+ * consumes; deletes reach that view only; a malformed holder is refused; and no
+ * log line or error carries a holder.
+ *
  * **`SessionRecord.modifications` says what the journal says.** The member is
  * a mirror written at install time, while the conflict watcher, cleanup and
  * start-up reconciliation move the journal alone; the record must still report
@@ -941,6 +954,451 @@ describe('schema version 6 adds the persisted project-root identity', () => {
     for (const needle of [sessionA, sessionB, '/workspace/project-one']) {
       expect(logged).not.toContain(needle);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Schema version 7 — the tab bindings keyed by holder and tab
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The routing table schema version 7 re-keys. */
+const BINDINGS_TABLE = 'bindings';
+
+/** The unique index that keeps one binding per session, before and after the re-key. */
+const BINDINGS_SESSION_INDEX = 'idx_bindings_session_id';
+
+/** The description the version-7 ladder step logs and reports. */
+const VERSION_7_DESCRIPTION = 'key the tab bindings by the credential that made them and the tab';
+
+/** The `bindings` table exactly as versions 1 to 6 declared it: keyed by the tab id alone. */
+const LEGACY_BINDINGS_DDL = `CREATE TABLE ${BINDINGS_TABLE} (
+  tab_id     INTEGER PRIMARY KEY,
+  session_id TEXT    NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+  url        TEXT    NOT NULL,
+  bound_at   INTEGER NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX ${BINDINGS_SESSION_INDEX} ON ${BINDINGS_TABLE} (session_id);`;
+
+/** A raw insert into the version-7 table, past the repository on purpose. */
+const RAW_BINDING_INSERT_SQL = `INSERT INTO ${BINDINGS_TABLE} (bound_by, tab_id, session_id, url, bound_at) VALUES (?, ?, ?, ?, ?)`;
+
+/** The SQLite extended result code of a `PRIMARY KEY` constraint failure. */
+const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
+
+/** The SQLite extended result code of a `UNIQUE` index constraint failure. */
+const SQLITE_CONSTRAINT_UNIQUE = 2067;
+
+/** The tab id two paired browsers both use in these cases. */
+const SHARED_TAB_ID = 7;
+
+/** The URL every binding case binds, on the sessions' dev server. */
+const BOUND_URL = 'http://127.0.0.1:3100/orders';
+
+/** Two credential digests shaped like `tokenHash` (64 hex characters), and distinct. */
+const FIRST_HOLDER = 'a'.repeat(64);
+const SECOND_HOLDER = 'b'.repeat(64);
+
+/** Every `bindings` row as stored, ordered by its key. */
+function bindingTableRows(db: DatabaseSync): Record<string, unknown>[] {
+  return db.prepare(`SELECT * FROM ${BINDINGS_TABLE} ORDER BY bound_by, tab_id`).all();
+}
+
+/** The DDL `db` holds for the bindings table, or `undefined` when it has none. */
+function bindingsTableSql(db: DatabaseSync): string | undefined {
+  const sql = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(BINDINGS_TABLE)?.['sql'];
+
+  return typeof sql === 'string' ? sql : undefined;
+}
+
+describe('schema version 7 keys the tab bindings by holder and tab', () => {
+  it('declares the step on the ladder and stamps a new store at the current version', () => {
+    const step = STORE_MIGRATIONS.find((candidate) => candidate.version === 7);
+
+    expect(STORE_SCHEMA_VERSION).toBeGreaterThanOrEqual(7);
+    expect(step?.description).toBe(VERSION_7_DESCRIPTION);
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+  });
+
+  it('gives a new store a STRICT table keyed by holder and tab, one row per session, removed with it', () => {
+    expect(
+      store.db
+        .prepare(
+          `SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info('${BINDINGS_TABLE}') ORDER BY cid`,
+        )
+        .all(),
+    ).toEqual([
+      { name: 'bound_by', type: 'TEXT', notnull: 1, dflt_value: "''", pk: 1 },
+      { name: 'tab_id', type: 'INTEGER', notnull: 1, dflt_value: null, pk: 2 },
+      { name: 'session_id', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+      { name: 'url', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
+      { name: 'bound_at', type: 'INTEGER', notnull: 1, dflt_value: null, pk: 0 },
+    ]);
+    expect(
+      store.db.prepare('SELECT strict FROM pragma_table_list WHERE name = ?').get(BINDINGS_TABLE),
+    ).toEqual({ strict: 1 });
+    expect(
+      store.db
+        .prepare(
+          `SELECT "table", "from", "to", on_delete FROM pragma_foreign_key_list('${BINDINGS_TABLE}')`,
+        )
+        .all(),
+    ).toEqual([{ table: 'sessions', from: 'session_id', to: 'id', on_delete: 'CASCADE' }]);
+    expect(
+      store.db
+        .prepare(`SELECT name, "unique" FROM pragma_index_list('${BINDINGS_TABLE}') WHERE name = ?`)
+        .all(BINDINGS_SESSION_INDEX),
+    ).toEqual([{ name: BINDINGS_SESSION_INDEX, unique: 1 }]);
+
+    // The database itself holds the key and the one-binding-per-session rule.
+    const insert = store.db.prepare(RAW_BINDING_INSERT_SQL);
+    const sessionC = newSessionId();
+
+    unwrap(sessions.insert(makeSession(sessionC)));
+
+    expect(
+      errcodeOf(() => insert.run(FIRST_HOLDER, SHARED_TAB_ID, sessionA, BOUND_URL, CLOCK_START)),
+    ).toBeUndefined();
+    expect(
+      errcodeOf(() => insert.run(SECOND_HOLDER, SHARED_TAB_ID, sessionB, BOUND_URL, CLOCK_START)),
+    ).toBeUndefined();
+    // A second row for one holder's tab is refused by the key, even for a session with no binding.
+    expect(
+      errcodeOf(() => insert.run(FIRST_HOLDER, SHARED_TAB_ID, sessionC, BOUND_URL, CLOCK_START)),
+    ).toBe(SQLITE_CONSTRAINT_PRIMARYKEY);
+    // A second binding of one session, on any tab, is refused by the session index.
+    expect(
+      errcodeOf(() =>
+        insert.run(FIRST_HOLDER, SHARED_TAB_ID + 1, sessionA, BOUND_URL, CLOCK_START),
+      ),
+    ).toBe(SQLITE_CONSTRAINT_UNIQUE);
+
+    // Deleting a session removes its binding through the foreign key.
+    unwrap(sessions.delete(sessionA));
+    expect(bindingTableRows(store.db).map((row) => row['session_id'])).toEqual([sessionB]);
+  });
+
+  it('is idempotent: the step leaves a store that is already re-keyed, and its rows, untouched', () => {
+    const step = STORE_MIGRATIONS.find((candidate) => candidate.version === 7);
+
+    if (step === undefined) {
+      throw new Error('the ladder has no version-7 step');
+    }
+
+    store.db
+      .prepare(RAW_BINDING_INSERT_SQL)
+      .run(FIRST_HOLDER, SHARED_TAB_ID, sessionA, BOUND_URL, CLOCK_START);
+    const tableBefore = bindingsTableSql(store.db);
+    const rowsBefore = bindingTableRows(store.db);
+
+    step.apply(store.db, { ddl: '', logger: noopLogger, now: () => CLOCK_START });
+
+    expect(bindingsTableSql(store.db)).toBe(tableBefore);
+    expect(bindingTableRows(store.db)).toEqual(rowsBefore);
+  });
+
+  it('migrates a version-6 store forward, keeping every binding under no recorded holder', () => {
+    const databasePath = store.path;
+
+    store.close();
+
+    // Turn the file back into what a version-6 build left behind: stamped 6,
+    // with the bindings table keyed by the tab id alone and holding two rows.
+    const legacy = new DatabaseSync(databasePath);
+
+    try {
+      legacy.exec(`DROP TABLE ${BINDINGS_TABLE}`);
+      legacy.exec(LEGACY_BINDINGS_DDL);
+      const insert = legacy.prepare(
+        `INSERT INTO ${BINDINGS_TABLE} (tab_id, session_id, url, bound_at) VALUES (?, ?, ?, ?)`,
+      );
+      insert.run(SHARED_TAB_ID, sessionA, BOUND_URL, CLOCK_START);
+      insert.run(SHARED_TAB_ID + 1, sessionB, BOUND_URL, CLOCK_START + 1);
+      legacy.exec('PRAGMA user_version = 6');
+
+      expect(bindingsTableSql(legacy)).not.toContain('bound_by');
+    } finally {
+      legacy.close();
+    }
+
+    const migrationLogs: CapturedLog[] = [];
+    const logger = createCapturingLogger(migrationLogs);
+
+    store = unwrap(openStore({ databasePath, logger }));
+    sessions = createSessionsRepo({ store, logger, now: () => CLOCK_START });
+
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+    expect(
+      migrationLogs
+        .filter((record) => record.message.startsWith('applied store migration'))
+        .map((record) => record.message),
+    ).toContain(`applied store migration 7 (${VERSION_7_DESCRIPTION})`);
+
+    // Every row kept, recorded under no holder, on the composite key and with
+    // the session index back in place.
+    expect(bindingTableRows(store.db)).toEqual([
+      {
+        bound_by: '',
+        tab_id: SHARED_TAB_ID,
+        session_id: sessionA,
+        url: BOUND_URL,
+        bound_at: CLOCK_START,
+      },
+      {
+        bound_by: '',
+        tab_id: SHARED_TAB_ID + 1,
+        session_id: sessionB,
+        url: BOUND_URL,
+        bound_at: CLOCK_START + 1,
+      },
+    ]);
+    expect(
+      store.db
+        .prepare(`SELECT name, pk FROM pragma_table_info('${BINDINGS_TABLE}') WHERE pk > 0`)
+        .all(),
+    ).toEqual([
+      { name: 'bound_by', pk: 1 },
+      { name: 'tab_id', pk: 2 },
+    ]);
+    expect(
+      store.db
+        .prepare(`SELECT "unique" FROM pragma_index_list('${BINDINGS_TABLE}') WHERE name = ?`)
+        .get(BINDINGS_SESSION_INDEX),
+    ).toEqual({ unique: 1 });
+    expect(
+      store.db.prepare(`SELECT on_delete FROM pragma_foreign_key_list('${BINDINGS_TABLE}')`).all(),
+    ).toEqual([{ on_delete: 'CASCADE' }]);
+
+    // The repository reads a kept row as holder-less, and any holder's view of
+    // the tab includes it — so the first re-bind consumes it as before.
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID))).toEqual({
+      sessionId: sessionA,
+      tab: { tabId: SHARED_TAB_ID, url: BOUND_URL },
+      boundAt: CLOCK_START,
+      boundBy: '',
+    });
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, FIRST_HOLDER))?.sessionId).toBe(sessionA);
+
+    // The re-key is logged by count, never by a session, a tab or a URL.
+    expect(
+      migrationLogs
+        .filter((record) => record.fields['keptBindings'] !== undefined)
+        .map((record) => record.fields['keptBindings']),
+    ).toEqual([2]);
+    const logged = JSON.stringify(migrationLogs);
+
+    for (const needle of [sessionA, sessionB, BOUND_URL]) {
+      expect(logged).not.toContain(needle);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The tab bindings, by holder and tab
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('upsertBinding, getBindingByTab and deleteBinding by holder', () => {
+  it('keeps two holders’ bindings of the same tab id side by side, displacing neither', () => {
+    const first = unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionA,
+        url: BOUND_URL,
+        boundBy: FIRST_HOLDER,
+      }),
+    );
+    const second = unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionB,
+        url: BOUND_URL,
+        boundBy: SECOND_HOLDER,
+      }),
+    );
+
+    // Neither bind reports a displaced row: the outcome carries the binding alone.
+    expect(Object.keys(first)).toEqual(['binding']);
+    expect(Object.keys(second)).toEqual(['binding']);
+    expect(first.binding.boundBy).toBe(FIRST_HOLDER);
+    expect(second.binding.boundBy).toBe(SECOND_HOLDER);
+    expect(bindingTableRows(store.db).map((row) => [row['bound_by'], row['session_id']])).toEqual([
+      [FIRST_HOLDER, sessionA],
+      [SECOND_HOLDER, sessionB],
+    ]);
+
+    // Each holder reads its own binding of the tab id; a holder with none reads nothing.
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, FIRST_HOLDER))?.sessionId).toBe(sessionA);
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, SECOND_HOLDER))?.sessionId).toBe(
+      sessionB,
+    );
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, 'c'.repeat(64)))).toBeUndefined();
+    expect(unwrap(sessions.getBindingBySession(sessionA))?.boundBy).toBe(FIRST_HOLDER);
+    expect(unwrap(sessions.getBindingBySession(sessionB))?.boundBy).toBe(SECOND_HOLDER);
+  });
+
+  it('refuses to guess a tab id several holders bound, and never names a holder in the refusal', () => {
+    for (const [sessionId, boundBy] of [
+      [sessionA, FIRST_HOLDER],
+      [sessionB, SECOND_HOLDER],
+    ] as const) {
+      unwrap(sessions.upsertBinding({ tabId: SHARED_TAB_ID, sessionId, url: BOUND_URL, boundBy }));
+    }
+
+    const refusal = refusalOf(sessions.getBindingByTab(SHARED_TAB_ID));
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('ambiguous-tab');
+    expect(errorText(refusal)).not.toContain(FIRST_HOLDER);
+    expect(errorText(refusal)).not.toContain(SECOND_HOLDER);
+  });
+
+  it('keeps one binding per session across holders: another holder’s bind of the session displaces its row', () => {
+    unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionA,
+        url: BOUND_URL,
+        boundBy: FIRST_HOLDER,
+      }),
+    );
+
+    // The same tab id and session, bound by another credential: the first
+    // holder's row is the session's displaced binding.
+    const takeover = unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionA,
+        url: BOUND_URL,
+        boundBy: SECOND_HOLDER,
+      }),
+    );
+
+    expect(takeover.displacedTab).toMatchObject({
+      sessionId: sessionA,
+      tab: { tabId: SHARED_TAB_ID },
+      boundBy: FIRST_HOLDER,
+    });
+    expect(takeover.displacedSession).toBeUndefined();
+    expect(bindingTableRows(store.db).map((row) => [row['bound_by'], row['session_id']])).toEqual([
+      [SECOND_HOLDER, sessionA],
+    ]);
+
+    // The same holder re-binding its own pair displaces nothing.
+    const again = unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionA,
+        url: BOUND_URL,
+        boundBy: SECOND_HOLDER,
+      }),
+    );
+
+    expect(again.displacedTab).toBeUndefined();
+    expect(again.displacedSession).toBeUndefined();
+  });
+
+  it('lets the first holder’s bind of a tab consume the row that recorded no holder, as before version 7', () => {
+    const unrecorded = unwrap(
+      sessions.upsertBinding({ tabId: SHARED_TAB_ID, sessionId: sessionA, url: BOUND_URL }),
+    );
+
+    expect(unrecorded.binding.boundBy).toBe('');
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, FIRST_HOLDER))?.boundBy).toBe('');
+
+    const rebound = unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionB,
+        url: BOUND_URL,
+        boundBy: FIRST_HOLDER,
+      }),
+    );
+
+    expect(rebound.displacedSession).toMatchObject({ sessionId: sessionA, boundBy: '' });
+    expect(rebound.displacedTab).toBeUndefined();
+    expect(bindingTableRows(store.db).map((row) => [row['bound_by'], row['session_id']])).toEqual([
+      [FIRST_HOLDER, sessionB],
+    ]);
+  });
+
+  it('prefers a holder’s own row over the tab’s unrecorded row', () => {
+    store.db.prepare(RAW_BINDING_INSERT_SQL).run('', SHARED_TAB_ID, sessionA, BOUND_URL, 1);
+    store.db
+      .prepare(RAW_BINDING_INSERT_SQL)
+      .run(FIRST_HOLDER, SHARED_TAB_ID, sessionB, BOUND_URL, 2);
+
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, FIRST_HOLDER))?.sessionId).toBe(sessionB);
+    expect(unwrap(sessions.getBindingByTab(SHARED_TAB_ID, SECOND_HOLDER))?.sessionId).toBe(
+      sessionA,
+    );
+  });
+
+  it('deletes a holder’s view of a tab only, and every row of the tab without a holder', () => {
+    const sessionC = newSessionId();
+
+    unwrap(sessions.insert(makeSession(sessionC)));
+    store.db.prepare(RAW_BINDING_INSERT_SQL).run('', SHARED_TAB_ID, sessionA, BOUND_URL, 1);
+    store.db
+      .prepare(RAW_BINDING_INSERT_SQL)
+      .run(FIRST_HOLDER, SHARED_TAB_ID, sessionB, BOUND_URL, 2);
+    store.db
+      .prepare(RAW_BINDING_INSERT_SQL)
+      .run(SECOND_HOLDER, SHARED_TAB_ID, sessionC, BOUND_URL, 3);
+
+    unwrap(sessions.deleteBinding(SHARED_TAB_ID, FIRST_HOLDER));
+    expect(bindingTableRows(store.db).map((row) => [row['bound_by'], row['session_id']])).toEqual([
+      [SECOND_HOLDER, sessionC],
+    ]);
+
+    unwrap(sessions.deleteBinding(SHARED_TAB_ID));
+    expect(bindingTableRows(store.db)).toEqual([]);
+  });
+
+  it('refuses a holder that is not a credential digest, writing and reading nothing', () => {
+    for (const boundBy of ['has space', 'x'.repeat(129), '\u0000']) {
+      const refusal = refusalOf(
+        sessions.upsertBinding({
+          tabId: SHARED_TAB_ID,
+          sessionId: sessionA,
+          url: BOUND_URL,
+          boundBy,
+        }),
+      );
+
+      expect(refusal.code).toBe('STORE_ERROR');
+      expect(refusal.details?.['field']).toBe('boundBy');
+      expect(refusalOf(sessions.getBindingByTab(SHARED_TAB_ID, boundBy)).code).toBe('STORE_ERROR');
+      expect(refusalOf(sessions.deleteBinding(SHARED_TAB_ID, boundBy)).code).toBe('STORE_ERROR');
+    }
+
+    expect(bindingTableRows(store.db)).toEqual([]);
+  });
+
+  it('never logs a holder', () => {
+    unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionA,
+        url: BOUND_URL,
+        boundBy: FIRST_HOLDER,
+      }),
+    );
+    unwrap(
+      sessions.upsertBinding({
+        tabId: SHARED_TAB_ID,
+        sessionId: sessionB,
+        url: BOUND_URL,
+        boundBy: SECOND_HOLDER,
+      }),
+    );
+    refusalOf(sessions.getBindingByTab(SHARED_TAB_ID));
+    unwrap(sessions.deleteBinding(SHARED_TAB_ID, FIRST_HOLDER));
+
+    const logged = JSON.stringify(logs);
+
+    expect(logged).not.toContain(FIRST_HOLDER);
+    expect(logged).not.toContain(SECOND_HOLDER);
   });
 });
 

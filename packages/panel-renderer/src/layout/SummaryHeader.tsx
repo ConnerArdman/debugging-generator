@@ -847,7 +847,12 @@ function VersionIndicator(props: VersionIndicatorProps): ReactElement {
  * `openSource={hostActions?.openSource}` — must remain legal.
  */
 export interface SummaryHeaderProps {
-  /** The panel's title. Rendered verbatim as the head's heading. */
+  /**
+   * The panel's title. Rendered verbatim as the head's heading, except that the
+   * `Heading` primitive prints each Unicode direction control in it as its
+   * visible `\u202E`-style escape, so a model-authored title cannot display
+   * its characters in an order other than the one they were written in.
+   */
   title: string;
 
   /**
@@ -1069,7 +1074,9 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
               <li key={`${fact.statement}#${String(index)}`} className="dg-summary-header__fact">
                 {/* Verbatim: no truncation, no re-casing, no added punctuation.
                     The statement was redacted upstream, and this component
-                    neither redacts nor logs it. */}
+                    neither redacts nor logs it. `Text` prints a direction
+                    control as its visible escape, which is display only: the
+                    evidence chips below still carry the raw event ids. */}
                 <Text as="p" className="dg-summary-header__statement">
                   {fact.statement}
                 </Text>

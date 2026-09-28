@@ -141,7 +141,9 @@ import {
   ELLIPSIS,
   MAX_PREVIEW_LENGTH,
   NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
   formatCount,
+  formatUntrustedText,
   humanizeLabel,
   oneLinePreview,
 } from '../utils/format';
@@ -4290,5 +4292,176 @@ describe('StateTransitionViewer toolbar filter reports', () => {
       changedOnly: 'false',
       grouped: 'false',
     });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * A component name, a hook label, a value preview, a trigger's name and a
+ * location are captured text, and an invisible right-to-left override (U+202E)
+ * in one of them draws the characters after it backwards. Every place this
+ * view puts such text — the row header and toggle, the hook, both previews,
+ * the trigger control, the source chip, the grid's name and the component
+ * picker's native options — prints each control as its visible escape
+ * (`\u202E`); a short preview is not called shortened merely because it
+ * carries one; and every value handed back to the host stays as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered tree.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('StateTransitionViewer direction controls', () => {
+  const component = `Example${RLO}Widget${PDF}`;
+  const before = `"${RLO}</td><script>alert(7)</script>${PDF}"`;
+  const after = `"done${RLO}"`;
+  const bidiSource: SourceLocation = {
+    file: `src/example/${RLO}widget.tsx`,
+    line: 12,
+    column: 3,
+    symbol: component,
+    resolvedBy: 'react-owner',
+    confidence: 0.7,
+  };
+  const bidiTransition = makeTransition({
+    id: `evt_${RLO}example`,
+    component,
+    hookLabel: `use${RLO}Flag`,
+    previousValue: before,
+    nextValue: after,
+    valueType: 'string',
+    triggerEventId: `evt_trigger_${RLO}0001`,
+    triggerName: `click ${RLO}button`,
+    triggerKind: 'interaction',
+    transitionSource: 'state',
+    source: bidiSource,
+  });
+
+  it('prints every control as its escape, the picker included', async () => {
+    const title = `State ${RLO}changes`;
+    const stub = resolvingProvider([bidiTransition]);
+
+    renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('grid', { name: formatUntrustedText(title) });
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+    const cells = cellsOf(row);
+
+    // Both previews are whole, revealed, and not marked as shortened.
+    expect(valueTextOf(cells.previous)).toBe(formatUntrustedText(before));
+    expect(valueTextOf(cells.next)).toBe(formatUntrustedText(after));
+    expect(cells.previous.querySelector('.dg-is-truncated')).toBeNull();
+    expect(cells.next.querySelector('.dg-is-truncated')).toBeNull();
+
+    // The trigger control, the hook and the row header show the markers.
+    expect(
+      within(cells.trigger).getByRole('button', {
+        name: formatUntrustedText(bidiTransition.triggerName ?? ''),
+      }),
+    ).toBeDefined();
+    expect(cells.hook.textContent).toContain(`use${RLO_MARKER}Flag`);
+    expect(cells.component.textContent).toContain(formatUntrustedText(component));
+
+    // The picker offers the captured component by its revealed label.
+    const picker = screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME });
+    const option = within(picker).getByRole('option', { name: formatUntrustedText(component) });
+    expect(option.getAttribute('value')).toBe(component);
+    expect(option.textContent).toContain(RLO_MARKER);
+
+    // Nothing else a reader sees, hovers or hears carries a raw control — the
+    // option's `value` is the filter's data, never displayed — and the markup
+    // in the preview is only text.
+    expect(rawDirectionSinks(document.body).filter((sink) => sink !== 'option[value]')).toEqual([]);
+    expect(document.body.querySelector('script, td')).toBeNull();
+  });
+
+  it('narrows by, reports, selects and opens the raw values', async () => {
+    const stub = pagingProvider([{ data: [bidiTransition] }, { data: [bidiTransition] }]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    // The picker's value is the captured name: the re-query and the report
+    // carry it raw.
+    const picker = screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME });
+    await user.selectOptions(
+      picker,
+      within(picker).getByRole('option', { name: formatUntrustedText(component) }),
+    );
+
+    expect(queryOfCall(stub, 2).filter).toEqual({ component });
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(
+      NODE_ID,
+      expect.objectContaining({ component }),
+    );
+
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(1);
+    });
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    // The trigger reports the raw record id.
+    await user.click(
+      within(cellsOf(row).trigger).getByRole('button', {
+        name: formatUntrustedText(bidiTransition.triggerName ?? ''),
+      }),
+    );
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: bidiTransition.triggerEventId,
+    });
+
+    // The chip hands over the very location.
+    await user.click(
+      within(cellsOf(row).component).getByRole('button', {
+        name: sourceLinkAccessibleName({ location: bidiSource, compact: true }),
+      }),
+    );
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toEqual(bidiSource);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]?.file).toContain(RLO);
   });
 });

@@ -7504,6 +7504,460 @@ describe('DevServerLauncher.launch: one child per project', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A child whose credential was rotated or revoked is replaced (AAP §0.5.6)
+// ---------------------------------------------------------------------------
+
+type IsLiveFn = NonNullable<ServerAgentCredentialIssuer['isLive']>;
+
+/** {@link createIssuer}'s double with a liveness answer over a simulated credential store. */
+interface LivenessIssuer extends FakeIssuer {
+  readonly isLive: Mock<IsLiveFn>;
+  /** Deletes every credential the double has issued, as `AuthService.rotateAll` does. */
+  rotate(): void;
+}
+
+/**
+ * An issuer whose `isLive` answers as the access boundary would — `ok(true)`
+ * for a token it issued that was neither revoked nor rotated away, else
+ * `ok(false)` — unless `answer` replaces that answer. Its `revoke` answers
+ * `ok(false)` for a credential already gone, as the access boundary does.
+ */
+function createLivenessIssuer(answer?: IsLiveFn): LivenessIssuer {
+  const issuer = createIssuer();
+  const retired = new Set<string>();
+  const isLive = vi.fn<IsLiveFn>(
+    answer ?? ((input) => ok(issuer.tokens.includes(input.token) && !retired.has(input.token))),
+  );
+  issuer.revoke.mockImplementation((input) => {
+    const present = !retired.has(input.token);
+    retired.add(input.token);
+    return ok(present);
+  });
+  return {
+    ...issuer,
+    credentials: { ...issuer.credentials, isLive },
+    isLive,
+    rotate: () => {
+      for (const token of issuer.tokens) {
+        retired.add(token);
+      }
+    },
+  };
+}
+
+/** The warning a replacement is logged with. */
+const REPLACED_RECORD =
+  "A launched dev server's credential no longer authenticates (rotated or revoked); it is stopped and launched again with a new credential";
+
+/** The warning a liveness check that could not answer is logged with. */
+const UNKNOWN_LIVENESS_RECORD =
+  "Whether a launched dev server's credential still authenticates could not be confirmed; the running dev server is reused";
+
+/** The record {@link DevServerLauncher.credentialsRotated} writes. */
+const ROTATED_RECORD =
+  "The launched dev servers' credentials were rotated away; each is launched again, with a new credential, on its project's next launch";
+
+/** The spawn record of the child with `pid`. */
+function spawnRecordOf(harness: Harness, pid: number): LogRecord | undefined {
+  return harness.records.find(
+    (record) =>
+      record.message === 'Spawned a dev server with the telemetry preload attached' &&
+      record.fields['pid'] === pid,
+  );
+}
+
+describe('DevServerLauncher.launch: a child whose credential was rotated or revoked is replaced', () => {
+  it('stops a child whose credential was rotated away and answers with a replacement holding a new credential', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    const { launch: first, child: stale } = await launchReady(harness);
+    const staleToken = launchedChildToken(harness, 0);
+    issuer.rotate();
+
+    const { launch: second } = await launchReady(harness, {}, 1);
+
+    expect(second).toMatchObject({
+      managed: true,
+      alreadyRunning: false,
+      devServerUrl: DEV_URL,
+      pid: FIRST_PID + 1,
+    });
+    expect(second.pid).not.toBe(first.pid);
+    expect(stale.signals).toEqual(['SIGTERM']);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(2);
+    expect(issuer.issue).toHaveBeenCalledTimes(2);
+    expect(launchedChildToken(harness, 1)).toBe(issuer.tokens[1]);
+    expect(issuer.isLive.mock.calls).toStrictEqual([
+      [{ projectRoot: harness.projectRoot, token: staleToken, credentialId: 'cred-1' }],
+    ]);
+    // The access boundary no longer held the old credential: nothing was left to revoke.
+    expect(issuer.revoke).not.toHaveBeenCalled();
+    expect(harness.launcher.list()).toMatchObject([
+      { pid: FIRST_PID + 1, status: 'ready', credentialId: 'cred-2', sessionIds: [] },
+    ]);
+    const replaced = harness.records.find((record) => record.message === REPLACED_RECORD);
+    expect(replaced?.level).toBe('warn');
+    expect(replaced?.fields).toMatchObject({ projectRoot: harness.projectRoot, pid: FIRST_PID });
+    expect(replaced?.fields).not.toHaveProperty('sessionId');
+    expect(spawnRecordOf(harness, FIRST_PID + 1)?.fields['replacedPid']).toBe(FIRST_PID);
+    expect(serializedRecords(harness.records)).not.toContain(staleToken);
+
+    // The replacement's credential is live: the next launch reuses it.
+    const third = expectOk(await harness.launcher.launch({ projectRoot: harness.projectRoot }));
+    expect(third).toStrictEqual({
+      managed: true,
+      alreadyRunning: true,
+      devServerUrl: DEV_URL,
+      pid: FIRST_PID + 1,
+    });
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(2);
+    expect(issuer.isLive).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses a child whose credential still authenticates, asking the issuer once and spawning nothing', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    const { launch: first, child } = await launchReady(harness, { sessionId: 'ses-alpha' });
+
+    const again = expectOk(
+      await harness.launcher.launch({ projectRoot: harness.projectRoot, sessionId: 'ses-beta' }),
+    );
+
+    expect(again).toStrictEqual({
+      managed: true,
+      alreadyRunning: true,
+      devServerUrl: DEV_URL,
+      pid: first.pid,
+    });
+    expect(issuer.isLive).toHaveBeenCalledTimes(1);
+    expect(child.signals).toEqual([]);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    expect(harness.launcher.list()).toMatchObject([{ sessionIds: ['ses-alpha', 'ses-beta'] }]);
+    expect(harness.records.some((record) => record.message === REPLACED_RECORD)).toBe(false);
+  });
+
+  it.each([
+    { label: 'an Err', answer: (): ReturnType<IsLiveFn> => storeRefusal() },
+    {
+      label: 'a throw',
+      answer: (): ReturnType<IsLiveFn> => {
+        throw new Error('the credential store is busy');
+      },
+    },
+    {
+      label: 'a rejected promise',
+      answer: (): ReturnType<IsLiveFn> => Promise.reject(new Error('the credential store is busy')),
+    },
+    {
+      label: 'a promise of an Err',
+      answer: (): ReturnType<IsLiveFn> => Promise.resolve(storeRefusal()),
+    },
+    {
+      label: 'an answer that is no Result',
+      answer: (): ReturnType<IsLiveFn> => 'maybe' as unknown as ReturnType<IsLiveFn>,
+    },
+  ])(
+    'reuses the child, and says so, when the liveness answer is unknown ($label)',
+    async ({ answer }) => {
+      const issuer = createLivenessIssuer(answer);
+      const harness = createHarness({ issuer });
+      const { launch: first, child } = await launchReady(harness);
+      const token = launchedChildToken(harness);
+
+      const again = expectOk(await harness.launcher.launch({ projectRoot: harness.projectRoot }));
+
+      expect(again).toMatchObject({ managed: true, alreadyRunning: true, pid: first.pid });
+      expect(child.signals).toEqual([]);
+      expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+      const unknown = harness.records.find((record) => record.message === UNKNOWN_LIVENESS_RECORD);
+      expect(unknown?.level).toBe('warn');
+      expect(unknown?.fields).toMatchObject({ projectRoot: harness.projectRoot, pid: first.pid });
+      expect(serializedRecords(harness.records)).not.toContain(token);
+    },
+  );
+
+  it('replaces a child whose renewal found its credential gone, even with an issuer that has no liveness check', async () => {
+    vi.useFakeTimers({ now: FIXED_NOW });
+    const issuer = createIssuer();
+    issuer.renew.mockReturnValueOnce(ok(false));
+    const harness = createHarness({ issuer, deps: { managedCredentialLeaseMs: 900 } });
+    const { child: stale } = await launchReady(harness);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(issuer.renew).toHaveBeenCalledTimes(1);
+    expect(serializedRecords(harness.records)).toContain('no longer exists');
+    vi.useRealTimers();
+
+    const { launch } = await launchReady(harness, {}, 1);
+
+    expect(launch).toMatchObject({ alreadyRunning: false, pid: FIRST_PID + 1 });
+    expect(stale.signals).toEqual(['SIGTERM']);
+    expect(issuer.issue).toHaveBeenCalledTimes(2);
+    // The renewal already found it gone: nothing was left to revoke.
+    expect(issuer.revoke).not.toHaveBeenCalled();
+  });
+
+  it('replaces every child credentialsRotated marked, without asking the issuer, and records it once', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    const { child: stale } = await launchReady(harness);
+    expect(harness.launcher.preloadServesAt(harness.projectRoot, DEV_URL)).toBe(true);
+
+    harness.launcher.credentialsRotated?.();
+    harness.launcher.credentialsRotated?.();
+
+    const rotated = harness.records.filter((record) => record.message === ROTATED_RECORD);
+    expect(rotated).toHaveLength(1);
+    expect(rotated[0]?.fields).toMatchObject({ lapsed: 1 });
+    // No preload is attributed to it any more, and it is still running.
+    expect(harness.launcher.preloadServesAt(harness.projectRoot, DEV_URL)).toBe(false);
+    expect(stale.signals).toEqual([]);
+
+    const { launch } = await launchReady(harness, {}, 1);
+
+    expect(launch).toMatchObject({ alreadyRunning: false, pid: FIRST_PID + 1 });
+    expect(issuer.isLive).not.toHaveBeenCalled();
+    expect(stale.signals).toEqual(['SIGTERM']);
+    expect(harness.launcher.preloadServesAt(harness.projectRoot, DEV_URL)).toBe(true);
+  });
+
+  it.each(['synchronous', 'asynchronous'] as const)(
+    'spawns one replacement for concurrent launches of the project (%s liveness answer)',
+    async (timing) => {
+      const issuer = createLivenessIssuer(() =>
+        timing === 'synchronous' ? ok(false) : Promise.resolve(ok(false)),
+      );
+      const harness = createHarness({ issuer });
+      const { child: stale } = await launchReady(harness, { sessionId: 'ses-alpha' });
+
+      const firstPending = harness.launcher.launch({ projectRoot: harness.projectRoot });
+      const secondPending = harness.launcher.launch({
+        projectRoot: harness.projectRoot,
+        sessionId: 'ses-beta',
+      });
+      const thirdPending = harness.launcher.launch({
+        projectRoot: harness.projectRoot,
+        sessionId: 'ses-gamma',
+      });
+      const replacement = await spawnedChild(harness, firstPending, 1);
+      replacement.print(`   - Local:        ${DEV_ORIGIN}\n`);
+      const [first, second, third] = await Promise.all([firstPending, secondPending, thirdPending]);
+
+      expect(expectOk(first)).toMatchObject({ alreadyRunning: false, pid: FIRST_PID + 1 });
+      for (const joined of [second, third]) {
+        expect(expectOk(joined)).toStrictEqual({
+          managed: true,
+          alreadyRunning: true,
+          devServerUrl: DEV_URL,
+          pid: FIRST_PID + 1,
+        });
+      }
+      expect(harness.spawner.spawn).toHaveBeenCalledTimes(2);
+      expect(issuer.issue).toHaveBeenCalledTimes(2);
+      // The joining launches waited for the one decision instead of asking again.
+      expect(issuer.isLive).toHaveBeenCalledTimes(1);
+      expect(stale.signals).toEqual(['SIGTERM']);
+      expect(harness.records.filter((record) => record.message === REPLACED_RECORD)).toHaveLength(
+        1,
+      );
+      // The old child's owner, then every session that joined the replacement.
+      expect(harness.launcher.list()).toMatchObject([
+        { pid: FIRST_PID + 1, sessionIds: ['ses-alpha', 'ses-beta', 'ses-gamma'] },
+      ]);
+    },
+  );
+
+  it('keeps a session-owned child session-owned: its live owners and the requester own the replacement', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    await launchReady(harness, { sessionId: 'ses-alpha' });
+    expectOk(
+      await harness.launcher.launch({ projectRoot: harness.projectRoot, sessionId: 'ses-beta' }),
+    );
+    // ses-beta ends; the child stays for ses-alpha.
+    expect(expectOk(await harness.launcher.stopForSession('ses-beta'))).toStrictEqual({
+      stopped: 0,
+    });
+    // A session being created against the old child holds it.
+    const staleHold = harness.launcher.acquireForSession(harness.projectRoot);
+    expect(staleHold?.sessionOwned).toBe(true);
+    issuer.rotate();
+
+    const { child: replacement } = await launchReady(harness, { sessionId: 'ses-gamma' }, 1);
+
+    expect(harness.launcher.list()).toMatchObject([
+      { pid: FIRST_PID + 1, sessionId: 'ses-alpha', sessionIds: ['ses-alpha', 'ses-gamma'] },
+    ]);
+    // Like a stop, the replacement carries no hold over: the old one commits
+    // nothing, and the session's creation acquires the replacement instead.
+    expect(staleHold?.commit('ses-delta')).toBe(false);
+    expect(harness.launcher.list()[0]?.sessionIds).toEqual(['ses-alpha', 'ses-gamma']);
+    expect(harness.launcher.acquireForSession(harness.projectRoot)?.commit('ses-delta')).toBe(true);
+
+    for (const owner of ['ses-alpha', 'ses-gamma']) {
+      expect(expectOk(await harness.launcher.stopForSession(owner))).toStrictEqual({ stopped: 0 });
+    }
+    expect(replacement.signals).toEqual([]);
+    expect(expectOk(await harness.launcher.stopForSession('ses-delta'))).toStrictEqual({
+      stopped: 1,
+    });
+    expect(replacement.signals).toEqual(['SIGTERM']);
+    expect(harness.launcher.list()).toEqual([]);
+  });
+
+  it('keeps a developer-owned child developer-owned: no session end stops its replacement', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    await launchReady(harness);
+    issuer.rotate();
+
+    const { child: replacement } = await launchReady(harness, { sessionId: 'ses-alpha' }, 1);
+
+    const [record] = harness.launcher.list();
+    expect(record).toMatchObject({ pid: FIRST_PID + 1, sessionIds: [] });
+    expect(record?.sessionId).toBeUndefined();
+    expect(expectOk(await harness.launcher.stopForSession('ses-alpha'))).toStrictEqual({
+      stopped: 0,
+    });
+    expect(replacement.signals).toEqual([]);
+  });
+
+  it('replaces a session-owned child no live session owns any more with the developer’s own', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    await launchReady(harness, { sessionId: 'ses-alpha' });
+    // Only a pending hold keeps the child once its one session ended.
+    const hold = harness.launcher.acquireForSession(harness.projectRoot);
+    expect(expectOk(await harness.launcher.stopForSession('ses-alpha'))).toStrictEqual({
+      stopped: 0,
+    });
+    issuer.rotate();
+
+    const { child: replacement } = await launchReady(harness, {}, 1);
+
+    expect(harness.launcher.list()).toMatchObject([{ pid: FIRST_PID + 1, sessionIds: [] }]);
+    // Releasing the old hold stops nothing: the replacement is nobody's session's.
+    await hold?.release();
+    expect(replacement.signals).toEqual([]);
+    expect(harness.launcher.list()).toMatchObject([{ pid: FIRST_PID + 1, status: 'ready' }]);
+  });
+
+  it('refuses a command the policy refuses before the stale child is checked or touched', async () => {
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({ issuer });
+    const { child: stale } = await launchReady(harness);
+    issuer.rotate();
+
+    expectErr(
+      await harness.launcher.launch({ projectRoot: harness.projectRoot, command: 'rm -rf /' }),
+      'DEV_SERVER_LAUNCH_FAILED',
+      'executable-not-allowed',
+    );
+
+    expect(issuer.isLive).not.toHaveBeenCalled();
+    expect(stale.signals).toEqual([]);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    expect(issuer.issue).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a stop of the project cancel a replacement still waiting for the liveness answer', async () => {
+    const answer = deferred<Result<boolean, DebuggenError>>();
+    const issuer = createLivenessIssuer(() => answer.promise);
+    const harness = createHarness({ issuer });
+    const { child: stale } = await launchReady(harness);
+
+    const relaunching = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    const stopping = harness.launcher.stop({ projectRoot: harness.projectRoot });
+    answer.resolve(ok(false));
+
+    expectErr(await relaunching, 'DEV_SERVER_LAUNCH_FAILED', 'cancelled');
+    expect(expectOk(await stopping)).toStrictEqual({ stopped: true });
+    expect(stale.signals).toEqual(['SIGTERM']);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    expect(issuer.issue).toHaveBeenCalledTimes(1);
+    expect(harness.launcher.list()).toEqual([]);
+  });
+
+  it('launches afresh, owning nothing of the old child, when the child exits while its credential is checked', async () => {
+    const answer = deferred<Result<boolean, DebuggenError>>();
+    const issuer = createLivenessIssuer(() => answer.promise);
+    const harness = createHarness({ issuer });
+    const { child: exiting } = await launchReady(harness, { sessionId: 'ses-alpha' });
+
+    const relaunching = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    exiting.finish(0, null);
+    answer.resolve(ok(true));
+    const successor = await spawnedChild(harness, relaunching, 1);
+    successor.print(`   - Local:        ${DEV_ORIGIN}\n`);
+
+    expect(expectOk(await relaunching)).toMatchObject({
+      alreadyRunning: false,
+      pid: FIRST_PID + 1,
+    });
+    // An exit is no replacement: the new child is what this launch alone asked for.
+    expect(harness.launcher.list()).toMatchObject([{ pid: FIRST_PID + 1, sessionIds: [] }]);
+    expect(harness.records.some((record) => record.message === REPLACED_RECORD)).toBe(false);
+  });
+
+  it('refuses the launch when a stop by pid left the child a survivor while its credential was checked', async () => {
+    vi.useFakeTimers();
+    const answer = deferred<Result<boolean, DebuggenError>>();
+    const issuer = createLivenessIssuer(() => answer.promise);
+    const harness = createHarness({
+      issuer,
+      children: [{ killThrows: true }],
+      deps: { stopGraceMs: 100 },
+    });
+    const { child } = await launchReady(harness);
+
+    const relaunching = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    const stopping = harness.launcher.stop({ pid: FIRST_PID });
+    await vi.advanceTimersByTimeAsync(100 + 2_000);
+    expectErr(await stopping, 'DEV_SERVER_LAUNCH_FAILED', 'survived-termination');
+    answer.resolve(ok(true));
+    await vi.advanceTimersByTimeAsync(100 + 2_000);
+
+    expectErr(await relaunching, 'DEV_SERVER_LAUNCH_FAILED', 'survived-termination');
+    // It was tried once more, and its record was never replaced.
+    expect(child.signals).toEqual(['SIGTERM', 'SIGKILL', 'SIGTERM', 'SIGKILL']);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    expect(harness.launcher.list()).toMatchObject([{ pid: FIRST_PID, status: 'failed' }]);
+  });
+
+  it('refuses the launch with survived-termination when the stale child outlives its termination', async () => {
+    vi.useFakeTimers();
+    const issuer = createLivenessIssuer();
+    const harness = createHarness({
+      issuer,
+      children: [{ killThrows: true }],
+      deps: { stopGraceMs: 100 },
+    });
+    const { child: stale } = await launchReady(harness);
+    issuer.rotate();
+
+    const relaunching = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    // The grace period, then the bounded wait for an exit after SIGKILL.
+    await vi.advanceTimersByTimeAsync(100 + 2_000);
+    const refused = expectErr(
+      await relaunching,
+      'DEV_SERVER_LAUNCH_FAILED',
+      'survived-termination',
+    );
+
+    expect(refused.details).toMatchObject({ pid: FIRST_PID, pids: [FIRST_PID] });
+    expect(stale.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    expect(issuer.issue).toHaveBeenCalledTimes(1);
+    expect(harness.launcher.list()).toMatchObject([{ pid: FIRST_PID, status: 'failed' }]);
+
+    // Once its exit is observed, the next launch starts the replacement.
+    stale.finish(null, 'SIGKILL');
+    vi.useRealTimers();
+    const { launch } = await launchReady(harness, {}, 1);
+    expect(launch).toMatchObject({ alreadyRunning: false, pid: FIRST_PID + 1 });
+  });
+});
+
 describe('DevServerLauncher.launch: a refused command is refused whichever path the launch takes', () => {
   it.each([
     { label: 'a destructive program', command: 'rm -rf /', reason: 'executable-not-allowed' },
@@ -8880,6 +9334,49 @@ describe('serverAgentCredentialIssuer over the real access boundary', () => {
       expect(expectOk(await harness.launcher.releaseCredential({ token: minted.token }))).toEqual({
         released: false,
       });
+    } finally {
+      boundary.release();
+    }
+  });
+
+  it('answers isLive from the store — true while the child credential lives, false once rotateAll removed it — so the next launch replaces the child', async () => {
+    const boundary = openBoundary(() => FIXED_NOW);
+    try {
+      const { auth } = boundary;
+      const issuer = serverAgentCredentialIssuer(auth);
+      const harness = createHarness({ deps: { credentials: issuer } });
+      /** The adapter's own liveness answer for `token`. */
+      const liveness = async (token: string): Promise<boolean> => {
+        const answer = await issuer.isLive?.({ projectRoot: harness.projectRoot, token });
+        if (answer === undefined) {
+          throw new Error('the access-boundary adapter has no liveness check');
+        }
+        return expectOk(answer);
+      };
+      const { child: stale } = await launchReady(harness);
+      const staleToken = launchedChildToken(harness);
+
+      expect(await liveness(staleToken)).toBe(true);
+      expect(await liveness('not a credential')).toBe(false);
+
+      expectOk(auth.rotateAll());
+      expect(await liveness(staleToken)).toBe(false);
+      expect(principalOf(auth, staleToken)).toBeUndefined();
+
+      const { launch } = await launchReady(harness, {}, 1);
+      expect(launch).toMatchObject({ alreadyRunning: false, pid: FIRST_PID + 1 });
+      expect(stale.signals).toEqual(['SIGTERM']);
+      const freshToken = launchedChildToken(harness, 1);
+      expect(freshToken).not.toBe(staleToken);
+      expect(await liveness(freshToken)).toBe(true);
+      expect(principalOf(auth, freshToken)?.expiresAt).toBe(
+        FIXED_NOW + DEFAULT_MANAGED_CREDENTIAL_LEASE_MS,
+      );
+
+      // The replacement's credential is live, so it is reused.
+      const again = expectOk(await harness.launcher.launch({ projectRoot: harness.projectRoot }));
+      expect(again).toMatchObject({ alreadyRunning: true, pid: FIRST_PID + 1 });
+      expect(harness.spawner.spawn).toHaveBeenCalledTimes(2);
     } finally {
       boundary.release();
     }

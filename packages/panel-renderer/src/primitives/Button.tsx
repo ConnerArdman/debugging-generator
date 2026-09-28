@@ -111,6 +111,22 @@
  * the `aria-hidden` icon box become the name — an icon is never the accessible
  * name (AAP 0.6.4).
  *
+ * ## What is on screen is the logical text
+ *
+ * A button's label is often untrusted — an evidence chip names a captured
+ * event, a row's expand control names its request — and an invisible Unicode
+ * direction control in it (U+202E and its eleven siblings) would draw the
+ * glyphs after it in an order that was never captured. Every string in the
+ * label and the icon, and a string `title` or `aria-label`, is therefore
+ * rendered through `formatUntrustedNode`/`formatUntrustedText` from
+ * `./untrusted-text` — the one helper this primitive imports from its folder, a
+ * pure function over strings — which print each control as its visible escape
+ * (`\u202E`) and change nothing else. That is the guarantee that the glyphs
+ * shown are the characters given, in the order given, and it keeps the visible
+ * label, the tooltip and the accessible name one text (WCAG 2.5.3). The
+ * accessible-name check above reads the props as the caller passed them:
+ * revealing changes what is rendered, never whether a control is named.
+ *
  * ## Presentational only
  *
  * The component raises `onClick` and renders. It never fetches, never opens a
@@ -121,6 +137,8 @@
 
 import { clsx } from 'clsx';
 import type { ButtonHTMLAttributes, ReactElement, ReactNode, Ref } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
 
 /**
  * The visual weights of the design system's button, in descending prominence.
@@ -678,8 +696,8 @@ export function Button(props: ButtonProps): ReactElement {
   }: ButtonResolvedProps = props;
 
   // Read the ARIA naming attributes off `props` instead of destructuring them:
-  // left in `rest`, they reach the element unchanged, and this component only
-  // needs to know WHETHER the caller named the control.
+  // left in `rest`, they reach the element (`aria-label` revealed, below), and
+  // this component only needs to know WHETHER the caller named the control.
   const namedByCaller =
     namesSomething(props['aria-label']) || namesSomething(props['aria-labelledby']);
 
@@ -700,9 +718,17 @@ export function Button(props: ButtonProps): ReactElement {
   const showVisibleLabel = !iconOnly && hasLabelContent;
   const showHiddenLabel = iconOnly && !namedByCaller && hasLabelContent;
 
+  // Only what is rendered is revealed; every decision above read the props as
+  // given. The two string attributes are written after `rest` so the revealed
+  // value replaces the raw one it carried, and an absent attribute stays absent.
+  const label = props['aria-label'];
+  const shown = formatUntrustedNode(children);
+
   return (
     <button
       {...rest}
+      title={props.title === undefined ? props.title : formatUntrustedText(props.title)}
+      aria-label={label === undefined ? label : formatUntrustedText(label)}
       ref={ref}
       type={type}
       disabled={disabled}
@@ -718,11 +744,11 @@ export function Button(props: ButtonProps): ReactElement {
     >
       {isRenderable(icon) ? (
         <span className="dg-button__icon" aria-hidden="true">
-          {icon}
+          {formatUntrustedNode(icon)}
         </span>
       ) : null}
-      {showVisibleLabel ? <span className="dg-button__label">{children}</span> : null}
-      {showHiddenLabel ? <span className="dg-visually-hidden">{children}</span> : null}
+      {showVisibleLabel ? <span className="dg-button__label">{shown}</span> : null}
+      {showHiddenLabel ? <span className="dg-visually-hidden">{shown}</span> : null}
     </button>
   );
 }

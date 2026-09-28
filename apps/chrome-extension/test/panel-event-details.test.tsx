@@ -34,6 +34,13 @@
  * shorter cut never does. The scan is cycle-safe, bounded and total, and every
  * value renders byte-for-byte whatever the verdict.
  *
+ * And the drawer's presentation of hostile captured text (QA-SEC F02): an
+ * event whose name, attribute key and values, request URL, statement, source
+ * location and ancestor carry markup and a right-to-left override pair renders
+ * it as text, each direction control printed as its visible `\u202E`-style
+ * escape and every code-like value isolated left-to-right, while the Source
+ * chip and the ancestor buttons still hand the raw captured values on.
+ *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom). Every fixture value is neutral
  * vocabulary written for this suite (AAP 0.5.4).
@@ -44,6 +51,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
 
+import { containsDirectionControl } from '@debuggen/panel-renderer';
 import type { TelemetryEvent } from '@debuggen/protocol';
 import type { SourceLocation } from '@debuggen/shared';
 
@@ -938,5 +946,170 @@ describe('EventDetails attributes — values the privacy layer replaced', () => 
 
     expectRedactionMarking(['header'], ['unreadable']);
     expect(within(attributeRow('unreadable')).getByText(UNSERIALISABLE_LABEL)).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hostile captured text: markup and direction controls (QA-SEC F02)
+// ---------------------------------------------------------------------------
+
+/**
+ * The label QA-SEC F02 ingested: markup wrapped in U+202E RIGHT-TO-LEFT
+ * OVERRIDE and U+202C POP DIRECTIONAL FORMATTING, which drew its tail reversed
+ * while `textContent` stayed logical.
+ */
+const BIDI_LABEL = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** The same label as the drawer prints it: each control as its visible escape. */
+const REVEALED_LABEL = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** An attribute key carrying the label, and the key as its row header shows it. */
+const BIDI_KEY = `qa.${BIDI_LABEL}`;
+const REVEALED_KEY = `qa.${REVEALED_LABEL}`;
+
+/** A request URL and a statement carrying the label, raw and as displayed. */
+const BIDI_URL = `https://shop.example.test/api/items?label=${BIDI_LABEL}`;
+const REVEALED_URL = `https://shop.example.test/api/items?label=${REVEALED_LABEL}`;
+const BIDI_SQL = `SELECT name FROM item WHERE label = '${BIDI_LABEL}'`;
+const REVEALED_SQL = `SELECT name FROM item WHERE label = '${REVEALED_LABEL}'`;
+
+/** Where the hostile event was resolved: a file and a symbol carrying the label. */
+const BIDI_SOURCE: SourceLocation = {
+  file: `src/server/${BIDI_LABEL}.ts`,
+  line: 12,
+  column: 3,
+  symbol: BIDI_LABEL,
+  resolvedBy: 'patch',
+  confidence: 1,
+};
+
+/** The hostile event's parent, whose own name carries the label. */
+const BIDI_PARENT: TelemetryEvent = { ...MIDDLE_EVENT, name: BIDI_LABEL };
+
+/**
+ * The selected server span: its name, one attribute key, three attribute
+ * values (a note, a request URL, a statement) and its source location all
+ * carry {@link BIDI_LABEL}, exactly as the service stores it.
+ */
+const BIDI_EVENT: TelemetryEvent = {
+  ...LEAF_EVENT,
+  name: BIDI_LABEL,
+  attributes: {
+    'qa.note': BIDI_LABEL,
+    'http.url': BIDI_URL,
+    'db.statement': BIDI_SQL,
+    [BIDI_KEY]: 'plain value',
+  },
+  source: BIDI_SOURCE,
+};
+
+/**
+ * Asserts that no text a reader sees, hovers or hears under `root` carries a
+ * raw direction control: its text content, and every attribute but the
+ * `data-*` ones, which are data rather than presentation and keep raw values
+ * by contract.
+ *
+ * @param root The subtree to read; the document body, so a portalled tooltip
+ *   is read too.
+ */
+function expectNoRawDirectionControl(root: Element): void {
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of [root, ...root.querySelectorAll('*')]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-')) {
+        expect(
+          containsDirectionControl(attribute.value),
+          `${element.tagName.toLowerCase()}[${attribute.name}]`,
+        ).toBe(false);
+      }
+    }
+  }
+}
+
+/**
+ * Asserts that the value of `key`'s row prints `shown` and sits in a
+ * left-to-right isolate, so the surrounding row cannot reorder it either.
+ *
+ * @param key The attribute key as its row header shows it.
+ * @param shown The value as the drawer must print it.
+ */
+function expectIsolatedValue(key: string, shown: string): void {
+  expect(renderedValue(key)).toBe(shown);
+  const value = within(attributeRow(key)).getAllByText(
+    (_content, element) => element?.tagName === 'CODE',
+  );
+  expect(value.at(-1)?.closest('[dir="ltr"]')).not.toBeNull();
+}
+
+describe('EventDetails — hostile captured text', () => {
+  it('prints each direction control as its visible escape in every field, and nowhere raw', () => {
+    // The fixture is hostile: the raw controls are in the event the drawer receives.
+    expect(containsDirectionControl(BIDI_EVENT.name)).toBe(true);
+    renderDrawer({
+      event: BIDI_EVENT,
+      ancestry: { state: 'complete', ancestors: [ROOT_EVENT, BIDI_PARENT] },
+      onSelectEvent: vi.fn(),
+    });
+
+    // The name, and the chain's current item naming it.
+    const name = screen.getAllByText(REVEALED_LABEL).find((element) => element.tagName === 'P');
+    expect(name?.textContent).toBe(REVEALED_LABEL);
+    const items = chainItems(parentChainRegion());
+    expect(items).toHaveLength(3);
+    expect(within(items[1] as HTMLElement).getByRole('button').textContent).toContain(
+      REVEALED_LABEL,
+    );
+    expect(items[2]?.textContent).toContain(REVEALED_LABEL);
+
+    // The attributes: the hostile key, and three values in both `Code` forms.
+    expect(renderedValue(REVEALED_KEY)).toBe('plain value');
+    expectIsolatedValue('qa.note', REVEALED_LABEL);
+    expectIsolatedValue('http.url', REVEALED_URL);
+    expectIsolatedValue('db.statement', REVEALED_SQL);
+
+    // The Source chip's visible text and accessible name.
+    const chip = within(screen.getByRole('region', { name: 'Source' })).getByRole('button', {
+      name: /QA_BIDI/u,
+    });
+    expect(chip.getAttribute('aria-label')).toContain('\\u202E');
+    expect(chip.textContent).toContain('\\u202C');
+
+    // The markup stayed text: nothing was parsed out of it.
+    expect(document.querySelector('script')).toBeNull();
+    expect(document.querySelector('td')).toBeNull();
+    expectNoRawDirectionControl(document.body);
+  });
+
+  it('opens the source and selects the ancestor with the raw captured values', async () => {
+    const user = userEvent.setup();
+    const onOpenSource = vi.fn();
+    const onSelectEvent = vi.fn();
+    renderDrawer({
+      event: BIDI_EVENT,
+      ancestry: { state: 'complete', ancestors: [ROOT_EVENT, BIDI_PARENT] },
+      onOpenSource,
+      onSelectEvent,
+    });
+
+    await user.click(
+      within(screen.getByRole('region', { name: 'Source' })).getByRole('button', {
+        name: /QA_BIDI/u,
+      }),
+    );
+    expect(onOpenSource).toHaveBeenCalledTimes(1);
+    // The very location the event carried, its file and symbol still raw.
+    expect(onOpenSource.mock.calls[0]?.[0]).toBe(BIDI_SOURCE);
+    expect(onOpenSource).toHaveBeenCalledWith(
+      expect.objectContaining({ file: `src/server/${BIDI_LABEL}.ts`, symbol: BIDI_LABEL }),
+    );
+
+    await user.click(within(parentChainRegion()).getByRole('button', { name: /QA_BIDI/u }));
+    expect(onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_PARENT.id,
+      traceId: TRACE_ID,
+      spanId: MIDDLE_SPAN,
+      kind: 'fetch',
+    });
   });
 });

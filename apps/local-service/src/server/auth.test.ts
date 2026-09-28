@@ -4153,6 +4153,100 @@ describe('releasing a POST /dev-server/credential credential', () => {
   });
 });
 
+describe('whether a server-agent credential is still live', () => {
+  /** The access boundary's liveness answer for `token`. */
+  function isLive(token: string): boolean {
+    return expectOk(harness.auth.serverAgentCredentialIsLive(token));
+  }
+
+  it('answers true for a live server-agent credential — bounded, unbounded or a launched child’s lease — and changes nothing', () => {
+    const bounded = serverAgentToken(projectPath('alpha'), harness.clock.now + 60_000);
+    const unbounded = serverAgentToken(projectPath('alpha'));
+    const leased = remember(
+      expectOk(
+        harness.auth.issueServerAgentCredential({
+          projectRoot: projectPath('beta'),
+          expiresAt: harness.clock.now + 60_000,
+          lease: true,
+        }),
+      ).token,
+    );
+    const rowsBefore = credentialRows();
+
+    for (const token of [bounded, unbounded, leased]) {
+      expect(isLive(token)).toBe(true);
+    }
+
+    // Read-only: no row changed and no socket was closed.
+    expect(credentialRows()).toEqual(rowsBefore);
+    expect(harness.revoker.calls).toEqual([]);
+  });
+
+  it('answers false for a missing, revoked, expired, malformed or unreadable credential and for another role’s', () => {
+    const expiring = serverAgentToken(projectPath('alpha'), harness.clock.now + 1_000);
+    const revoked = serverAgentToken(projectPath('alpha'));
+    expect(expectOk(harness.auth.revokeServerAgentCredential(revoked))).toBe(true);
+    const unreadable = serverAgentToken(projectPath('alpha'));
+    harness.store.db
+      .prepare('UPDATE credentials SET scope = ? WHERE token_hash = ?')
+      .run(JSON.stringify({ kind: 'workspace' }), sha256Hex(unreadable));
+    const unknown = remember(cryptoRandomBytes(CREDENTIAL_TOKEN_BYTES).toString('base64url'));
+    const oversized = 'x'.repeat((clientHelloPayloadSchema.shape.token.maxLength ?? 0) + 1);
+    const editor = editorToken();
+    const devtools = pairDevtools();
+    harness.clock.advance(1_000);
+    const rowsBefore = credentialRows();
+
+    const cases: Readonly<Record<string, string>> = {
+      empty: '',
+      oversized,
+      unknown,
+      revoked,
+      expired: expiring,
+      unreadable,
+      editor,
+      devtools,
+    };
+    for (const [label, token] of Object.entries(cases)) {
+      expect(isLive(token), label).toBe(false);
+    }
+
+    // Read-only: the expired row is left to the expiry sweep, the others in place.
+    expect(credentialRows()).toEqual(rowsBefore);
+    expectOk(authorize('session.list', editor));
+  });
+
+  it('answers false for every server-agent credential once rotateAll ran, and true for one issued after it', () => {
+    const before = serverAgentToken(projectPath('alpha'), harness.clock.now + 60_000);
+    expect(isLive(before)).toBe(true);
+
+    expectOk(harness.auth.rotateAll());
+
+    expect(isLive(before)).toBe(false);
+    // The rotation's new editor credential is live, but it is no server agent.
+    expect(isLive(remember(readAuthFile(harness.config).token))).toBe(false);
+    const after = serverAgentToken(projectPath('alpha'), harness.clock.now + 60_000);
+    expect(isLive(after)).toBe(true);
+  });
+
+  it('reports a store it cannot read as STORE_ERROR — an unknown answer, never a retired credential', () => {
+    const token = serverAgentToken(projectPath('alpha'));
+    harness.store.close();
+
+    expectFailure(harness.auth.serverAgentCredentialIsLive(token), 'STORE_ERROR');
+  });
+
+  it('writes no log record, so neither the token nor its digest can reach one', () => {
+    const live = serverAgentToken(projectPath('alpha'));
+    const firstLine = capturedLogLines.length;
+
+    expect(isLive(live)).toBe(true);
+    expect(isLive('')).toBe(false);
+
+    expect(capturedLogLines.slice(firstLine)).toEqual([]);
+  });
+});
+
 /* =================================================================================================
  * Rotation across auth.json and the store
  * ============================================================================================== */

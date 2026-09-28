@@ -32,6 +32,9 @@
  *     selection loses the inserted characters again.
  *   - **The states and their precedence:** error > pending > empty > analysis.
  *     A failure is never shaped like an observed fact (AAP 0.5.5).
+ *   - **Direction controls are shown, never obeyed.** A U+202E/U+202C pair in
+ *     a statement, an evidence label, a suggested location or an error prints
+ *     as visible escapes, while `onOpenSource` receives the raw location.
  *   - **Privacy.** Nothing is ever written to the console in any state (AAP
  *     0.5.2): findings are rendered, never logged.
  *
@@ -895,5 +898,106 @@ describe('AnalysisSummary privacy', () => {
       error: spies.error.mock.calls.length,
       debug: spies.debug.mock.calls.length,
     }).toEqual({ log: 0, info: 0, warn: 0, error: 0, debug: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Direction controls
+// ---------------------------------------------------------------------------
+
+describe('AnalysisSummary direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) around markup.
+   * Escaping keeps the markup inert, but the override alone would draw the text
+   * between them backwards, so a fact would read as something never observed.
+   * Every code point is written as an escape so this suite is not a carrier.
+   */
+  const SPOOF = '\u202E</td><script>alert(7)</script>\u202C';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * What a reader must see: each control of {@link SPOOF} printed as its
+   * visible escape and every other character untouched. Spelled out here
+   * rather than by calling the formatter, so the suite pins the output.
+   */
+  function revealed(text: string): string {
+    return text.replaceAll('\u202E', '\\u202E').replaceAll('\u202C', '\\u202C');
+  }
+
+  const FACT = `The span ${SPOOF} accounted for 640 ms of the interaction.`;
+  const CAUSE = `The handler ${SPOOF} may issue one query per item.`;
+  const LOCATION: SourceLocation = {
+    ...SUGGESTED_LOCATION,
+    file: `src/spoof/${SPOOF}.ts`,
+    symbol: `run${SPOOF}`,
+  };
+
+  /** An analysis whose statements, evidence labels and location carry the spoof. */
+  function spoofedAnalysis(): AnalysisResult {
+    return makeAnalysis({
+      observed: [
+        { statement: FACT, evidence: [{ eventId: 'evt-sample-001', label: `span ${SPOOF}` }] },
+      ],
+      likelyCauses: [
+        {
+          statement: CAUSE,
+          evidence: [{ eventId: 'evt-sample-002', label: `request ${SPOOF}` }],
+          confidence: 'high',
+          suggestedLocation: LOCATION,
+        },
+      ],
+    });
+  }
+
+  /**
+   * A statement as a reader sees it, less the U+200B break opportunities the
+   * component inserts into long runs (see the module header).
+   */
+  function shown(statements: readonly string[]): string[] {
+    return statements.map((statement) => statement.replaceAll('\u200B', ''));
+  }
+
+  it('shows each control as a visible escape in facts, causes, chips and the source chip', () => {
+    const { container } = render(
+      <AnalysisSummary analysis={spoofedAnalysis()} onOpenSource={vi.fn()} />,
+    );
+
+    expect(shown(statementsIn(observedRegion()))).toEqual([revealed(FACT)]);
+    expect(shown(statementsIn(causesRegion()))).toEqual([revealed(CAUSE)]);
+
+    const chips = Array.from(container.querySelectorAll<HTMLElement>('[data-event-id]'));
+    expect(chips.map((chip) => chip.textContent ?? '').join(' ')).toContain('\\u202E');
+    expect(container.querySelector('.dg-source-link')?.textContent).toContain('\\u202C');
+
+    expect(container.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(container.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        // Keys and `data-*` attributes stay raw; none of this fixture's carries a control.
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+  });
+
+  it('raises onOpenSource with the raw suggested location, controls included', async () => {
+    const user = userEvent.setup();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+    render(<AnalysisSummary analysis={spoofedAnalysis()} onOpenSource={onOpenSource} />);
+
+    await user.click(within(causesRegion()).getByRole('button'));
+
+    expect(onOpenSource.mock.calls).toEqual([[LOCATION]]);
+    expect(onOpenSource.mock.calls[0]?.[0].file).toMatch(RAW_CONTROL);
+  });
+
+  it('shows the controls of an error message as visible escapes', () => {
+    render(<AnalysisSummary error={`Analysis failed: ${SPOOF}`} />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(revealed(`Analysis failed: ${SPOOF}`));
+    expect(alert.textContent).not.toMatch(RAW_CONTROL);
   });
 });

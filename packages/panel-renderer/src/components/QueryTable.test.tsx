@@ -109,11 +109,13 @@ import { DESIGN_TOKENS, cssVar } from '../tokens/tokens';
 import type { TokenKey, TokenValues } from '../tokens/tokens';
 import {
   NOT_AVAILABLE_LABEL,
+  containsDirectionControl,
   formatCompactPath,
   formatCount,
   formatDuration,
   formatOffset,
   formatStatusLabel,
+  formatUntrustedText,
   oneLinePreview,
 } from '../utils/format';
 import { QueryTable } from './QueryTable';
@@ -4072,5 +4074,187 @@ describe('QueryTable shared selection', () => {
     await user.click(occurrenceButton(1));
     expect(markedOccurrences()).toEqual([1]);
     expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * A statement, a caller's span name, an engine name and a location are captured
+ * text, and an invisible right-to-left override (U+202E) in one of them draws
+ * the characters after it backwards: the QA report's `</td><script>alert(?)`
+ * was escaped yet read reversed. Every place this table puts such text — the
+ * preview, the full and grouping statements, the disclosure's name, the callers,
+ * the source chips, the grid's name — prints each control as its visible escape
+ * (`\u202E`); a short statement is not treated as abbreviated merely because it
+ * carries one; and every value handed back to the host stays as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered tree.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('QueryTable direction controls', () => {
+  const bidiStatement = `SELECT '${RLO}</td><script>alert(?)</script>${PDF}' FROM example_items WHERE id = $1`;
+  const bidiNormalized = `SELECT ? FROM example_items WHERE id = ? -- ${RLO}grouped`;
+
+  /** A location whose path and symbol both carry a control. */
+  const bidiSource: SourceLocation = {
+    ...BASE_SOURCE,
+    file: `src/example/${RLO}repository.ts`,
+    symbol: `load${RLO}Items`,
+  };
+
+  const bidiOccurrence = makeOccurrence({
+    id: `event-${RLO}example-0001`,
+    startTime: BASE_START_MS + 12,
+    rowCount: 24,
+    source: bidiSource,
+  });
+
+  const bidiGroup = makeQueryGroup({
+    id: `query-${RLO}example`,
+    statement: bidiStatement,
+    normalizedStatement: bidiNormalized,
+    system: `postgre${RLO}sql`,
+    callers: [
+      makeCaller({ name: `example${RLO}Repository.load`, source: bidiSource }),
+      makeCaller({ id: 'caller-example-0002', name: `example${RLO}Worker`, executionCount: 1 }),
+    ],
+    occurrences: [bidiOccurrence],
+    occurrencesTruncated: false,
+  });
+
+  it('prints every control as its escape and keeps the markup inert', async () => {
+    const stub = resolvingProvider([bidiGroup]);
+    const user = userEvent.setup();
+    const title = `Queries ${RLO}issued`;
+
+    renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('grid', { name: formatUntrustedText(title) });
+
+    // The preview is the whole statement, revealed; a control alone does not
+    // make it abbreviated, so it is neither a tooltip trigger nor focusable.
+    const [preview] = within(dataRow(0))
+      .getByRole('rowheader')
+      .querySelectorAll<HTMLElement>('code.dg-query-table__statement');
+    if (preview === undefined) {
+      throw new Error('the row header carries no statement cell');
+    }
+    expect(preview.textContent).toBe(formatUntrustedText(bidiStatement));
+    expect(preview.textContent).toContain(RLO_MARKER);
+    expect(preview.getAttribute('tabindex')).toBeNull();
+    expect(preview.closest('.dg-tooltip')).toBeNull();
+
+    // The disclosure names the revealed preview, and opens the detail.
+    await user.click(screen.getByRole('button', { name: expandRowName(bidiStatement) }));
+
+    const detail = detailRow();
+    expect(statementBlocks(detail).map((block) => block.textContent)).toEqual([
+      formatUntrustedText(bidiStatement),
+      formatUntrustedText(bidiNormalized),
+    ]);
+
+    // Nothing a reader sees, hovers or hears carries a raw control, and the
+    // markup inside the statement is only text.
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+    expect(document.body.querySelector('script, td')).toBeNull();
+    expect(document.body.textContent).toContain(`via example${RLO_MARKER}Repository.load`);
+    expect(document.body.textContent).toContain(`postgre${RLO_MARKER}sql`);
+    expect(
+      within(dataRow(0)).getByRole('button', {
+        name: sourceLinkAccessibleName({ location: bidiSource }),
+      }).textContent,
+    ).toContain(RLO_MARKER);
+  });
+
+  it('still discloses a long statement with a control through its tooltip', async () => {
+    const long = `${LONG_STATEMENT} ${RLO}tail`;
+    const stub = resolvingProvider([makeQueryGroup({ statement: long })]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Shortened, so the whole statement — revealed — is the preview's tooltip.
+    expect(collapsedStatement(dataRow(0))).toBe(oneLinePreview(long));
+    const preview = within(dataRow(0))
+      .getByRole('rowheader')
+      .querySelector<HTMLElement>('code.dg-query-table__statement');
+    const bubble = preview?.closest('.dg-tooltip')?.querySelector('[role="tooltip"]');
+    expect(preview?.getAttribute('tabindex')).toBe('-1');
+    expect(bubble?.textContent).toBe(formatUntrustedText(long));
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+  });
+
+  it('hands the host the raw location and the raw event id', async () => {
+    const stub = resolvingProvider([bidiGroup]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await user.click(
+      within(dataRow(0)).getByRole('button', {
+        name: sourceLinkAccessibleName({ location: bidiSource }),
+      }),
+    );
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const opened = spies.onOpenSource.mock.calls[0]?.[0];
+    expect(opened).toEqual(bidiSource);
+    expect(opened?.file).toBe(bidiSource.file);
+
+    await user.click(screen.getByRole('button', { name: expandRowName(bidiStatement) }));
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, bidiGroup.id, true);
+
+    await user.click(
+      within(detailRow()).getByRole('button', {
+        name: `Select the execution at +${formatOffset(bidiOccurrence.startTime, bidiGroup.firstStartTime)}`,
+      }),
+    );
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls[0]?.[0]).toEqual({
+      eventId: bidiOccurrence.eventId,
+      spanId: bidiOccurrence.spanId,
+      traceId: bidiOccurrence.traceId,
+    });
+    expect(containsDirectionControl(bidiOccurrence.eventId)).toBe(true);
   });
 });

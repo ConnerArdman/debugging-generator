@@ -318,6 +318,7 @@ const HTTP_OK = 200;
 const HTTP_BAD_REQUEST = 400;
 const HTTP_FORBIDDEN = 403;
 const HTTP_NOT_FOUND = 404;
+const HTTP_METHOD_NOT_ALLOWED = 405;
 const HTTP_CONFLICT = 409;
 const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_UNAVAILABLE = 503;
@@ -2908,6 +2909,10 @@ interface RawUpgradeOptions {
   readonly origin?: string | undefined;
   /** The `Sec-WebSocket-Key`; omitted, a valid random one. */
   readonly key?: string | undefined;
+  /** The request method; omitted, `GET`. */
+  readonly method?: string | undefined;
+  /** The `Sec-WebSocket-Version`; omitted, `13`. */
+  readonly version?: string | undefined;
   /** The peer the admission rig's relay presents the upgrade under. */
   readonly peer?: string | undefined;
 }
@@ -2963,11 +2968,11 @@ function rawUpgrade(
     }, HARNESS_TIMEOUTS.message);
     socket.on('connect', () => {
       const lines = [
-        `GET ${options.path ?? WS_PATH} HTTP/1.1`,
+        `${options.method ?? 'GET'} ${options.path ?? WS_PATH} HTTP/1.1`,
         `Host: ${host}:${String(port)}`,
         'Connection: Upgrade',
         'Upgrade: websocket',
-        'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Version: ${options.version ?? '13'}`,
         `Sec-WebSocket-Key: ${options.key ?? randomBytes(16).toString('base64')}`,
         ...(options.origin === undefined ? [] : [`Origin: ${options.origin}`]),
         ...(options.peer === undefined ? [] : [`${PEER_HEADER}: ${options.peer}`]),
@@ -3010,14 +3015,19 @@ function rawUpgrade(
 
 /**
  * Asserts a bare refusal of the upgrade gate: the status, a closed
- * connection, and exactly the constant headers — `nosniff`, `no-store`, an
- * empty body and, for an admission refusal, `Retry-After` — so nothing else,
- * and nothing the client sent, is in the answer.
+ * connection, and exactly the constant headers — `nosniff`, `no-store`,
+ * `X-Frame-Options: DENY`, the CSP
+ * `default-src 'none'; frame-ancestors 'none'`, an empty body and, for an
+ * admission refusal, `Retry-After`, and for a handshake `ws` refused, the
+ * `extra` hints it names (`Allow`, `Sec-WebSocket-Version`) — so nothing
+ * else, and nothing the client sent, is in the answer. The values are the
+ * literals the HTTP application's replies are held to.
  */
 function expectBareRefusal(
   response: RawUpgradeResponse,
   status: number,
   retryAfter: string | undefined,
+  extra: Readonly<Record<string, string>> = {},
 ): void {
   expect(response.status, response.head).toBe(status);
   expect(response.closedByService).toBe(true);
@@ -3026,7 +3036,10 @@ function expectBareRefusal(
     'content-length': '0',
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
     ...(retryAfter === undefined ? {} : { 'retry-after': retryAfter }),
+    ...extra,
   });
 }
 
@@ -3517,8 +3530,7 @@ describe('admission before the hello', () => {
       // The gate admits it; `ws` then refuses the malformed key itself and
       // never creates a WebSocket, so only the TCP close can free the slot.
       const aborted = await rig.upgrade({ key: 'not-a-websocket-key' });
-      expect(aborted.status).toBe(HTTP_BAD_REQUEST);
-      expect(aborted.closedByService).toBe(true);
+      expectBareRefusal(aborted, HTTP_BAD_REQUEST, undefined);
       await rig.until(
         (stats) =>
           stats.admitted === 0 && stats.pendingHandshakes === 0 && stats.pendingPeers === 0,
@@ -3561,7 +3573,7 @@ describe('admission before the hello', () => {
     ]);
   });
 
-  it('answers the running service’s refused upgrades with nosniff and no-store, and nothing the client sent', async () => {
+  it('answers the running service’s refused upgrades — its own and those ws refuses — with the response-header policy, and nothing the client sent', async () => {
     const h = harness();
     const host = new URL(h.url).hostname;
     const marker = newMarker();
@@ -3570,7 +3582,19 @@ describe('admission before the hello', () => {
     expectBareRefusal(offRoute, HTTP_NOT_FOUND, undefined);
     const webOrigin = await rawUpgrade(host, h.port, { origin: `https://${marker}.example` });
     expectBareRefusal(webOrigin, HTTP_FORBIDDEN, undefined);
-    for (const response of [offRoute, webOrigin]) {
+
+    // Admitted by the gate, then refused by `ws` itself: answered by the gate's
+    // own bare refusal, never by `ws`'s `text/html` one.
+    const badKey = await rawUpgrade(host, h.port, { key: marker });
+    expectBareRefusal(badKey, HTTP_BAD_REQUEST, undefined);
+    const badVersion = await rawUpgrade(host, h.port, { version: marker });
+    expectBareRefusal(badVersion, HTTP_BAD_REQUEST, undefined, {
+      'sec-websocket-version': '13, 8',
+    });
+    const badMethod = await rawUpgrade(host, h.port, { method: 'POST' });
+    expectBareRefusal(badMethod, HTTP_METHOD_NOT_ALLOWED, undefined, { allow: 'GET' });
+
+    for (const response of [offRoute, webOrigin, badKey, badVersion, badMethod]) {
       expect(response.head).not.toContain(marker);
     }
 

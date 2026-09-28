@@ -2140,6 +2140,28 @@ export interface AuthService {
   revokeServerAgentCredential(token: string): Result<boolean, DebuggenError>;
 
   /**
+   * Whether one server-agent credential still authenticates **now** — what the
+   * dev-server launcher asks before it hands a running child back to a later
+   * launch, so a child whose credential a rotation ({@link rotateAll}) or a
+   * revocation retired is stopped and launched again with a new one instead of
+   * being reused with a preload that can no longer connect (AAP §0.5.6).
+   *
+   * Read-only: one lookup by the token's digest and the same row checks
+   * authentication applies; nothing is written or closed, and nothing is
+   * logged but a store failure's operation and code. The token is hashed and
+   * dropped; it never reaches a log record or an error.
+   *
+   * @param token The plaintext credential the launcher holds for its child.
+   * @returns `true` when a row with the token's digest exists, is a
+   *   `server-agent` credential scoped to a project and has not expired;
+   *   `false` for a malformed, unknown, rotated-away, revoked, expired or
+   *   unreadable credential and for another role's; `STORE_ERROR` when the
+   *   store is closed or the row cannot be read — an unknown answer, which the
+   *   launcher never takes for a retired credential.
+   */
+  serverAgentCredentialIsLive(token: string): Result<boolean, DebuggenError>;
+
+  /**
    * Releases one `POST /dev-server/credential` credential at its holder's
    * request — the store half of `POST /credentials/release`, which
    * `scripts/dev-instrumented.mjs` calls as the dev server it started exits
@@ -3514,6 +3536,49 @@ class CredentialAuthority implements AuthService {
         : { projectRoot: revoked.value.projectRoot }),
     });
     return ok(revoked.value.deleted);
+  }
+
+  serverAgentCredentialIsLive(token: string): Result<boolean, DebuggenError> {
+    if (!presentedCredentialSchema.safeParse(token).success) {
+      // A value of the wrong shape was never issued, so nothing authenticates with it.
+      return ok(false);
+    }
+    if (this.#store.isClosed) {
+      // The service is shutting down: the answer is unknown, not "retired".
+      return err(
+        new DebuggenError(
+          'STORE_ERROR',
+          'The credential store is closed, so whether the server-agent credential is live is unknown.',
+          { details: { operation: 'read-server-agent-credential' } },
+        ),
+      );
+    }
+
+    const tokenHash = sha256Hex(token);
+    const raw = this.#guard('read-server-agent-credential', (): unknown =>
+      this.#store.statement(SQL.selectCredential).get(tokenHash),
+    );
+    if (isErr(raw)) {
+      return raw;
+    }
+    if (raw.value === undefined) {
+      // Rotated away, revoked or swept: nothing authenticates with it.
+      return ok(false);
+    }
+    // The row checks authentication applies, in its order: a row that does not
+    // validate, a digest that does not match, an expiry that has passed, and
+    // any row that is not a project-scoped server-agent credential all refuse.
+    const row = credentialRowSchema.safeParse(raw.value);
+    if (!row.success || !digestsEqual(row.data.token_hash, tokenHash)) {
+      return ok(false);
+    }
+    if (row.data.expires_at !== null && row.data.expires_at <= this.#now()) {
+      return ok(false);
+    }
+    if (row.data.role !== 'server-agent') {
+      return ok(false);
+    }
+    return ok(parseStoredScope(row.data.scope)?.kind === 'project');
   }
 
   releaseServerAgentCredential(token: string): Result<boolean, DebuggenError> {

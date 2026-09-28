@@ -39,10 +39,16 @@
  * | this peer already holds its share of unauthenticated sockets (`maxPendingHandshakesPerPeer`) | 429, with `Retry-After` |
  * | every peer together already holds the unauthenticated share (`maxPendingHandshakes`) | 429, with `Retry-After` |
  * | the service already holds its most sockets in any phase (`maxOpenConnections`) | 503, with `Retry-After` |
+ * | `ws` cannot complete the admitted handshake: a method other than `GET` | 405, with `Allow: GET` |
+ * | `ws` cannot complete the admitted handshake: a bad `Upgrade`, `Sec-WebSocket-Key`, `Sec-WebSocket-Version` or `Sec-WebSocket-Protocol` | 400 |
  *
- * Every refusal carries `Connection: close`, `Content-Length: 0`,
- * `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and nothing
- * the client sent. A client answered 429 or 503 with `Retry-After` retries no
+ * A handshake that named a `Sec-WebSocket-Version` other than 13 or 8 is also
+ * told `Sec-WebSocket-Version: 13, 8` (RFC 6455 §4.4). Every refusal carries `Connection: close`, `Content-Length: 0`,
+ * `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+ * `X-Frame-Options: DENY` and
+ * `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` — the
+ * response-header policy of every HTTP reply of the service — and nothing the
+ * client sent. A client answered 429 or 503 with `Retry-After` retries no
  * sooner than that many seconds, with its usual backoff.
  *
  * **Admission.** An upgrade that passes the path and origin checks reserves a
@@ -1010,6 +1016,7 @@ export interface WsServerDeps {
     | 'touch'
     | 'bindingForSession'
     | 'bindingForTab'
+    | 'tabHeldByAnotherCredential'
     | 'sendToClient'
   >;
   /** The binding route, owner of `session.bind`, `tab.navigated` and `session.unbind`. */
@@ -1205,6 +1212,26 @@ const ADMISSION_REFUSAL_STATUS = Object.freeze({
   'pending-quota': 429,
   capacity: 503,
 } as const satisfies Readonly<Record<AdmissionRefusal, number>>);
+
+/**
+ * The only request method a WebSocket upgrade may use (RFC 6455 §4.1). A
+ * handshake `ws` refuses for any other method is answered `405`, which must
+ * name the allowed method in `Allow` (RFC 9110 §15.5.6).
+ */
+const UPGRADE_METHOD = 'GET';
+
+/** The status of a handshake `ws` refused for its method — `ws`'s own choice. */
+const UPGRADE_METHOD_REFUSAL_STATUS = 405;
+
+/** The status of every other handshake `ws` refused — `ws`'s own choice. */
+const UPGRADE_HANDSHAKE_REFUSAL_STATUS = 400;
+
+/**
+ * The `Sec-WebSocket-Version` values `ws` 8 completes a handshake for, in the
+ * order it advertises them. A refused handshake that named another version is
+ * answered with them (RFC 6455 §4.4), as `ws`'s own refusal is.
+ */
+const SUPPORTED_WS_VERSIONS: readonly number[] = Object.freeze([13, 8]);
 
 /** The validated admission bounds of one server. */
 interface AdmissionLimits {
@@ -2139,11 +2166,26 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   /**
    * Answers a refused upgrade with a bare HTTP status and destroys the TCP
    * socket. The response holds nothing the client sent: the status line,
-   * `Connection: close`, an empty body, `Cache-Control: no-store` and
-   * `X-Content-Type-Options: nosniff` on every status, and — for an admission
-   * refusal — the `Retry-After` the client is to wait, in seconds.
+   * `Connection: close`, an empty body, `Cache-Control: no-store`,
+   * `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+   * `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` on
+   * every status, and then the refusal's own `fields`: an admission refusal's
+   * `Retry-After`, or the `Allow` and `Sec-WebSocket-Version` hints of a
+   * handshake `ws` refused. Every one of those lines is built by this module
+   * from constants — never from a byte of the request.
+   *
+   * The policy lines are the values of `./http.ts`'s
+   * `RESPONSE_POLICY_HEADERS`, written here by hand because this module does
+   * not depend on the hono application. `test/integration/ws-protocol.test.ts`
+   * pins every refusal to the same literal values `./http.test.ts` pins the
+   * application's replies to, so the two cannot drift apart unnoticed.
+   *
+   * @param socket The upgrade's TCP socket; destroyed once the head is sent.
+   * @param status The refusal's HTTP status.
+   * @param fields Complete header lines (`Name: value`, no CRLF) appended
+   * after the policy.
    */
-  function rejectUpgrade(socket: Duplex, status: number, retryAfterSeconds?: number): void {
+  function rejectUpgrade(socket: Duplex, status: number, fields: readonly string[] = []): void {
     socket.on('error', (cause) => {
       log.debug(
         'a refused upgrade socket failed while closing',
@@ -2163,7 +2205,9 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       'Content-Length: 0',
       'Cache-Control: no-store',
       'X-Content-Type-Options: nosniff',
-      ...(retryAfterSeconds === undefined ? [] : [`Retry-After: ${String(retryAfterSeconds)}`]),
+      'X-Frame-Options: DENY',
+      "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'",
+      ...fields,
     ];
     socket.end(`${head.join('\r\n')}\r\n\r\n`);
   }
@@ -2202,7 +2246,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       refusalsSinceWarn += 1;
       log.debug(ADMISSION_REFUSED_LOG, fields);
     }
-    rejectUpgrade(socket, status, admissionRetryAfterSeconds);
+    rejectUpgrade(socket, status, [`Retry-After: ${String(admissionRetryAfterSeconds)}`]);
   }
 
   /**
@@ -2233,6 +2277,42 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
 
   /** The record of every upgrade refused for its `Origin`, at either level. */
   const ORIGIN_UPGRADE_REFUSED_LOG = 'refused a WebSocket upgrade from a refused origin';
+
+  /**
+   * Answers the handshakes `ws` itself refuses once the gate has admitted
+   * them — a method other than `GET`, a missing or malformed `Upgrade` or
+   * `Sec-WebSocket-Key`, an unsupported `Sec-WebSocket-Version`, an
+   * unparseable `Sec-WebSocket-Protocol` — through {@link rejectUpgrade},
+   * so they carry the response-header policy like every other refusal. `ws`
+   * hands such a handshake to `wsClientError` only while a listener exists;
+   * without this one it would answer with its own `text/html` refusal, which
+   * carries none of the policy and echoes its reason as the body.
+   *
+   * The status is the one `ws` picks: `405` with `Allow: GET` for a method
+   * other than `GET` (the first check it makes), `400` for the rest. A
+   * request that named no version `ws` speaks also gets the
+   * `Sec-WebSocket-Version` hint RFC 6455 §4.4 asks for. The record carries
+   * the status and `ws`'s constant reason, never the request. The socket's
+   * admission slot is given back when the socket closes, as for every
+   * admitted upgrade, and it is not counted in `refusedUpgrades`, which
+   * counts only the admission quotas' refusals.
+   */
+  wss.on('wsClientError', (cause, socket, request) => {
+    const fields: string[] = [];
+    let status = UPGRADE_HANDSHAKE_REFUSAL_STATUS;
+    if (request.method !== UPGRADE_METHOD) {
+      status = UPGRADE_METHOD_REFUSAL_STATUS;
+      fields.push(`Allow: ${UPGRADE_METHOD}`);
+    }
+    if (!SUPPORTED_WS_VERSIONS.includes(Number(request.headers['sec-websocket-version']))) {
+      fields.push(`Sec-WebSocket-Version: ${SUPPORTED_WS_VERSIONS.join(', ')}`);
+    }
+    log.debug('refused a WebSocket handshake the ws library could not complete', {
+      status,
+      reason: cause.message,
+    });
+    rejectUpgrade(socket, status, fields);
+  });
 
   function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     try {
@@ -3227,7 +3307,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * check: a single-tab connection may report only the tab its hello announced
    * ({@link requireAnnouncedTab}); the report is accepted for a tab this
    * connection's credential bound or one nobody has bound yet (the page may
-   * load before its panel binds it), never for a tab another credential holds;
+   * load before its panel binds it), never for a tab id only another
+   * credential holds a binding of;
    * when the envelope names a session, that session's live binding must be
    * this credential's binding of the very tab the report names.
    */
@@ -3245,7 +3326,15 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     if (isErr(ownTab)) {
       return ownTab;
     }
-    const tabBinding = clients.bindingForTab(payload.tabId);
+    // A tab id is unique only within one browser: bindings are this
+    // credential's own (`bindingForTab(tabId, principal)`). A tab id that only
+    // another credential holds a binding of is refused, because readiness
+    // keeps its evidence by tab id alone and could not tell this report from
+    // one about the other browser's bound tab.
+    const tabBinding = clients.bindingForTab(payload.tabId, principal);
+    if (tabBinding === undefined && clients.tabHeldByAnotherCredential(payload.tabId, principal)) {
+      return refusal('TAB_NOT_BOUND', MISSING_BINDING_MESSAGE);
+    }
     if (tabBinding !== undefined) {
       const own = requireBoundSession(principal, tabBinding.sessionId, tabBinding, payload.tabId);
       if (isErr(own)) {

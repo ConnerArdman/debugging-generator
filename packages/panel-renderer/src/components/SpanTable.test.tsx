@@ -106,12 +106,15 @@ import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelA
 import { Button } from '../primitives/Button';
 import { kindColorVar, tierColorVar } from '../utils/color';
 import {
+  containsDirectionControl,
   formatCount,
   formatDuration,
   formatKindLabel,
   formatOffset,
   formatTierLabel,
+  formatUntrustedText,
 } from '../utils/format';
+import { sourceLinkAccessibleName } from './SourceLink';
 import { SpanTable } from './SpanTable';
 
 /*
@@ -2943,5 +2946,163 @@ describe('SpanTable shared selection', () => {
     // Re-arranging is not selecting: nothing was reported and nothing re-queried.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * A span name, a path and a symbol are captured text, and an invisible
+ * right-to-left override (U+202E) in one of them draws the characters after it
+ * backwards: HTML escaping keeps `</td><script>` from becoming markup, yet the
+ * row would still read `<tpircs/>…`, a sequence the capture never held. Every
+ * sink this table puts text into — the name, its tooltip, the grid's name, the
+ * source chip — prints each control as its visible escape (`\u202E`), while the
+ * values the table hands back to the host stay exactly as captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escapes printed in their place. */
+const RLO_MARKER = '\\u202E';
+const PDF_MARKER = '\\u202C';
+
+/** The span name the QA report ingested through `/telemetry/ingest`. */
+const BIDI_NAME = `QA_BIDI ${RLO}</td><script>alert(7)</script>${PDF}`;
+
+/** That name as the row must show it: logical order, controls visible. */
+const BIDI_NAME_SHOWN = `QA_BIDI ${RLO_MARKER}</td><script>alert(7)</script>${PDF_MARKER}`;
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered container.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('SpanTable direction controls', () => {
+  /** A location whose path and symbol both carry a control. */
+  const bidiSource: SourceLocation = {
+    ...BASE_SOURCE,
+    file: `src/${RLO}example/service.ts`,
+    symbol: `run${RLO}Example${PDF}`,
+  };
+
+  /** The QA row: a failed span, located, with a control in its id as well. */
+  const bidiRow = makeEvent({
+    id: `event-${RLO}example-0001`,
+    name: BIDI_NAME,
+    status: 'error',
+    source: bidiSource,
+  });
+
+  it('prints every control as its escape and keeps the markup inert', async () => {
+    const stub = resolvingProvider('spans', [bidiRow]);
+    const title = `Slowest ${RLO}operations`;
+
+    const { container } = renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const grid = await screen.findByRole('grid', { name: formatUntrustedText(title) });
+
+    // No text, title, name or description anywhere carries a raw control.
+    expect(rawDirectionSinks(container)).toEqual([]);
+
+    // The markup in the name is text, in the order it was captured.
+    expect(container.querySelector('script, td')).toBeNull();
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    const name = nameTriggerIn(row);
+    expect(name.textContent).toBe(BIDI_NAME_SHOWN);
+    expect(nameBubbleOf(name).textContent).toBe(BIDI_NAME_SHOWN);
+    expect(within(grid).getByRole('rowheader').textContent).toContain(BIDI_NAME_SHOWN);
+
+    // The chip is named by its own rule, revealed, and shows the markers.
+    const chipName = sourceLinkAccessibleName({ location: bidiSource, compact: true });
+    expect(chipName).toContain(RLO_MARKER);
+    expect(within(row).getByRole('button', { name: chipName })).toBeDefined();
+  });
+
+  it('hands the host the raw location and the raw event id', async () => {
+    const stub = resolvingProvider('spans', [bidiRow]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(
+      within(row).getByRole('button', {
+        name: sourceLinkAccessibleName({ location: bidiSource, compact: true }),
+      }),
+    );
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const opened = spies.onOpenSource.mock.calls[0]?.[0];
+    expect(opened).toEqual(bidiSource);
+    expect(opened?.file).toBe(bidiSource.file);
+    expect(opened?.symbol).toBe(bidiSource.symbol);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    await user.click(row);
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls[0]?.[0]).toEqual({
+      eventId: bidiRow.id,
+      spanId: bidiRow.spanId,
+      traceId: bidiRow.traceId,
+    });
+    expect(containsDirectionControl(bidiRow.id)).toBe(true);
+  });
+
+  it('keeps every name revealed under a view order', async () => {
+    const stub = resolvingProvider('spans', [
+      makeEvent({ id: 'event-example-0002', name: `b${RLO}`, spanId: spanIdFor(2) }),
+      makeEvent({ id: 'event-example-0003', name: 'a', spanId: spanIdFor(3) }),
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: OPERATION_SORT_NAME }));
+
+    // The view order arranges the loaded rows over their captured names (the
+    // component's `ROW_COMPARATORS`); each row still shows its name revealed.
+    expect(renderedNames()).toEqual(['a', `b${RLO_MARKER}`]);
   });
 });

@@ -87,6 +87,7 @@ import {
   MAX_ATTRIBUTE_NODES,
   STACK_ATTRIBUTE_KEYS,
   UNTRUNCATED_ATTRIBUTE_KEYS,
+  isDroppedAttributeKey,
   redactAttributes,
   redactAttributesWithFindings,
   redactEvent,
@@ -540,6 +541,52 @@ describe('redactAttributes — dropped keys', () => {
     const droppedFolds = new Set(DROPPED_ATTRIBUTE_KEYS.map(folded));
 
     expect(ALL_ATTRIBUTE_KEYS.filter((key) => droppedFolds.has(folded(key)))).toEqual([]);
+    // The shape rule too: `encodedBodySize` and `decodedBodySize` mention a
+    // body and are sizes, which is evidence.
+    expect(ALL_ATTRIBUTE_KEYS.filter((key) => isDroppedAttributeKey(key))).toEqual([]);
+  });
+
+  it('drops a namespaced body attribute a producer sends, however it spells it', () => {
+    // QSA-F04: a fetch event relayed with `http.request.body` was stored,
+    // tailed and served verbatim. Bodies are never captured (AAP 0.5.2).
+    const planted = '{"password":"' + SHORT_CREDENTIAL + '"}';
+    const bodyKeys = [
+      'http.request.body',
+      'http.response.body',
+      'rawBody',
+      'request.payload',
+      'responseBodyText',
+      'http.response.body.content',
+      'HTTPBody',
+      'REQUEST_BODY_JSON',
+    ];
+    const bag: Record<string, unknown> = { 'http.method': 'POST', url: '/api/widgets/items' };
+    for (const key of bodyKeys) {
+      bag[key] = planted;
+    }
+
+    const event = redactEvent(checkedEvent(fetchEvent(bag)));
+
+    expect(event.attributes).toEqual({ 'http.method': 'POST', url: '/api/widgets/items' });
+    expect(JSON.stringify(event)).not.toContain(SHORT_CREDENTIAL);
+    expect(event.redacted).toEqual(expect.arrayContaining(bodyKeys));
+    expect(redactEvent(event)).toEqual(event);
+  });
+
+  it('keeps a key that describes a body without carrying it', () => {
+    const kept = {
+      'http.request.body.size': 26,
+      bodyLength: 4,
+      bodyUsed: true,
+      encodedBodySize: 512,
+      nobody: 'here',
+      somebodyElse: 'x',
+    };
+
+    expect(redactAttributes(kept, { kind: 'fetch' })).toEqual(kept);
+    for (const key of Object.keys(kept)) {
+      expect(isDroppedAttributeKey(key), key).toBe(false);
+    }
   });
 });
 
@@ -760,15 +807,17 @@ describe('redactAttributes — stack text', () => {
     const { attributes, report } = redactAttributesWithFindings(
       {
         'error.type': 'TypeError',
-        'error.stack': `at load (http://127.0.0.1:20450/a.js?email=${CONTACT_ADDRESS}:1:1)`,
+        'error.stack': `at load (http://127.0.0.1:20450/a.js?email=${CONTACT_ADDRESS}&v=3:1:1)`,
       },
       { kind: 'error' },
     );
 
     expect(attributes['error.stack']).toBe(
-      `at load (http://127.0.0.1:20450/a.js?email=${REDACTION_MASK}:1:1)`,
+      `at load (http://127.0.0.1:20450/a.js?email=${REDACTION_MASK}&v=${REDACTION_MASK}:1:1)`,
     );
-    expect(report.rules).toContain('url-query-value');
+    // The address is masked by its own rule, with the query mask because it
+    // sits in a query; the URL rule masks the other value.
+    expect(report.rules).toEqual(['email-address', 'url-query-value']);
     expect(report.maskedValues).toBe(1);
   });
 
@@ -802,7 +851,7 @@ describe('redactAttributes — stack text', () => {
   it("masks a URL quoted in an error stack's message line and keeps every frame position", () => {
     // A stack's first line is the thrown error's message: the same text
     // `error.message` carries, so it must not travel unmasked here either.
-    const message = `failed /reset?email=${CONTACT_ADDRESS}`;
+    const message = `failed /reset?email=${CONTACT_ADDRESS}&step=2`;
     const stack =
       `Error: ${message}\n` +
       `    at load (http://127.0.0.1:20450/a.js?v=${CONTACT_ADDRESS}:1:1)\n` +
@@ -812,13 +861,17 @@ describe('redactAttributes — stack text', () => {
       { kind: 'error' },
     );
 
-    expect(attributes['error.message']).toBe(`failed /reset?email=${REDACTION_MASK}`);
+    expect(attributes['error.message']).toBe(
+      `failed /reset?email=${REDACTION_MASK}&step=${REDACTION_MASK}`,
+    );
     expect(attributes['error.stack']).toBe(
-      `Error: failed /reset?email=${REDACTION_MASK}\n` +
+      `Error: failed /reset?email=${REDACTION_MASK}&step=${REDACTION_MASK}\n` +
         `    at load (http://127.0.0.1:20450/a.js?v=${REDACTION_MASK}:1:1)\n` +
         '    at send (src/a.ts:18:3)',
     );
-    expect(report.rules).toEqual(['url-query-value']);
+    // The quoted addresses are masked by their own rule, with the query mask
+    // because they sit in a query; the URL rule masks the other value.
+    expect(report.rules).toEqual(['email-address', 'url-query-value']);
     expect(redactAttributes(attributes, { kind: 'error' })).toEqual(attributes);
   });
 
@@ -1226,6 +1279,80 @@ describe('redactAttributes — preview families', () => {
     expect(secondNext.preview as string).toMatch(new RegExp(`${TRUNCATION_SUFFIX}$`));
   });
 
+  it('flags a preview it cuts as truncated, whatever the producer said', () => {
+    // QSA-F06: a 316-character preview arriving with `truncated: false` was
+    // cut to the bound and kept `truncated: false`, so a panel would present a
+    // cut value as the whole value.
+    const long = 'x'.repeat(40) + ' ' + 'lorem ipsum dolor sit amet '.repeat(10) + 'y'.repeat(5);
+    const event = redactEvent(
+      checkedEvent(
+        eventOfKind('render', 'render WidgetSummary', {
+          component: 'WidgetSummary',
+          changedProps: [
+            {
+              key: 'note',
+              previous: { type: 'string', preview: long, truncated: false },
+              next: { type: 'string', preview: 'short', truncated: false },
+            },
+          ],
+        }),
+      ),
+    );
+
+    const entry = (event.attributes.changedProps as Record<string, unknown>[])[0] ?? {};
+    const previous = entry.previous as Record<string, unknown>;
+
+    expect(long.length).toBeGreaterThan(MAX_PREVIEW_LENGTH * 2);
+    expect(Array.from(previous.preview as string)).toHaveLength(MAX_PREVIEW_LENGTH);
+    expect(previous.truncated).toBe(true);
+    // The summary the redactor did not cut keeps the producer's flag.
+    expect(entry.next).toEqual({ type: 'string', preview: 'short', truncated: false });
+    expect(event.redacted).toEqual(
+      expect.arrayContaining([
+        'changedProps[0].previous.preview',
+        'changedProps[0].previous.truncated',
+      ]),
+    );
+    expect(event.redacted).not.toContain('changedProps[0].next.truncated');
+    // A fixed point: the flag stays set and nothing else changes.
+    expect(redactEvent(event)).toEqual(event);
+  });
+
+  it('flags a cut state value summary, adding the flag a producer omitted', () => {
+    const redacted = redactAttributes(
+      {
+        component: 'BetaRow',
+        hookIndex: 0,
+        previousValue: { type: 'string', preview: 'p'.repeat(MAX_PREVIEW_LENGTH + 1) },
+        nextValue: { type: 'string', preview: 'q'.repeat(MAX_PREVIEW_LENGTH), truncated: false },
+      },
+      { kind: 'state' },
+    );
+
+    expect(redacted.previousValue).toEqual({
+      type: 'string',
+      preview: 'p'.repeat(MAX_PREVIEW_LENGTH - 1) + TRUNCATION_SUFFIX,
+      truncated: true,
+    });
+    // Exactly at the bound: not cut, so the producer's flag stands.
+    expect(redacted.nextValue).toEqual({
+      type: 'string',
+      preview: 'q'.repeat(MAX_PREVIEW_LENGTH),
+      truncated: false,
+    });
+  });
+
+  it('does not touch a truncated flag outside a preview subtree', () => {
+    // On any other kind the same key is not a diff, and a `preview` field
+    // there is an ordinary string attribute.
+    const redacted = redactAttributes(
+      { summary: { preview: 'z'.repeat(MAX_PREVIEW_LENGTH * 2), truncated: false } },
+      { kind: 'log' },
+    );
+
+    expect((redacted.summary as Record<string, unknown>).truncated).toBe(false);
+  });
+
   it('keeps hook labels and scrubs state value summaries by content', () => {
     const redacted = redactAttributes(
       {
@@ -1293,7 +1420,7 @@ describe('redactAttributes — preview families', () => {
         hookLabel: 'returnTo',
         nextValue: {
           type: 'string',
-          preview: `"/checkout?coupon=${CONTACT_ADDRESS}"`,
+          preview: `"/checkout?coupon=${CONTACT_ADDRESS}&step=2"`,
           truncated: false,
         },
       },
@@ -1301,9 +1428,9 @@ describe('redactAttributes — preview families', () => {
     );
 
     expect((asState.attributes.nextValue as Record<string, unknown>).preview).toBe(
-      `"/checkout?coupon=${REDACTION_MASK}"`,
+      `"/checkout?coupon=${REDACTION_MASK}&step=${REDACTION_MASK}"`,
     );
-    expect(asState.report.rules).toContain('url-query-value');
+    expect(asState.report.rules).toEqual(['email-address', 'url-query-value']);
     expect(JSON.stringify([asRender, asState.attributes])).not.toContain(CONTACT_ADDRESS);
   });
 
@@ -1459,7 +1586,9 @@ describe('redactAttributes — URLs and header lines in free text', () => {
     expect(attributes['log.message']).toBe(
       `mailing /notify?to=${REDACTION_MASK}&lang=${REDACTION_MASK}`,
     );
-    expect(report.rules).toEqual(['url-query-value']);
+    // The `to` value is an address, masked by its own rule with the query
+    // mask; the URL rule masks the other values.
+    expect(report.rules).toEqual(['email-address', 'url-query-value']);
     expect(report.maskedValues).toBe(2);
     expect(report.truncatedValues).toBe(0);
   });
@@ -1564,6 +1693,129 @@ describe('redactAttributes — URLs and header lines in free text', () => {
  * Bounds
  * ---------------------------------------------------------------------------
  */
+
+describe('redactEvent — personal data and labelled values in free text', () => {
+  /** A Luhn-valid 16-digit card number, printed in groups of four. */
+  const SPACED_CARD = '4111 1111 1111 1111';
+
+  /** An all-digit span id that is also a Luhn-valid number opening with 4. */
+  const DIGIT_SPAN_ID = '4111111111111111';
+
+  it('masks the element text, error message and stack the QA report relayed', () => {
+    // QSA-F05: these travelled to the store, the live tail and panel-data
+    // unmasked.
+    const interaction = redactEvent(
+      checkedEvent(
+        eventOfKind('interaction', 'click button', {
+          'event.type': 'click',
+          'target.text': 'Pay with card ' + SPACED_CARD + ' token secret-token-123',
+        }),
+      ),
+    );
+    const error = redactEvent(
+      checkedEvent(
+        eventOfKind('error', 'TypeError', {
+          'error.type': 'TypeError',
+          'error.message': 'Order for ' + CONTACT_ADDRESS + ' failed with card ' + DIGIT_SPAN_ID,
+          'error.stack':
+            'TypeError: Order for ' +
+            CONTACT_ADDRESS +
+            ' failed\n    at submitForm (http://127.0.0.1:20450/_next/static/chunks/app.js:10:5)',
+        }),
+      ),
+    );
+
+    expect(interaction.attributes['target.text']).toBe(
+      `Pay with card ${REDACTION_MARKER} token ${REDACTION_MARKER}`,
+    );
+    expect(error.attributes['error.message']).toBe(
+      `Order for ${REDACTION_MARKER} failed with card ${REDACTION_MARKER}`,
+    );
+    // The frame keeps its URL and position, which source-map resolution reads.
+    expect(error.attributes['error.stack']).toBe(
+      `TypeError: Order for ${REDACTION_MARKER} failed\n` +
+        '    at submitForm (http://127.0.0.1:20450/_next/static/chunks/app.js:10:5)',
+    );
+    expect(interaction.redacted).toEqual(['target.text']);
+    expect(error.redacted).toEqual(expect.arrayContaining(['error.message', 'error.stack']));
+    for (const event of [interaction, error]) {
+      const text = JSON.stringify(event);
+      expect(text).not.toContain(CONTACT_ADDRESS);
+      expect(text).not.toContain('1111 1111');
+      expect(text).not.toContain('secret-token-123');
+      expect(redactEvent(event)).toEqual(event);
+    }
+  });
+
+  it('reports the classes it masked', () => {
+    const { report } = redactEventWithFindings(
+      checkedEvent(
+        eventOfKind('log', 'log', {
+          'log.message': 'mail ' + CONTACT_ADDRESS + ' card ' + SPACED_CARD + ' pwd=hunter22',
+        }),
+      ),
+    );
+
+    expect(report.rules).toEqual(['email-address', 'payment-card', 'labelled-secret']);
+    expect(report.maskedValues).toBe(1);
+  });
+
+  it('keeps a span reference the product wrote even when its digits pass a card checksum', () => {
+    const state = redactEvent(
+      checkedEvent(
+        eventOfKind('state', 'state BetaRow', {
+          component: 'BetaRow',
+          triggerSpanId: DIGIT_SPAN_ID,
+          renderSpanId: DIGIT_SPAN_ID,
+        }),
+      ),
+    );
+    const commit = redactEvent(
+      checkedEvent(
+        eventOfKind('commit', 'commit', {
+          lineage: 'async-continuation',
+          lineageAmbiguous: true,
+          lineageCandidates: [DIGIT_SPAN_ID, 'abcdef0123456789'],
+          orphanedParentSpanId: DIGIT_SPAN_ID,
+        }),
+      ),
+    );
+
+    expect(state.attributes.triggerSpanId).toBe(DIGIT_SPAN_ID);
+    expect(state.attributes.renderSpanId).toBe(DIGIT_SPAN_ID);
+    expect(commit.attributes.lineageCandidates).toEqual([DIGIT_SPAN_ID, 'abcdef0123456789']);
+    expect(commit.attributes.orphanedParentSpanId).toBe(DIGIT_SPAN_ID);
+    expect(state.redacted).toBeUndefined();
+    expect(commit.redacted).toBeUndefined();
+  });
+
+  it('still redacts a value under a span-reference key that is not a span id', () => {
+    const state = redactAttributes(
+      {
+        triggerSpanId: 'card ' + SPACED_CARD,
+        lineageCandidates: ['mail ' + CONTACT_ADDRESS, DIGIT_SPAN_ID],
+        note: DIGIT_SPAN_ID,
+      },
+      { kind: 'state' },
+    );
+
+    expect(state.triggerSpanId).toBe(`card ${REDACTION_MARKER}`);
+    expect(state.lineageCandidates).toEqual([`mail ${REDACTION_MARKER}`, DIGIT_SPAN_ID]);
+    // An undeclared key gets no exemption: its value is judged by content.
+    expect(state.note).toBe(REDACTION_MARKER);
+  });
+
+  it('names span-reference keys the attribute catalog declares', () => {
+    for (const key of [
+      'triggerSpanId',
+      'renderSpanId',
+      'orphanedParentSpanId',
+      'lineageCandidates',
+    ]) {
+      expect(ALL_ATTRIBUTE_KEYS, key).toContain(key);
+    }
+  });
+});
 
 describe('redactAttributes — bounds', () => {
   it('bounds a nested object to the tracked-key count but never the bag itself', () => {

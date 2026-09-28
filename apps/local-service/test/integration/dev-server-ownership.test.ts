@@ -43,6 +43,11 @@
  *   answer at, refuses one nothing answers at (`DEV_SERVER_UNAVAILABLE`) or
  *   that names another host (`PROTOCOL_INVALID_MESSAGE`), and prefers a dev
  *   server the service launched for the project.
+ * - **Relaunch after rotation** (AAP §0.5.6, "launched dev servers must be
+ *   relaunched"): once `POST /credentials/rotate` retired a launched child's
+ *   `server-agent` credential, the project's next launch stops that child and
+ *   answers a replacement with a new pid and a new credential, which a later
+ *   launch reuses.
  */
 
 import { existsSync } from 'node:fs';
@@ -51,6 +56,7 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { WS_CLOSE_UNAUTHORIZED } from '@debuggen/protocol';
 import type { SessionRecord } from '@debuggen/protocol';
 import { isErr, newSessionId } from '@debuggen/shared';
 import type { DebuggenError, Result } from '@debuggen/shared';
@@ -139,6 +145,19 @@ async function answers(url: string): Promise<boolean> {
 /** The error code of a refusal, or `undefined` for a success. */
 function codeOf(result: Result<unknown, DebuggenError>): string | undefined {
   return isErr(result) ? result.error.code : undefined;
+}
+
+/**
+ * Whether a process with `pid` exists: signal 0 checks without delivering
+ * anything, and `EPERM` means one exists that this user may not signal.
+ */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === 'EPERM';
+  }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -490,4 +509,85 @@ describe('dev-server ownership and the dev-server URL of a new session', () => {
       HARNESS_TIMEOUTS.pipeline,
     );
   });
+
+  // Declared last because the rotation retires every credential the suite
+  // holds; the harness's editor credential is re-read right after it.
+  it(
+    'relaunches a dev server whose credential a rotation retired, with a new credential, and then reuses the replacement',
+    async () => {
+      const projectRoot = await freshProject();
+      const first = await launchFor(projectRoot);
+      if (isErr(first)) {
+        throw new Error(`The dev server could not be launched: ${first.error.message}`);
+      }
+      expect(await answers(first.value.devServerUrl)).toBe(true);
+
+      // The editor rotates every credential (`debuggen.rotateServiceToken`):
+      // its own connection is closed with 4401 and its announcement cleared.
+      const heldEditor = await h.editor(projectRoot);
+      const closesBefore = heldEditor.closes.length;
+      const rotated = await h.http().request('credentials.rotate', {
+        body: {},
+        timeoutMs: HARNESS_TIMEOUTS.request,
+      });
+      if (isErr(rotated)) {
+        throw new Error(`The rotation was refused: ${rotated.error.message}`);
+      }
+      const closed = await heldEditor.waitForClose(HARNESS_TIMEOUTS.message, closesBefore);
+      expect(closed.code).toBe(WS_CLOSE_UNAUTHORIZED);
+      expect(serverAgentCredentialCount()).toBe(0);
+
+      // The editor re-reads auth.json and announces its workspace again.
+      h.refreshEditorToken();
+      expect((await h.editor(projectRoot)).authenticated).toBe(true);
+
+      // The same launch now replaces the child, whose preload can never connect again.
+      const second = await launchFor(projectRoot);
+      if (isErr(second)) {
+        throw new Error(`The dev server could not be relaunched: ${second.error.message}`);
+      }
+      expect(second.value.pid).not.toBe(first.value.pid);
+      expect(isRunning(first.value.pid)).toBe(false);
+      expect(await answers(first.value.devServerUrl)).toBe(false);
+      expect(await answers(second.value.devServerUrl)).toBe(true);
+      expect(serverAgentCredentialCount()).toBe(1);
+
+      // Its credential is live: the next launch reuses it.
+      const third = await launchFor(projectRoot);
+      expect(isErr(third) ? third.error.code : third.value.pid).toBe(second.value.pid);
+      expect(serverAgentCredentialCount()).toBe(1);
+    },
+    HARNESS_TIMEOUTS.pipeline * 2,
+  );
+
+  it(
+    'relaunches a dev server whose credential was rotated away without the launcher being told, through the launch’s own liveness check',
+    async () => {
+      const projectRoot = await freshProject();
+      const first = await launchFor(projectRoot);
+      if (isErr(first)) {
+        throw new Error(`The dev server could not be launched: ${first.error.message}`);
+      }
+
+      // The access boundary rotates directly, so the route's call into the
+      // launcher never happens: only the store knows the credential is gone.
+      const heldEditor = await h.editor(projectRoot);
+      const closesBefore = heldEditor.closes.length;
+      h.rotateAll();
+      const closed = await heldEditor.waitForClose(HARNESS_TIMEOUTS.message, closesBefore);
+      expect(closed.code).toBe(WS_CLOSE_UNAUTHORIZED);
+      expect(serverAgentCredentialCount()).toBe(0);
+      expect((await h.editor(projectRoot)).authenticated).toBe(true);
+
+      const second = await launchFor(projectRoot);
+      if (isErr(second)) {
+        throw new Error(`The dev server could not be relaunched: ${second.error.message}`);
+      }
+      expect(second.value.pid).not.toBe(first.value.pid);
+      expect(isRunning(first.value.pid)).toBe(false);
+      expect(await answers(second.value.devServerUrl)).toBe(true);
+      expect(serverAgentCredentialCount()).toBe(1);
+    },
+    HARNESS_TIMEOUTS.pipeline * 2,
+  );
 });

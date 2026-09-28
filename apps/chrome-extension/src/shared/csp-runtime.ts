@@ -5,17 +5,19 @@
  * import, and the bridge's build puts it first in the content-script bundle (`vite.config.ts`,
  * `standaloneContentScriptsPlugin`), so it is evaluated before any module that builds a schema.
  *
- * Manifest V3 extension pages run under `script-src 'self' 'wasm-unsafe-eval'`, which no manifest
- * may relax with `'unsafe-eval'`, and the ISOLATED-world bridge runs under an equally eval-free
- * extension policy inside the developer's page. Zod 4 - reached through `./messages` and the
- * `@debuggen/protocol` and `@debuggen/panel-schema` schemas it imports - builds a compiled fast
- * path for every object schema with `new Function`, after probing once whether that is allowed
- * with `new Function('')`. The probe is caught, so nothing breaks, but Chrome still raises a
- * "Content Security Policy of your site blocks the use of 'eval' in JavaScript" issue in DevTools
- * on every load: in the DevTools-on-DevTools window for the two pages, and in the developer's own
- * Issues panel for the bridge. Zod's `jitless` option short-circuits both the probe and the
- * compilation, leaving validation on Zod's interpreted path - the only path this policy permits
- * anyway.
+ * Every extension page runs under the policy the manifest declares as
+ * `content_security_policy.extension_pages` (`../../manifest.config.ts`), whose `script-src` is
+ * exactly `'self'`: no eval of any kind - neither `'unsafe-eval'`, which Manifest V3 forbids an
+ * extension page anyway, nor `'wasm-unsafe-eval'` - and the ISOLATED-world bridge runs under an
+ * equally eval-free extension policy inside the developer's page. Zod 4 - reached through
+ * `./messages` and the `@debuggen/protocol` and `@debuggen/panel-schema` schemas it imports -
+ * builds a compiled fast path for every object schema with `new Function`, after probing once
+ * whether that is allowed with `new Function('')`. The probe is caught, so nothing breaks, but
+ * Chrome still raises a "Content Security Policy of your site blocks the use of 'eval' in
+ * JavaScript" issue in DevTools on every load: in the DevTools-on-DevTools window for the two
+ * pages, and in the developer's own Issues panel for the bridge. Zod's `jitless` option
+ * short-circuits both the probe and the compilation, leaving validation on Zod's interpreted path -
+ * the only path these policies permit anyway.
  *
  * The option is written through `globalThis.__zod_globalConfig`, the object Zod 4 adopts as its
  * `globalConfig` at load and reads `jitless` from each time an object schema is constructed.

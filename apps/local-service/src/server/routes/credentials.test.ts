@@ -3,7 +3,9 @@
  * how `scripts/dev-instrumented.mjs` revokes the server-agent credential it
  * leased from `POST /dev-server/credential` as its dev server exits — and a
  * smoke test that `POST /credentials/rotate`, built by the same factory, still
- * rotates.
+ * rotates, plus the rotation's one call into the launcher: once the rotation
+ * has committed, and only then, the launcher is told so its dev servers are
+ * replaced on their next launch — best effort, never changing the answer.
  *
  * What is on trial is the release's contract with its caller and with the
  * launcher it delegates to:
@@ -190,7 +192,17 @@ interface HarnessOptions {
   readonly releaseCredential?: DevServerLauncher['releaseCredential'];
   /** When `false`, the routes are composed without a launcher at all. */
   readonly launcherWired?: boolean;
+  /** The rotation; by default it succeeds with {@link ROTATION}. */
+  readonly rotateAll?: AuthService['rotateAll'];
+  /**
+   * The launcher's rotation hook; by default it records the call. `null`
+   * composes a launcher that does not implement the optional hook.
+   */
+  readonly credentialsRotated?: RotationHook | null | undefined;
 }
+
+/** The launcher's optional rotation hook, as a callable. */
+type RotationHook = NonNullable<DevServerLauncher['credentialsRotated']>;
 
 /**
  * The two handlers over a fake access boundary, a fake launcher and a
@@ -201,10 +213,11 @@ function harness(options: HarnessOptions = {}) {
   const requireLiveCredential = vi.fn<AuthService['requireLiveCredential']>(
     options.requireLiveCredential ?? (() => ok(undefined)),
   );
-  const rotateAll = vi.fn<AuthService['rotateAll']>(() => ok(ROTATION));
+  const rotateAll = vi.fn<AuthService['rotateAll']>(options.rotateAll ?? (() => ok(ROTATION)));
   const releaseCredential = vi.fn<DevServerLauncher['releaseCredential']>(
     options.releaseCredential ?? (() => Promise.resolve(ok({ released: true }))),
   );
+  const credentialsRotated = vi.fn<RotationHook>(options.credentialsRotated ?? (() => undefined));
   const unwired: Omit<CredentialsRoutesDeps, 'launcher'> = {
     auth: { requireLiveCredential, rotateAll },
     logger: capturingLogger(entries),
@@ -214,9 +227,22 @@ function harness(options: HarnessOptions = {}) {
       ? // A composition that never wired a launcher: the type forbids it, and
         // the handler must still answer rather than crash.
         (unwired as CredentialsRoutesDeps)
-      : { ...unwired, launcher: { releaseCredential } },
+      : {
+          ...unwired,
+          launcher:
+            options.credentialsRotated === null
+              ? { releaseCredential }
+              : { releaseCredential, credentialsRotated },
+        },
   );
-  return { routes, entries, requireLiveCredential, rotateAll, releaseCredential };
+  return {
+    routes,
+    entries,
+    requireLiveCredential,
+    rotateAll,
+    releaseCredential,
+    credentialsRotated,
+  };
 }
 
 /**
@@ -610,7 +636,7 @@ describe('POST /credentials/release — launcher failures', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('POST /credentials/rotate — beside the release', () => {
-  it('rotates on the editor’s request behind the same fence and never asks the launcher', async () => {
+  it('rotates on the editor’s request behind the same fence and asks the launcher to release nothing', async () => {
     const h = harness();
     const principal = editorPrincipal();
 
@@ -626,5 +652,115 @@ describe('POST /credentials/rotate — beside the release', () => {
       h.releaseCredential,
       'a rotation releases nothing through the launcher',
     ).not.toHaveBeenCalled();
+  });
+});
+
+/** A rotation failure that states its outcome, as `rotateAll` words one. */
+function rotationFailure(rotated: boolean): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    rotated
+      ? 'Credentials were rotated, but auth.json could not be updated with the new editor credential.'
+      : 'Credentials were not rotated; every existing credential is still valid.',
+    {
+      hint: 'Restart the Debug Generator service.',
+      details: { operation: 'publish-auth-file', rotated },
+    },
+  );
+}
+
+describe('POST /credentials/rotate — the launched dev servers are told', () => {
+  it('tells the launcher once, right after the rotation committed, so its children are replaced on their next launch', async () => {
+    const h = harness();
+
+    const response = await credentialsApp(h.routes, editorPrincipal()).fetch(
+      jsonRequest(ROTATE_URL, '{}'),
+    );
+
+    expect(response.status).toBe(200);
+    expect(h.credentialsRotated).toHaveBeenCalledTimes(1);
+    expect(h.credentialsRotated).toHaveBeenCalledWith();
+    const [rotatedAt] = h.rotateAll.mock.invocationCallOrder;
+    const [toldAt] = h.credentialsRotated.mock.invocationCallOrder;
+    expect(rotatedAt, 'the launcher is told after the rotation').toBeLessThan(
+      toldAt ?? Number.NEGATIVE_INFINITY,
+    );
+  });
+
+  it('tells the launcher about a rotation that committed but did not finish, and answers its 500', async () => {
+    const h = harness({ rotateAll: () => err(rotationFailure(true)) });
+
+    const response = await credentialsApp(h.routes, editorPrincipal()).fetch(
+      jsonRequest(ROTATE_URL, '{}'),
+    );
+
+    expect(response.status).toBe(500);
+    expect(((await response.json()) as ErrorPayload).message).toContain('Credentials were rotated');
+    expect(h.credentialsRotated).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: 'did not commit', rotateAll: () => err(rotationFailure(false)) },
+    {
+      label: 'states no outcome',
+      rotateAll: () => err(new DebuggenError('INTERNAL', 'The store failed.')),
+    },
+    {
+      label: 'threw',
+      rotateAll: (): ReturnType<AuthService['rotateAll']> => {
+        throw new Error('the store failed');
+      },
+    },
+    {
+      label: 'was refused',
+      rotateAll: () => err(fenceRefusal('unknown-credential')),
+    },
+  ])('never tells the launcher about a rotation that $label', async ({ rotateAll }) => {
+    const h = harness({ rotateAll });
+
+    const response = await credentialsApp(h.routes, editorPrincipal()).fetch(
+      jsonRequest(ROTATE_URL, '{}'),
+    );
+
+    expect(response.status).not.toBe(200);
+    expect(h.credentialsRotated).not.toHaveBeenCalled();
+  });
+
+  it('answers the rotation whole when the launcher’s hook throws, and logs it without its words', async () => {
+    const h = harness({
+      credentialsRotated: () => {
+        throw new Error(`the launcher said ${LEASED_TOKEN}`);
+      },
+    });
+
+    const response = await credentialsApp(h.routes, editorPrincipal()).fetch(
+      jsonRequest(ROTATE_URL, '{}'),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(ROTATION);
+    const warned = h.entries.filter((entry) => entry.level === 'warn');
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.fields).toEqual({ operation: 'credentials.rotate' });
+    expect(logsCarryToken(h.entries)).toBe(false);
+  });
+
+  it.each([
+    {
+      label: 'a launcher without the optional hook',
+      credentialsRotated: null,
+      launcherWired: true,
+    },
+    { label: 'no launcher at all', credentialsRotated: undefined, launcherWired: false },
+  ])('answers the rotation whole with $label', async ({ credentialsRotated, launcherWired }) => {
+    const h = harness({ credentialsRotated, launcherWired });
+
+    const response = await credentialsApp(h.routes, editorPrincipal()).fetch(
+      jsonRequest(ROTATE_URL, '{}'),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(ROTATION);
+    expect(h.rotateAll).toHaveBeenCalledTimes(1);
   });
 });

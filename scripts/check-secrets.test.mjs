@@ -13,7 +13,9 @@
  * rather than inferable from it. Three more blocks carry the other half of the contract: the
  * reviewed allowlist is the only exemption channel and is narrow in both directions; the two
  * `.env.example` files scan clean; and the false positives that would make a gate inside
- * `pnpm verify` unusable do not occur.
+ * `pnpm verify` unusable do not occur. A `UTF-16 text` block then proves that the same rules, and
+ * the same allowlist, reach a file stored as UTF-16LE or UTF-16BE, with or without a byte-order
+ * mark, and that NUL-rich content which is not UTF-16 is not decoded as it.
  *
  * WHY EVERY FIXTURE IS ASSEMBLED AT RUNTIME. This file is tracked content, and the gate scans
  * tracked content - including this file, whose path no allowlist entry names, and rightly so. A
@@ -77,6 +79,7 @@ import {
   MAX_SCAN_BYTES,
   RULE_IDS,
   STREAM_CHUNK_BYTES,
+  UTF16_SAMPLE_BYTES,
   isEnvFileViolation,
   isKeyLikeName,
   loadAllowlist,
@@ -704,6 +707,14 @@ describe('the enforced contract', () => {
   it('bounds the in-memory read of one metadata field by the in-memory file limit', () => {
     // A field's bytes are joined in memory; the byte-for-byte pass still reads everything past it.
     expect(MAX_FIELD_BYTES).toBe(MAX_SCAN_BYTES);
+  });
+
+  it('samples no more bytes for UTF-16 detection than one streamed chunk holds', () => {
+    // A streamed file is classified from its first chunk; the in-memory and streamed paths agree
+    // on a file only because both classify it from the same leading bytes.
+    expect(UTF16_SAMPLE_BYTES).toBeGreaterThan(0);
+    expect(UTF16_SAMPLE_BYTES).toBeLessThanOrEqual(STREAM_CHUNK_BYTES);
+    expect(UTF16_SAMPLE_BYTES % 2).toBe(0);
   });
 
   it('treats the two required example files as the only committable environment files', () => {
@@ -1783,6 +1794,146 @@ describe('content this repository legitimately commits', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * UTF-16 text: the same rules over the text a UTF-16 file decodes to
+ *
+ * A UTF-16 file puts a NUL byte beside every ASCII character, so a reading as UTF-8 matches no
+ * rule however plainly the file holds a credential - and Windows PowerShell 5.1 writes UTF-16LE by
+ * default. These cases hand `scanContent` raw bytes, which it reads as the gate reads a tracked
+ * text file: as UTF-8, and again as UTF-16 when the leading bytes say so.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * `text` encoded as UTF-16 in the given byte order, preceded by that order's byte-order mark when
+ * `bom` is set.
+ *
+ * @param {string} text
+ * @param {'utf-16le' | 'utf-16be'} encoding
+ * @param {boolean} bom
+ * @returns {Buffer}
+ */
+function utf16Bytes(text, encoding, bom) {
+  const body = Buffer.from(text, 'utf16le');
+  if (encoding === 'utf-16be') {
+    body.swap16();
+  }
+  if (!bom) {
+    return body;
+  }
+  const mark = encoding === 'utf-16le' ? [0xff, 0xfe] : [0xfe, 0xff];
+  return Buffer.concat([Buffer.from(mark), body]);
+}
+
+/**
+ * One case per way a UTF-16 file is recognised: each byte order, with and without its mark.
+ * `name` is how a finding's message names the encoding.
+ *
+ * @type {readonly { label: string, encoding: 'utf-16le' | 'utf-16be', bom: boolean,
+ *   name: string }[]}
+ */
+const UTF16_VARIANTS = [
+  { label: 'UTF-16LE with a byte-order mark', encoding: 'utf-16le', bom: true, name: 'UTF-16LE' },
+  { label: 'UTF-16LE without one', encoding: 'utf-16le', bom: false, name: 'UTF-16LE' },
+  { label: 'UTF-16BE with a byte-order mark', encoding: 'utf-16be', bom: true, name: 'UTF-16BE' },
+  { label: 'UTF-16BE without one', encoding: 'utf-16be', bom: false, name: 'UTF-16BE' },
+];
+
+describe('UTF-16 text', () => {
+  /** The vendor-scoped key fixture, which every case below plants. */
+  const credential = PROVIDER_KEY_FIXTURES[0].value;
+
+  it.each(UTF16_VARIANTS)(
+    'reports a provider key stored as $label, naming the encoding',
+    ({ encoding, bom, name }) => {
+      const line = fixtureAssignment(credential);
+      // CRLF, the way a Windows editor or PowerShell writes the file.
+      const text = [...PROSE_BEFORE, line, ...PROSE_AFTER].join('\r\n');
+      const bytes = utf16Bytes(text, encoding, bom);
+      // Read as UTF-8, these bytes hold no rule's shape: the finding is the UTF-16 reading's.
+      expect(scanContent('scripts/deploy.ps1', bytes.toString('utf8'), ALLOWLIST)).toEqual([]);
+
+      const finding = expectSingleFinding(scanContent('scripts/deploy.ps1', bytes, ALLOWLIST), {
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+        file: 'scripts/deploy.ps1',
+        column: columnOf(line, credential),
+      });
+      expect(finding.message).toContain(`decoded as ${name}`);
+      expectValueNeverPrinted(finding, credential);
+    },
+  );
+
+  it('counts the byte-order mark as a column on the first line, as a UTF-8 mark counts', () => {
+    const line = fixtureAssignment(credential);
+    const expectedColumn = columnOf(line, credential) + 1;
+    const utf8 = scanContent('config/key.txt', Buffer.from(`\ufeff${line}`), ALLOWLIST);
+    expect(utf8).toHaveLength(1);
+    expect(utf8[0]).toMatchObject({ line: 1, column: expectedColumn });
+    for (const { encoding } of UTF16_VARIANTS.filter((variant) => variant.bom)) {
+      const findings = scanContent('config/key.txt', utf16Bytes(line, encoding, true), ALLOWLIST);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ line: 1, column: expectedColumn, rule: 'provider-key' });
+    }
+  });
+
+  it('reads a string as it stands, whatever it holds', () => {
+    // Only bytes are decoded; a string that happens to carry the UTF-16 NUL pattern is text.
+    const text = utf16Bytes(fixtureAssignment(credential), 'utf-16le', false).toString('latin1');
+    expect(scanContent('config/key.txt', text, ALLOWLIST)).toEqual([]);
+  });
+
+  it.each(UTF16_VARIANTS)('finds nothing in credential-free text stored as $label', (variant) => {
+    const text = [...PROSE_BEFORE, 'const fixture = 42;', ...PROSE_AFTER].join('\r\n');
+    const bytes = utf16Bytes(text, variant.encoding, variant.bom);
+    expect(scanContentWithSuppressions('docs/notes.txt', bytes, ALLOWLIST)).toEqual({
+      findings: [],
+      allowlisted: [],
+    });
+  });
+
+  it('does not decode NUL-rich bytes whose NULs fall at both parities alike', () => {
+    // The same UTF-16LE key line, first on its own and then followed by zero padding twice its
+    // length, which adds as many NULs at even offsets as at odd ones. Balanced NULs are what zero
+    // fill, image headers and binary residue look like, so the padded file is not UTF-16 to the
+    // gate and its UTF-16 reading - the only one that could find the key - does not happen.
+    const encoded = utf16Bytes(fixtureAssignment(credential), 'utf-16le', false);
+    expect(scanContent('assets/blob.bin', encoded, ALLOWLIST)).toHaveLength(1);
+    const padded = Buffer.concat([encoded, Buffer.alloc(encoded.length * 2)]);
+    expect(scanContent('assets/blob.bin', padded, ALLOWLIST)).toEqual([]);
+  });
+
+  it('still judges a NUL-laden file as UTF-8 text, and does not relabel its findings', () => {
+    // A couple of stray NUL bytes are far below the UTF-16 threshold, so the file is read once.
+    const embedded = SHORT_KEY_PREFIX + cycle(URLSAFE_CHARS, 32);
+    const bytes = Buffer.from(`head\u0000\u0000\n${fixtureAssignment(embedded)}\n`);
+    const findings = scanContent('assets/blob.bin', bytes, ALLOWLIST);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ line: 2, rule: 'provider-key', pattern: SHORT_KEY_PREFIX });
+    expect(findings[0].message).not.toContain('decoded as');
+  });
+
+  it.each(REQUIRED_EXAMPLE_FILES)(
+    'scans $path clean when it is stored as UTF-16LE, on the committed allowlist',
+    ({ path: relPath, fixture }) => {
+      const bytes = utf16Bytes(committedOrFixture(relPath, fixture), 'utf-16le', true);
+      const { findings, allowlisted } = scanContentWithSuppressions(relPath, bytes, ALLOWLIST);
+      expect(findings).toEqual([]);
+      // The pass is the allowlist's doing, exactly as for the UTF-8 file: the placeholder is
+      // matched in the decoded text and exempted there.
+      expect(allowlisted.length).toBeGreaterThan(0);
+      for (const entry of allowlisted) {
+        expect(entry.rule).toBe('connection-string');
+        expect(entry.allowlistValue).toBe(DEV_DATABASE_URL);
+        expect(entry.message).toContain('decoded as UTF-16LE');
+      }
+      // And the exemption stays bound to its paths: the same bytes anywhere else are a finding.
+      const elsewhere = scanContent('config/database.txt', bytes, ALLOWLIST);
+      expect(elsewhere.length).toBeGreaterThan(0);
+      expect(elsewhere.every((finding) => finding.rule === 'connection-string')).toBe(true);
+    },
+  );
+});
+
+/* ---------------------------------------------------------------------------
  * The command line, end to end over a throwaway checkout
  *
  * The rule coverage above needs neither git nor a checkout, and keeping it that way is what makes
@@ -2305,6 +2456,8 @@ describe('the command line', () => {
       expect(report.allowlisted).toEqual([]);
       expect(report.filesTracked).toBe(1);
       expect(report.filesScanned).toBe(1);
+      // The UTF-16 list is always present, so a consumer never has to test for it.
+      expect(report.utf16).toEqual([]);
       expect(report.rules).toEqual([...RULE_IDS]);
       // The committed allowlist stays in force even when the scan points elsewhere.
       expect(report.allowlistPath).toBe(DEFAULT_ALLOWLIST_PATH);
@@ -2513,6 +2666,96 @@ describe('the command line', () => {
         `${BINARY_FIXTURES.length + 5} files scanned (${BINARY_FIXTURES.length} binary)`,
       );
       expect(text.stdout).not.toContain('skipped');
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'exits 1 on a key in each UTF-16 byte order, with or without a mark, and lists the files',
+    async () => {
+      // The QA reproduction: the same assignment stored in UTF-16LE and UTF-16BE, each with and
+      // without its byte-order mark, and a PowerShell script as Windows PowerShell 5.1 writes one
+      // - UTF-16LE with a mark. Read as UTF-8 alone, none of them holds a finding.
+      const credential = PROVIDER_KEY_FIXTURES[0].value;
+      const configLine = `key = "${credential}"`;
+      const config = `# config\r\n${configLine}\r\n`;
+      const scriptLine = `$env:KEY = "${credential}"`;
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'cfg/be-bom.txt', utf16Bytes(config, 'utf-16be', true));
+      trackFile(directory, 'cfg/be-nobom.txt', utf16Bytes(config, 'utf-16be', false));
+      trackFile(directory, 'cfg/deploy.ps1', utf16Bytes(`${scriptLine}\r\n`, 'utf-16le', true));
+      trackFile(directory, 'cfg/le-bom.txt', utf16Bytes(config, 'utf-16le', true));
+      trackFile(directory, 'cfg/le-nobom.txt', utf16Bytes(config, 'utf-16le', false));
+      // Zero fill has NUL bytes at both parities alike: text mode, and not UTF-16.
+      trackFile(directory, 'data/zero.bin', Buffer.alloc(256));
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.unscanned).toEqual([]);
+      expect(report.binaries).toEqual([]);
+      expect(report.filesTracked).toBe(7);
+      expect(report.filesScanned).toBe(7);
+      expect(report.utf16).toEqual([
+        { file: 'cfg/be-bom.txt', encoding: 'utf-16be', bom: true },
+        { file: 'cfg/be-nobom.txt', encoding: 'utf-16be', bom: false },
+        { file: 'cfg/deploy.ps1', encoding: 'utf-16le', bom: true },
+        { file: 'cfg/le-bom.txt', encoding: 'utf-16le', bom: true },
+        { file: 'cfg/le-nobom.txt', encoding: 'utf-16le', bom: false },
+      ]);
+      // One finding per file, at the line and column of the decoded text; the script's mark sits
+      // on the key's own line, so it counts as that line's first column.
+      const configColumn = columnOf(configLine, credential);
+      /**
+       * The expected summary of one finding.
+       *
+       * @param {string} file
+       * @param {number} line
+       * @param {number} column
+       * @param {string} name The encoding the message must name.
+       */
+      const at = (file, line, column, name) => ({
+        file,
+        line,
+        column,
+        rule: 'provider-key',
+        pattern: VENDOR_KEY_PREFIX,
+        name,
+      });
+      /**
+       * A reported finding in the shape of {@link at}, with the encoding its message names.
+       *
+       * @param {{ file: string, line: number, column: number, rule: string, pattern: string,
+       *   message: string }} finding
+       */
+      const summarize = (finding) => ({
+        file: finding.file,
+        line: finding.line,
+        column: finding.column,
+        rule: finding.rule,
+        pattern: finding.pattern,
+        name: /decoded as (UTF-16[LB]E)$/.exec(finding.message)?.[1],
+      });
+      expect(report.findings.map(summarize)).toEqual([
+        at('cfg/be-bom.txt', 2, configColumn, 'UTF-16BE'),
+        at('cfg/be-nobom.txt', 2, configColumn, 'UTF-16BE'),
+        at('cfg/deploy.ps1', 1, columnOf(scriptLine, credential) + 1, 'UTF-16LE'),
+        at('cfg/le-bom.txt', 2, configColumn, 'UTF-16LE'),
+        at('cfg/le-nobom.txt', 2, configColumn, 'UTF-16LE'),
+      ]);
+      for (const finding of report.findings) {
+        expectValueNeverPrinted(finding, credential);
+      }
+      expect(stdout).not.toContain(credential);
+
+      const text = await runCli([], { cwd: directory });
+      expect(text.exitCode).toBe(EXIT_FINDINGS);
+      expect(text.stdout).toContain('cfg/deploy.ps1:1: provider-key:');
+      expect(text.stdout).toContain('7 files scanned (5 UTF-16), 5 findings');
+      expect(text.stdout).not.toContain(credential);
     },
     20_000,
   );
@@ -3144,6 +3387,89 @@ describe('the command line', () => {
       });
       // And exactly what the in-memory reader reports over the same text.
       expect(report.findings).toEqual(scanContent('data/dump.sql', content, ALLOWLIST));
+    },
+    30_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'streams a UTF-16 file over the in-memory limit at the positions an in-memory decode yields',
+    async () => {
+      // Layout, in UTF-16 code units of a BOM-less UTF-16LE file (two bytes each, so a chunk holds
+      // `chunkUnits`): a key straddles the first chunk boundary, after a surrogate pair on the same
+      // line; then a dense value bound to a key-like name opens with a surrogate pair that
+      // straddles the second boundary - its high half the second chunk's last code unit. A reader
+      // that split lines per chunk would lose the key; a decoder that restarted per chunk, or
+      // kept a view of the reused chunk buffer, would turn the pair into replacement characters,
+      // which the entropy finding's preview - the value's first four code units - would show.
+      const chunkUnits = STREAM_CHUNK_BYTES / 2;
+      const filler = '# Filler line, deliberately free of any matchable shape.\n';
+      /**
+       * ASCII text of exactly `units` characters, ending in a newline.
+       *
+       * @param {number} units
+       * @returns {string}
+       */
+      const fillerOf = (units) => {
+        const whole = Math.floor(units / filler.length);
+        const rest = units - whole * filler.length;
+        return filler.repeat(whole) + (rest > 0 ? `${'.'.repeat(rest - 1)}\n` : '');
+      };
+      const pair = '\u{1F511}';
+      const first = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 40);
+      const second = pair + DENSE_VALUE;
+      const firstLine = `${pair} ${fixtureAssignment(first)}`;
+      const secondLine = `apiToken = "${second}"`;
+      const firstStart = chunkUnits - 8 - (columnOf(firstLine, first) - 1);
+      const head = fillerOf(firstStart) + firstLine + '\r\n';
+      const middle = fillerOf(2 * chunkUnits - 1 - secondLine.indexOf(pair) - head.length);
+      const text = `${head}${middle}${secondLine}\n# Tail.\nlast line, no newline`;
+      const bytes = utf16Bytes(text, 'utf-16le', false);
+
+      // The layout is asserted, not assumed.
+      expect(pair).toHaveLength(2);
+      const firstByte = 2 * text.indexOf(first);
+      expect(firstByte).toBeLessThan(STREAM_CHUNK_BYTES);
+      expect(firstByte + 2 * first.length).toBeGreaterThan(STREAM_CHUNK_BYTES);
+      expect(2 * text.indexOf(second)).toBe(2 * STREAM_CHUNK_BYTES - 2);
+      expect(bytes.length).toBeGreaterThan(MAX_SCAN_BYTES);
+
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'data/export.sql', bytes);
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.unscanned).toEqual([]);
+      expect(report.filesScanned).toBe(1);
+      expect(report.utf16).toEqual([{ file: 'data/export.sql', encoding: 'utf-16le', bom: false }]);
+
+      const lines = text.split(/\r?\n/);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'data/export.sql',
+        line: lines.indexOf(firstLine) + 1,
+        column: columnOf(firstLine, first),
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'data/export.sql',
+        line: lines.indexOf(secondLine) + 1,
+        column: columnOf(secondLine, second),
+        rule: 'entropy',
+        pattern: 'apiToken',
+      });
+      // The pair decoded whole, across the boundary: the preview opens with it, not with U+FFFD.
+      expect(report.findings[1].preview.startsWith(pair)).toBe(true);
+      expectValueNeverPrinted(report.findings[0], first);
+      expectValueNeverPrinted(report.findings[1], second);
+      for (const finding of report.findings) {
+        expect(finding.message).toContain('decoded as UTF-16LE');
+      }
+      expect(stdout).not.toContain(first);
+      expect(stdout).not.toContain(DENSE_VALUE);
+      // And exactly what the in-memory reader reports over the same bytes.
+      expect(report.findings).toEqual(scanContent('data/export.sql', bytes, ALLOWLIST));
     },
     30_000,
   );

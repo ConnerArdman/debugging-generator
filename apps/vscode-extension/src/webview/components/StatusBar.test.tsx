@@ -9,6 +9,8 @@
  *     reconnect — AAP 0.5.5's "Reconnecting…").
  *   - **A pill per session status**, total over the protocol's eleven statuses.
  *   - **The provider verbatim**, and nothing invented when it is absent.
+ *   - **Direction controls are shown, never obeyed**: a U+202E/U+202C pair in
+ *     the provider or the service URL prints as visible escapes.
  *   - **The retry callback**, offered as an enabled control in every state but
  *     `open`, and invoked exactly once, with no arguments, when activated.
  *   - **The three states**: empty (the connection pill still renders), loading
@@ -719,5 +721,40 @@ describe('StatusBar exhaustiveness', () => {
     expect(() => render(<StatusBar connection="open" sessionStatus={unknownStatus} />)).toThrow(
       /Unhandled session status/,
     );
+  });
+});
+
+describe('StatusBar direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) inside the two
+   * configured strings the bar shows. Every code point is written as an escape
+   * so this suite is not itself a carrier of what it defends against.
+   */
+  const PROVIDER = 'synthetic\u202Eredivorp\u202C';
+
+  /** Not a parseable URL, so the bar shows it as scrubbed text, not rebuilt. */
+  const SERVICE_TEXT = 'local\u202Ehost\u202C:43117/ws';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  it('shows each control of the provider and the service URL as a visible escape', () => {
+    const { container } = render(
+      <StatusBar connection="open" provider={PROVIDER} serviceUrl={SERVICE_TEXT} />,
+    );
+
+    expect(badge('synthetic\\u202Eredivorp\\u202C').textContent).toBe(
+      'synthetic\\u202Eredivorp\\u202C',
+    );
+    const code = container.querySelector('code');
+    expect(code?.textContent).toBe('local\\u202Ehost\\u202C:43117/ws');
+    expect(code?.getAttribute('title')).toBe('local\\u202Ehost\\u202C:43117/ws');
+
+    expect(container.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(container.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
   });
 });

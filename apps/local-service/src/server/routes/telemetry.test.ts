@@ -11,6 +11,11 @@
  * `../auth.ts`'s, setting the server-agent principal it would have resolved,
  * with a fake revocation fence. No HTTP server and no socket is opened.
  *
+ * The relayed-tab cases pin that a frame's tab is resolved to the connection's
+ * own credential's live binding: ingest is handed that binding's holder
+ * (`boundBy`), so attribution reads that holder's durable row, and a tab id only
+ * another paired browser bound is refused before ingest — never a holder logged.
+ *
  * The ingest cases pin what the route hands ingest — the body's delivery
  * context (`armedCaptureId`, `droppedCount`, `lossReportId`) exactly as sent,
  * and nothing it omitted — and what it refuses before ingest, without echoing
@@ -45,7 +50,13 @@ import type {
   TelemetryIngest,
 } from '../../telemetry/ingest.js';
 import { AUTH_FAILURE_REASONS } from '../auth.js';
-import type { AuthFailureReason, AuthService, ServerAgentPrincipal, ServerEnv } from '../auth.js';
+import type {
+  AuthFailureReason,
+  AuthService,
+  Principal,
+  ServerAgentPrincipal,
+  ServerEnv,
+} from '../auth.js';
 import type { TabBindingView } from '../clients.js';
 
 import {
@@ -72,10 +83,15 @@ const SESSION_OF_TAB: ReadonlyMap<number, string> = new Map([
   [OTHER_TAB, 'ses_relaytabeight'],
 ]);
 
-/** The live binding of `tabId`, made by the connection's credential, if the tab is bound. */
-function liveBinding(tabId: number): TabBindingView | undefined {
+/**
+ * The live binding of `tabId`, made by the paired credential ({@link TOKEN_HASH}),
+ * if the tab is bound. Asked for another credential, it answers nothing — as
+ * the client registry does: a tab id is unique only within one browser, and
+ * another browser's tab of the same id is not this binding's tab.
+ */
+function liveBinding(tabId: number, principal?: Principal): TabBindingView | undefined {
   const sessionId = SESSION_OF_TAB.get(tabId);
-  return sessionId === undefined
+  return sessionId === undefined || (principal !== undefined && principal.tokenHash !== TOKEN_HASH)
     ? undefined
     : {
         tabId,
@@ -146,15 +162,15 @@ function reportOf(counts: { persisted: number; invalid: number }): IngestReport 
   return report as IngestReport;
 }
 
-/** The DevTools connection every frame arrives on, announcing `tabId`. */
-function connection(tabId: number): TelemetryFrameConnection {
+/** The DevTools connection every frame arrives on, announcing `tabId`, of the paired credential by default. */
+function connection(tabId: number, tokenHash: string = TOKEN_HASH): TelemetryFrameConnection {
   return {
     id: 'cli_relay',
     kind: 'devtools',
     tabId,
     principal: {
       role: 'devtools',
-      tokenHash: TOKEN_HASH,
+      tokenHash,
       scope: { kind: 'extension', extensionId: 'abcdefghijklmnopabcdefghijklmnop' },
       issuedAt: 0,
     },
@@ -206,7 +222,7 @@ function harness(
       bindingForTab: liveBinding,
       bindingForSession: (sessionId) =>
         [...SESSION_OF_TAB.keys()]
-          .map(liveBinding)
+          .map((tabId) => liveBinding(tabId))
           .find((binding) => binding?.sessionId === sessionId),
     },
     auth: { requireLiveCredential },
@@ -475,6 +491,39 @@ function heldBody(): HeldBody {
     },
   };
 }
+
+describe('the relayed tab’s holder', () => {
+  /** Another paired browser's credential digest, whose tab ids may equal the first browser's. */
+  const OTHER_TOKEN_HASH = 'e'.repeat(64);
+
+  it('hands ingest the verified holder of the acting tab’s live binding', async () => {
+    const h = harness(() => ok(reportOf({ persisted: 1, invalid: 0 })));
+
+    expect((await h.routes.handleTelemetryEventFrame(frame(['event']))).ok).toBe(true);
+
+    expect(h.ingestFromAgent).toHaveBeenCalledTimes(1);
+    expect(h.ingestFromAgent.mock.calls[0]?.[0]).toMatchObject({ tabId: TAB, boundBy: TOKEN_HASH });
+    expect(JSON.stringify(h.entries), 'the holder is never logged').not.toContain(TOKEN_HASH);
+  });
+
+  it('refuses a frame for a tab id only another credential bound, before ingest', async () => {
+    const h = harness(() => ok(reportOf({ persisted: 1, invalid: 0 })));
+    const foreign: TelemetryEventFrame = {
+      ...frame(['event']),
+      client: connection(TAB, OTHER_TOKEN_HASH),
+    };
+
+    const refused = await h.routes.handleTelemetryEventFrame(foreign);
+
+    expect(isErr(refused) && refused.error.code).toBe(
+      AUTH_FAILURE_REASONS['session-not-bound'].code,
+    );
+    expect(h.ingestFromAgent).not.toHaveBeenCalled();
+    const logged = JSON.stringify(h.entries);
+    expect(logged, 'neither holder is logged').not.toContain(TOKEN_HASH);
+    expect(logged).not.toContain(OTHER_TOKEN_HASH);
+  });
+});
 
 describe('POST /telemetry/ingest — the revocation fence', () => {
   it('ingests the batch once, after confirming the resolved credential is still live', async () => {

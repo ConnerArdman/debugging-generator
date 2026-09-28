@@ -24,6 +24,17 @@
  * which session the frame belonged to and which connections missed it, of
  * which kind and why — directly for one recipient, as parallel arrays for
  * several — and never a principal or its digest.
+ *
+ * Bindings belong to the DevTools credential that made them and its tab
+ * (AAP §0.2.3, §0.5.6):
+ *
+ * - a second credential binding the very tab and session another holds is a
+ *   takeover: the first holder's binding is displaced, its connection is sent
+ *   the release (`replaced`) and never the new holder's establishment, and the
+ *   new holder is sent the establishment and never the release;
+ * - a Chrome tab id is unique only within one browser, so two credentials'
+ *   bindings of the same tab id coexist, and every tab lookup, navigation,
+ *   unbind and awaiting record is resolved for the given credential only.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -39,7 +50,7 @@ import {
   SOCKET_READY_STATE_OPEN,
   createClientRegistry,
 } from './clients.js';
-import type { ClientRegistry, ClientSocket, RegisteredClient } from './clients.js';
+import type { BindTabOutcome, ClientRegistry, ClientSocket, RegisteredClient } from './clients.js';
 
 /** A fixed clock reading, so every timestamp is exact. */
 const FIXED_NOW = 1_760_000_000_000;
@@ -406,7 +417,7 @@ describe('releasing a slot keeps the credential’s tab binding', () => {
     const reconnected = connectDevtools(clients, principal);
     expect(clients.get(closedDevtools.client.id)).toBeUndefined();
 
-    const binding = clients.bindingForTab(TAB_ID);
+    const binding = clients.bindingForTab(TAB_ID, principal);
     expect(binding).toMatchObject({
       tabId: TAB_ID,
       sessionId: SESSION_ID,
@@ -430,7 +441,7 @@ describe('releasing a slot keeps the credential’s tab binding', () => {
     connectEditor(clients);
     expect(clients.get(closedDevtools.client.id)).toBeUndefined();
 
-    const binding = clients.bindingForTab(TAB_ID);
+    const binding = clients.bindingForTab(TAB_ID, principal);
     expect(binding).toMatchObject({
       tabId: TAB_ID,
       sessionId: SESSION_ID,
@@ -646,5 +657,466 @@ describe('the frame-drop record names who missed the frame and why', () => {
 
     expect(clients.broadcast(SESSION_ID, progressFrame(SESSION_ID))).toBe(2);
     expect(dropRecords(records)).toHaveLength(0);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A second bind of the same tab and session by another credential (AAP §0.2.3)
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('a takeover of the same tab and session by another credential', () => {
+  const TAB_ID = 1;
+  const OTHER_TAB_ID = 2;
+  const SESSION_ID = 'ses_takeover0123456789';
+  const BOUND_URL = 'http://127.0.0.1:3000/products';
+  const ANNOUNCEMENT_KINDS = ['devtools', 'vscode'] as const;
+
+  /** A `session.bound` frame for the session, as `routes/binding.ts` frames one. */
+  function announcement(
+    tabId: number,
+    reason: 'bound' | 'replaced' | 'navigated' | 'unbound' | 'origin-changed',
+  ): ProtocolMessage {
+    return createEnvelope('session.bound', {
+      sessionId: SESSION_ID,
+      tabId,
+      url: BOUND_URL,
+      reason,
+    });
+  }
+
+  /** The `reason` of every `session.bound` a socket was written, in order. */
+  function reasonsSent(socket: FakeSocket): string[] {
+    return socket.sent.flatMap((frame) => {
+      const parsed: unknown = JSON.parse(frame);
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        'type' in parsed &&
+        parsed.type === 'session.bound' &&
+        'payload' in parsed &&
+        typeof parsed.payload === 'object' &&
+        parsed.payload !== null &&
+        'reason' in parsed.payload &&
+        typeof parsed.payload.reason === 'string'
+      ) {
+        return [parsed.payload.reason];
+      }
+      return [];
+    });
+  }
+
+  /** Two paired extensions and an editor following the session; the first credential binds the tab. */
+  function boundByFirst(): {
+    readonly clients: ClientRegistry;
+    readonly first: Connection;
+    readonly second: Connection;
+    readonly editor: Connection;
+    readonly firstPrincipal: DevtoolsPrincipal;
+    readonly secondPrincipal: DevtoolsPrincipal;
+  } {
+    const { clients } = openRegistry(8);
+    const firstPrincipal = devtoolsPrincipal();
+    const secondPrincipal = devtoolsPrincipal();
+    const first = connectDevtools(clients, firstPrincipal);
+    const second = connectDevtools(clients, secondPrincipal);
+    const editor = connectEditor(clients);
+    expectOk(clients.attachSession(editor.client.id, SESSION_ID));
+    expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: firstPrincipal,
+        clientId: first.client.id,
+      }),
+    );
+    return { clients, first, second, editor, firstPrincipal, secondPrincipal };
+  }
+
+  it('reports the first credential’s binding displaced, to be announced replaced', () => {
+    const { clients, second, firstPrincipal, secondPrincipal } = boundByFirst();
+
+    const outcome = expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+
+    expect(outcome.reason).toBe('bound');
+    expect(outcome.binding).toMatchObject({
+      tabId: TAB_ID,
+      sessionId: SESSION_ID,
+      boundBy: secondPrincipal.tokenHash,
+    });
+    expect(outcome.displaced).toHaveLength(1);
+    expect(outcome.displaced[0]).toMatchObject({
+      reason: 'replaced',
+      binding: { tabId: TAB_ID, sessionId: SESSION_ID, boundBy: firstPrincipal.tokenHash },
+    });
+    expect(clients.bindingForSession(SESSION_ID)?.boundBy).toBe(secondPrincipal.tokenHash);
+    expect(clients.stats().bindings).toBe(1);
+  });
+
+  it('keeps a re-announcement by the same credential idempotent: nothing is displaced', () => {
+    const { clients, first, firstPrincipal } = boundByFirst();
+
+    const outcome = expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: firstPrincipal,
+        clientId: first.client.id,
+      }),
+    );
+
+    expect(outcome.displaced).toEqual([]);
+    expect(clients.bindingForSession(SESSION_ID)?.boundBy).toBe(firstPrincipal.tokenHash);
+  });
+
+  it('sends the release to the displaced credential and the editor only, and the establishment to the new holder and the editor only', () => {
+    const { clients, first, second, editor, secondPrincipal } = boundByFirst();
+    expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+
+    // The order `routes/binding.ts` announces a takeover in: the release, then the establishment.
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(TAB_ID, 'replaced')),
+    ).toBe(2);
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(TAB_ID, 'bound')),
+    ).toBe(2);
+    // A later establishment of the standing binding (a reload) is the holder's too.
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(TAB_ID, 'navigated')),
+    ).toBe(2);
+
+    expect(reasonsSent(first.socket)).toEqual(['replaced']);
+    expect(reasonsSent(second.socket)).toEqual(['bound', 'navigated']);
+    expect(reasonsSent(editor.socket)).toEqual(['replaced', 'bound', 'navigated']);
+
+    // Every other frame of the session reaches the new holder, never the displaced one.
+    expect(clients.broadcast(SESSION_ID, progressFrame(SESSION_ID))).toBe(2);
+    expect(first.socket.sent).toHaveLength(1);
+    expect(second.socket.sent).toHaveLength(3);
+  });
+
+  it('lets a released credential be sent a release directly, and never an establishment', () => {
+    const { clients, first, second, secondPrincipal } = boundByFirst();
+    expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+
+    expectOk(clients.sendToClient(first.client.id, announcement(TAB_ID, 'replaced')));
+    expect(
+      expectErr(clients.sendToClient(first.client.id, announcement(TAB_ID, 'bound'))).code,
+    ).toBe('UNAUTHORIZED');
+    expect(
+      expectErr(clients.sendToClient(first.client.id, announcement(TAB_ID, 'navigated'))).code,
+    ).toBe('UNAUTHORIZED');
+    expectOk(clients.sendToClient(second.client.id, announcement(TAB_ID, 'bound')));
+
+    expect(reasonsSent(first.socket)).toEqual(['replaced']);
+    expect(reasonsSent(second.socket)).toEqual(['bound']);
+  });
+
+  it('still tells a credential that moved the session to another of its own tabs that the first tab was released', () => {
+    const { clients, first, editor, firstPrincipal } = boundByFirst();
+    const moved = expectOk(
+      clients.bindTab({
+        tabId: OTHER_TAB_ID,
+        sessionId: SESSION_ID,
+        url: BOUND_URL,
+        principal: firstPrincipal,
+        clientId: first.client.id,
+      }),
+    );
+    expect(moved.displaced).toHaveLength(1);
+    expect(moved.displaced[0]?.binding.tabId).toBe(TAB_ID);
+
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(TAB_ID, 'replaced')),
+    ).toBe(2);
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(OTHER_TAB_ID, 'bound')),
+    ).toBe(2);
+
+    expect(reasonsSent(first.socket)).toEqual(['replaced', 'bound']);
+    expect(reasonsSent(editor.socket)).toEqual(['replaced', 'bound']);
+  });
+
+  it('sends an unbind to the credential that released the binding and the editor', () => {
+    const { clients, first, second, editor, firstPrincipal } = boundByFirst();
+    const dropped = expectOk(clients.unbindTab(TAB_ID, { principal: firstPrincipal }));
+    expect(dropped?.reason).toBe('unbound');
+
+    expect(
+      clients.broadcastToKinds(SESSION_ID, ANNOUNCEMENT_KINDS, announcement(TAB_ID, 'unbound')),
+    ).toBe(2);
+    expect(reasonsSent(first.socket)).toEqual(['unbound']);
+    expect(reasonsSent(editor.socket)).toEqual(['unbound']);
+    expect(second.socket.sent).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Two paired browsers whose tab ids collide (a tab id is unique only within one browser)
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('bindings are keyed by the credential that made them and the tab', () => {
+  /** The tab id both browsers happen to use. */
+  const TAB_ID = 7;
+  const FIRST_SESSION_ID = 'ses_firstbrowser012345';
+  const SECOND_SESSION_ID = 'ses_secondbrowser01234';
+  const FIRST_URL = 'http://127.0.0.1:3000/products';
+  const SECOND_URL = 'http://127.0.0.1:3100/orders';
+  const FIRST_ORIGIN = 'http://127.0.0.1:3000';
+  const SECOND_ORIGIN = 'http://127.0.0.1:3100';
+
+  /** Two paired browsers, each binding its own tab 7 to its own session. */
+  function bothBound(): {
+    readonly clients: ClientRegistry;
+    readonly first: Connection;
+    readonly second: Connection;
+    readonly firstPrincipal: DevtoolsPrincipal;
+    readonly secondPrincipal: DevtoolsPrincipal;
+    readonly secondOutcome: BindTabOutcome;
+  } {
+    const { clients } = openRegistry(8);
+    const firstPrincipal = devtoolsPrincipal();
+    const secondPrincipal = devtoolsPrincipal();
+    const first = connectDevtools(clients, firstPrincipal);
+    const second = connectDevtools(clients, secondPrincipal);
+    expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: FIRST_SESSION_ID,
+        url: FIRST_URL,
+        principal: firstPrincipal,
+        clientId: first.client.id,
+      }),
+    );
+    const secondOutcome = expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SECOND_SESSION_ID,
+        url: SECOND_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+    return { clients, first, second, firstPrincipal, secondPrincipal, secondOutcome };
+  }
+
+  it('keeps both browsers’ bindings of the same tab id, and displaces neither', () => {
+    const { clients, first, second, firstPrincipal, secondPrincipal, secondOutcome } = bothBound();
+
+    expect(secondOutcome.reason).toBe('bound');
+    expect(secondOutcome.displaced).toEqual([]);
+    expect(clients.stats().bindings).toBe(2);
+
+    expect(clients.bindingForTab(TAB_ID, firstPrincipal)).toMatchObject({
+      tabId: TAB_ID,
+      sessionId: FIRST_SESSION_ID,
+      url: FIRST_URL,
+      boundBy: firstPrincipal.tokenHash,
+      recipientId: first.client.id,
+    });
+    expect(clients.bindingForTab(TAB_ID, secondPrincipal)).toMatchObject({
+      tabId: TAB_ID,
+      sessionId: SECOND_SESSION_ID,
+      url: SECOND_URL,
+      boundBy: secondPrincipal.tokenHash,
+      recipientId: second.client.id,
+    });
+    expect(clients.bindingForSession(FIRST_SESSION_ID)?.boundBy).toBe(firstPrincipal.tokenHash);
+    expect(clients.bindingForSession(SECOND_SESSION_ID)?.boundBy).toBe(secondPrincipal.tokenHash);
+
+    // Each session's tab traffic reaches its own browser only.
+    const toFirst = expectOk(
+      clients.sendToBoundTab(FIRST_SESSION_ID, progressFrame(FIRST_SESSION_ID)),
+    );
+    const toSecond = expectOk(
+      clients.sendToBoundTab(SECOND_SESSION_ID, progressFrame(SECOND_SESSION_ID)),
+    );
+    expect(toFirst.recipients).toEqual([first.client.id]);
+    expect(toSecond.recipients).toEqual([second.client.id]);
+    expect(clients.list({ sessionId: FIRST_SESSION_ID }).map((client) => client.id)).toEqual([
+      first.client.id,
+    ]);
+    expect(clients.list({ sessionId: SECOND_SESSION_ID }).map((client) => client.id)).toEqual([
+      second.client.id,
+    ]);
+  });
+
+  it('answers a tab id only for the credential that bound it', () => {
+    const { clients, firstPrincipal, secondPrincipal } = bothBound();
+    const stranger = devtoolsPrincipal();
+    connectDevtools(clients, stranger);
+
+    expect(clients.bindingForTab(TAB_ID, stranger)).toBeUndefined();
+    expect(clients.bindingForTab(TAB_ID, editorPrincipal())).toBeUndefined();
+
+    expect(clients.tabHeldByAnotherCredential(TAB_ID, stranger)).toBe(true);
+    expect(clients.tabHeldByAnotherCredential(TAB_ID, firstPrincipal)).toBe(false);
+    expect(clients.tabHeldByAnotherCredential(TAB_ID, secondPrincipal)).toBe(false);
+    expect(clients.tabHeldByAnotherCredential(TAB_ID + 1, stranger)).toBe(false);
+  });
+
+  it('matches a tab filter only on the connection carrying its own credential’s binding', () => {
+    const { clients, first, second } = bothBound();
+    const stranger = connectDevtools(clients, devtoolsPrincipal());
+
+    const matched = clients.list({ tabId: TAB_ID }).map((client) => client.id);
+    expect(matched).toHaveLength(2);
+    expect(matched).toEqual(expect.arrayContaining([first.client.id, second.client.id]));
+    expect(matched).not.toContain(stranger.client.id);
+  });
+
+  it('moves only the navigating credential’s binding to its new URL', () => {
+    const { clients, firstPrincipal, secondPrincipal } = bothBound();
+    const nextUrl = `${SECOND_ORIGIN}/orders/weekly`;
+
+    const navigated = expectOk(
+      clients.updateTabUrl({ tabId: TAB_ID, url: nextUrl, principal: secondPrincipal }),
+    );
+    expect(navigated.reason).toBe('navigated');
+    expect(navigated.binding.sessionId).toBe(SECOND_SESSION_ID);
+    expect(clients.bindingForTab(TAB_ID, secondPrincipal)?.url).toBe(nextUrl);
+    expect(clients.bindingForTab(TAB_ID, firstPrincipal)?.url).toBe(FIRST_URL);
+
+    const stranger = devtoolsPrincipal();
+    expect(
+      expectErr(clients.updateTabUrl({ tabId: TAB_ID, url: nextUrl, principal: stranger })).code,
+    ).toBe('TAB_NOT_BOUND');
+    expect(
+      expectErr(clients.updateTabUrl({ tabId: TAB_ID, url: nextUrl, principal: editorPrincipal() }))
+        .code,
+    ).toBe('UNAUTHORIZED');
+  });
+
+  it('drops only the unbinding credential’s binding of the tab id', () => {
+    const { clients, first, firstPrincipal, secondPrincipal } = bothBound();
+
+    const stranger = devtoolsPrincipal();
+    expect(expectOk(clients.unbindTab(TAB_ID, { principal: stranger }))).toBeUndefined();
+    expect(clients.stats().bindings).toBe(2);
+    expect(expectErr(clients.unbindTab(TAB_ID, { principal: editorPrincipal() })).code).toBe(
+      'UNAUTHORIZED',
+    );
+
+    const dropped = expectOk(clients.unbindTab(TAB_ID, { principal: secondPrincipal }));
+    expect(dropped?.reason).toBe('unbound');
+    expect(dropped?.binding.sessionId).toBe(SECOND_SESSION_ID);
+    expect(clients.bindingForTab(TAB_ID, secondPrincipal)).toBeUndefined();
+    expect(clients.bindingForSession(SECOND_SESSION_ID)).toBeUndefined();
+
+    expect(clients.bindingForTab(TAB_ID, firstPrincipal)?.sessionId).toBe(FIRST_SESSION_ID);
+    expect(clients.stats().bindings).toBe(1);
+    const toFirst = expectOk(
+      clients.sendToBoundTab(FIRST_SESSION_ID, progressFrame(FIRST_SESSION_ID)),
+    );
+    expect(toFirst.recipients).toEqual([first.client.id]);
+  });
+
+  it('still lets one session accept one bound tab: a bind of another browser’s bound session replaces it', () => {
+    const { clients, second, firstPrincipal, secondPrincipal } = bothBound();
+
+    // The second browser binds its tab 7 to the first browser's session: the
+    // session's previous binding (the first browser's tab 7) and the second
+    // browser's previous binding of its own tab 7 are both released.
+    const moved = expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: FIRST_SESSION_ID,
+        url: FIRST_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+    expect(moved.reason).toBe('bound');
+    const displaced = moved.displaced.map((change) => ({
+      sessionId: change.binding.sessionId,
+      boundBy: change.binding.boundBy,
+      reason: change.reason,
+    }));
+    expect(displaced).toHaveLength(2);
+    expect(displaced).toEqual(
+      expect.arrayContaining([
+        { sessionId: SECOND_SESSION_ID, boundBy: secondPrincipal.tokenHash, reason: 'replaced' },
+        { sessionId: FIRST_SESSION_ID, boundBy: firstPrincipal.tokenHash, reason: 'replaced' },
+      ]),
+    );
+
+    expect(clients.bindingForTab(TAB_ID, firstPrincipal)).toBeUndefined();
+    expect(clients.bindingForTab(TAB_ID, secondPrincipal)?.sessionId).toBe(FIRST_SESSION_ID);
+    expect(clients.bindingForSession(SECOND_SESSION_ID)).toBeUndefined();
+    expect(clients.stats().bindings).toBe(1);
+  });
+
+  it('keeps each browser’s record of a tab awaiting a session, and clears only the binder’s', () => {
+    const { clients } = openRegistry(8);
+    const firstPrincipal = devtoolsPrincipal();
+    const secondPrincipal = devtoolsPrincipal();
+    const first = connectDevtools(clients, firstPrincipal);
+    const second = connectDevtools(clients, secondPrincipal);
+
+    expectOk(
+      clients.awaitSession({
+        tabId: TAB_ID,
+        origin: FIRST_ORIGIN,
+        principal: firstPrincipal,
+        clientId: first.client.id,
+      }),
+    );
+    expectOk(
+      clients.awaitSession({
+        tabId: TAB_ID,
+        origin: SECOND_ORIGIN,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+    expect(clients.awaitedOriginForTab(TAB_ID, firstPrincipal)).toBe(FIRST_ORIGIN);
+    expect(clients.awaitedOriginForTab(TAB_ID, secondPrincipal)).toBe(SECOND_ORIGIN);
+    expect(clients.awaitedOriginForTab(TAB_ID, devtoolsPrincipal())).toBeUndefined();
+    expect(clients.awaitedOriginForTab(TAB_ID, editorPrincipal())).toBeUndefined();
+
+    // Binding the second browser's tab ends only that browser's record.
+    expectOk(
+      clients.bindTab({
+        tabId: TAB_ID,
+        sessionId: SECOND_SESSION_ID,
+        url: SECOND_URL,
+        principal: secondPrincipal,
+        clientId: second.client.id,
+      }),
+    );
+    expect(clients.awaitedOriginForTab(TAB_ID, secondPrincipal)).toBeUndefined();
+    expect(clients.awaitedOriginForTab(TAB_ID, firstPrincipal)).toBe(FIRST_ORIGIN);
+
+    // Another credential cannot end the first browser's record.
+    expect(clients.forgetAwaitingTab(TAB_ID, secondPrincipal)).toBe(false);
+    expect(clients.forgetAwaitingTab(TAB_ID, editorPrincipal())).toBe(false);
+    expect(clients.awaitedOriginForTab(TAB_ID, firstPrincipal)).toBe(FIRST_ORIGIN);
+    expect(clients.forgetAwaitingTab(TAB_ID, firstPrincipal)).toBe(true);
+    expect(clients.awaitedOriginForTab(TAB_ID, firstPrincipal)).toBeUndefined();
   });
 });

@@ -19,6 +19,9 @@
  *    prop preview truncated to 120 characters are what the ingest checkpoint
  *    produces, and every one of them must produce no finding — a second
  *    checkpoint that refused its own upstream would make the product unusable.
+ *    The same holds for the marker text the ingest layer's personal-data and
+ *    labelled-value rules leave, and for the unmasked originals of those
+ *    classes, which this guard deliberately does not refuse.
  * 3. **Refusal, never rewriting, and never a leak.** The request is unchanged
  *    after a refusal, and no finding, message, hint or detail carries any part
  *    of the value that caused it — asserted by sliding an eight-character
@@ -1025,6 +1028,20 @@ describe('a rule subset narrows what is reported and nothing else', () => {
 const PROP_PREVIEW = `${'a bounded preview of the previous value '.repeat(4).slice(0, 119)}\u2026`;
 
 /**
+ * `payload` followed by its Luhn check digit, so a card-number fixture is
+ * checksum-valid without a card number appearing in this file as a literal.
+ */
+function withLuhnCheckDigit(payload: string): string {
+  let sum = 0;
+  for (let index = 0; index < payload.length; index += 1) {
+    const digit = Number(payload.charAt(payload.length - 1 - index));
+    const doubled = index % 2 === 0 ? digit * 2 : digit;
+    sum += doubled > 9 ? doubled - 9 : doubled;
+  }
+  return `${payload}${String((10 - (sum % 10)) % 10)}`;
+}
+
+/**
  * A payload built only from shapes the ingest checkpoint produces.
  *
  * Every one of them is a negative case in its own right below; assembled here
@@ -1209,6 +1226,46 @@ describe('a payload the ingest checkpoint already redacted passes', () => {
     expect(
       inspectPayload({ excerpt: `a ${GENERIC_CREDENTIAL}` }, { rules: ['provider-key'] }),
     ).toHaveLength(1);
+  });
+
+  it('accepts what the ingest-only personal-data and labelled-value rules leave behind', () => {
+    // `packages/telemetry` masks e-mail addresses, payment card numbers and
+    // values written after a secret-like label with the same marker; the
+    // query masker then turns a masked query value into `?`, and a masked
+    // value that ends an absolute URL in text into an empty value followed by
+    // the marker on its own line. Every one of those forms must pass here.
+    const masked: JsonObject = {
+      'target.text': `Pay with card ${REDACTION_MARKER} token ${REDACTION_MARKER}`,
+      'error.message': `Order for ${REDACTION_MARKER} failed with card ${REDACTION_MARKER}`,
+      'error.stack':
+        `TypeError: Order for ${REDACTION_MARKER} failed\n` +
+        '    at submitForm (http://127.0.0.1:3000/_next/static/chunks/app.js:10:5)',
+      note: `password=${REDACTION_MARKER}; api_key: ${REDACTION_MARKER}; {"token":"${REDACTION_MARKER}"}`,
+      url: '/notify?to=?&ref=?',
+      logLine: `retry http://warehouse.internal.test/notify?to=\n${REDACTION_MARKER} later`,
+    };
+    const report = inspectPayloadReport(masked);
+    expect(report.findings).toEqual([]);
+    expect(report.complete).toBe(true);
+  });
+
+  it('does not refuse an address, a card number or a labelled value, which only the ingest layer masks', () => {
+    // A source excerpt Stage 2 selected is sent as written. It legitimately
+    // holds a contact address, a documented test card or a form placeholder,
+    // and refusing those would refuse the product's own payloads; none of them
+    // is a class of this guard's vocabulary.
+    const address = assemble('orders', '@', 'supplier.example.test');
+    const card = withLuhnCheckDigit('411111111111111');
+    const excerpt = [
+      `const contact = '${address}';`,
+      `const testCard = '${card}';`,
+      '<input placeholder="token 1234abcd" name="password" />',
+    ].join('\n');
+    expect(inspectPayload({ excerpt })).toEqual([]);
+    expect(assertOutboundSafe(makeRequest({ input: { excerpt } })).ok).toBe(true);
+    expect(REDACTION_RULE_IDS).not.toContain('email-address');
+    expect(REDACTION_RULE_IDS).not.toContain('payment-card');
+    expect(REDACTION_RULE_IDS).not.toContain('labelled-secret');
   });
 });
 

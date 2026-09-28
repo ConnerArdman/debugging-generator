@@ -16,6 +16,9 @@
  *     intact, nothing trimmed, nothing numbered.
  *   - **Meaning beyond colour.** The `+`, `-` or space marker is real, visible,
  *     announced text, never `aria-hidden` or visually hidden.
+ *   - **Direction controls are shown, never obeyed.** A "Trojan Source" line
+ *     and a spoofed file label print each control as its visible escape in the
+ *     rows, the header, the region's name and the error state; markup stays text.
  *   - **A labelled `<pre>` region.** The lines sit in one `<pre role=region>`
  *     named after the file, as phrasing `span` rows separated by line-break
  *     text nodes; it is a Tab stop unless `innerTabIndex` is `-1`.
@@ -637,6 +640,117 @@ describe('DiffView rendering', () => {
     const { container } = render(<DiffView diff={SAMPLE_DIFF} className="extra-layout" />);
 
     expect(rootOf(container).className).toBe('dgv-diff extra-layout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Direction controls
+// ---------------------------------------------------------------------------
+
+describe('DiffView direction controls', () => {
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * A file label that an override would display as `invoicest.txt`. Every code
+   * point is written as an escape so this suite is not itself a carrier.
+   */
+  const SPOOFED_LABEL = 'src/lib/invoice\u202Etxt.ts';
+
+  /**
+   * A hunk whose added line is the "Trojan Source" comment-out
+   * (CVE-2021-42574): drawn as the controls ask, the `if` reads as live code
+   * outside the comment. The context line carries an override around markup.
+   * The header's counts match the body, so every row is classified in the hunk.
+   */
+  const TROJAN_LINES: readonly string[] = [
+    '@@ -1,3 +1,3 @@',
+    '-const isAdmin = false;',
+    '+const isAdmin = false; /*\u202E } \u2066if (isAdmin)\u2069 \u2066 begin admins only */',
+    ' const note = "\u202E</td><script>alert(7)</script>\u202C";',
+    ' return isAdmin;',
+  ];
+
+  /** What a reviewer must see, spelled out: each control as its visible escape. */
+  const TROJAN_ROWS: readonly ExpectedRow[] = [
+    { kind: 'meta', marker: '', text: '@@ -1,3 +1,3 @@' },
+    { kind: 'removed', marker: '-', text: 'const isAdmin = false;' },
+    {
+      kind: 'added',
+      marker: '+',
+      text: 'const isAdmin = false; /*\\u202E } \\u2066if (isAdmin)\\u2069 \\u2066 begin admins only */',
+    },
+    {
+      kind: 'context',
+      marker: ' ',
+      text: 'const note = "\\u202E</td><script>alert(7)</script>\\u202C";',
+    },
+    { kind: 'context', marker: ' ', text: 'return isAdmin;' },
+  ];
+
+  const TROJAN_DIFF = `${TROJAN_LINES.join('\n')}\n`;
+
+  /**
+   * Asserts that no text node and no attribute under `root` carries a raw
+   * direction control.
+   */
+  function expectNoRawControl(root: HTMLElement): void {
+    expect(root.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(root.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
+  }
+
+  it('shows every control of a source line as a visible escape, column by column', () => {
+    render(<DiffView diff={TROJAN_DIFF} fileLabel={SPOOFED_LABEL} subject="What changed" />);
+
+    expectRows(rowsIn(), TROJAN_ROWS);
+    for (const row of rowsIn()) {
+      expect(columnOf(row, 'text').getAttribute('dir')).toBe('ltr');
+    }
+  });
+
+  it('reveals the file label in the header and in the region’s accessible name', () => {
+    const { container } = render(
+      <DiffView diff={TROJAN_DIFF} fileLabel={SPOOFED_LABEL} subject="What changed" />,
+    );
+
+    const region = screen.getByRole('region', {
+      name: 'Diff of src/lib/invoice\\u202Etxt.ts (What changed)',
+    });
+    expect(region.tagName).toBe('PRE');
+    expect(region.getAttribute('aria-label')).toBe(
+      'Diff of src/lib/invoice\\u202Etxt.ts (What changed)',
+    );
+    expect(container.querySelector('.dgv-diff__file')?.textContent).toContain(
+      'src/lib/invoice\\u202Etxt.ts',
+    );
+    expectNoRawControl(rootOf(container));
+  });
+
+  it('keeps markup in a line as text, never as elements', () => {
+    const { container } = render(<DiffView diff={TROJAN_DIFF} fileLabel={SPOOFED_LABEL} />);
+
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+    expect(screen.getByRole('region').textContent).toContain('<script>alert(7)</script>');
+  });
+
+  it('reveals the file label and the message in the error state', () => {
+    const { container } = render(
+      <DiffView
+        diff={TROJAN_DIFF}
+        fileLabel={SPOOFED_LABEL}
+        error={'The recorded diff could not be read: \u202Edaer'}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('src/lib/invoice\\u202Etxt.ts');
+    expect(alert.textContent).toContain('could not be read: \\u202Edaer');
+    expectNoRawControl(rootOf(container));
   });
 });
 

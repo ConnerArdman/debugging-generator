@@ -62,6 +62,16 @@
  *
  *   - A text file is scanned against every rule. One larger than 2 MiB is streamed in chunks,
  *     with the same line and column semantics as a file read whole.
+ *   - A text file whose leading bytes mark it as UTF-16 - a UTF-16LE (`FF FE`) or UTF-16BE
+ *     (`FE FF`) byte-order mark, or, without one, NUL bytes concentrated at the odd
+ *     (little-endian) or even (big-endian) offsets of its first {@link UTF16_SAMPLE_BYTES} (see
+ *     {@link detectUtf16}) - is scanned twice, streamed when large: as UTF-8 like every other
+ *     text file, so a mis-detection never narrows coverage, and again as the text its UTF-16
+ *     decoding yields, whose findings name the encoding and count columns in UTF-16 code units.
+ *     Windows PowerShell 5.1 writes UTF-16LE by default, which is how such a file reaches a
+ *     commit. Each is counted as scanned and listed under `utf16`. What stays uncovered is read
+ *     as UTF-8 only: BOM-less UTF-16 text too sparse in ASCII to meet the NUL threshold, UTF-32,
+ *     and every other legacy encoding.
  *   - A tracked symbolic link is scanned as its target text - the string git stores for it - and
  *     is never followed.
  *   - A positively identified binary (its extension and its leading bytes agree on a format in
@@ -76,8 +86,9 @@
  *     found, as is one that stands between non-token bytes anywhere else in the file, while one
  *     inside compressed data - a PNG `zTXt` chunk, compressed `iTXt` or image data, a PDF Flate
  *     stream, a deflated ZIP or VSIX entry, a compressed WOFF or WOFF2 table - is not, nor is one
- *     stored as UTF-16 or hexadecimal (see {@link BinaryFile}). Each such file counts as scanned
- *     and is listed under `binaries`.
+ *     stored as UTF-16 or hexadecimal (see {@link BinaryFile}): the UTF-16 pass above is a
+ *     text-mode pass, and an identified binary is not text. Each such file counts as scanned and
+ *     is listed under `binaries`.
  *   - A submodule (gitlink) is skipped, because its content is another repository's, and is
  *     listed under `skipped`.
  *   - A tracked file the check cannot examine - absent from the work tree, replaced by an entry of
@@ -207,6 +218,30 @@ export const MAX_SCAN_BYTES = 2 * 1024 * 1024;
  * tests can place a multi-byte character across a chunk boundary.
  */
 export const STREAM_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Leading bytes of a file that UTF-16 detection counts NUL bytes over when the file carries no
+ * byte-order mark (see {@link detectUtf16}). It must not exceed {@link STREAM_CHUNK_BYTES}: a
+ * streamed file is classified from its first chunk, and the in-memory and streamed paths classify
+ * a file identically only because both sample the same bytes.
+ */
+export const UTF16_SAMPLE_BYTES = 64 * 1024;
+
+/**
+ * Least share of the sampled bytes that must be NUL at the parity a UTF-16 byte order puts them,
+ * as a divisor: at least one sampled byte in {@link UTF16_NUL_SHARE_DIVISOR}. ASCII text in
+ * UTF-16 has a NUL beside every character, one sampled byte in two; four allows half the text to
+ * be non-ASCII while staying far above the handful of NUL bytes a textual file with some binary
+ * residue holds.
+ */
+const UTF16_NUL_SHARE_DIVISOR = 4;
+
+/**
+ * How many times the NUL bytes at the other parity the qualifying parity must outnumber. Binary
+ * data that is merely NUL-rich - zero padding, a PNG header, the `\0\0` runs of a text file with
+ * binary residue - holds NUL bytes at both parities alike, and must not be decoded as UTF-16.
+ */
+const UTF16_NUL_DOMINANCE = 8;
 
 /** Index mode of a gitlink: a submodule commit, whose content lives in another repository. */
 const GITLINK_MODE = '160000';
@@ -1571,7 +1606,13 @@ function matchEntropy(relPath, line) {
  * in what is scanned besides the lines of the file.
  *
  *   text    UTF-8. A regular file is read this way unless it is a positively identified binary,
- *           and a symbolic link's target text always is.
+ *           and a symbolic link's target text always is. A regular file {@link detectUtf16}
+ *           classifies as UTF-16 is read this way too, and then a second time as the text its
+ *           UTF-16 decoding yields, with the byte-order mark kept as U+FEFF exactly as the UTF-8
+ *           reading keeps it, so a column counts UTF-16 code units from the start of the decoded
+ *           line in both readings. Findings of the second reading name the encoding in their
+ *           message (see {@link scanTextBytesInto}). A symbolic link's target is a path, never
+ *           UTF-16.
  *   binary  latin1 - one byte to one character, lossless, so a column is a byte offset within its
  *           line and a chunk boundary never splits a character. Lines end at the same `\n` and
  *           `\r\n` bytes as in text mode. The plaintext metadata fields of the file's format are
@@ -1802,14 +1843,189 @@ function scanTextInto(relPath, allowlist, text, sink) {
 }
 
 /**
+ * A UTF-16 byte order a text file was classified as, in the label `TextDecoder` accepts.
+ *
+ * @typedef {'utf-16le' | 'utf-16be'} Utf16Encoding
+ */
+
+/**
+ * What {@link detectUtf16} established about a file.
+ *
+ * @typedef {object} Utf16Detection
+ * @property {Utf16Encoding} encoding The byte order the file's UTF-16 reading decodes.
+ * @property {boolean} bom Whether a byte-order mark announced it; `false` when the NUL-parity
+ *   heuristic inferred it.
+ */
+
+/** How each UTF-16 byte order is named in the message of a finding its reading produced. */
+const UTF16_LABELS = Object.freeze({ 'utf-16le': 'UTF-16LE', 'utf-16be': 'UTF-16BE' });
+
+/**
+ * Whether a text-mode file is UTF-16, and in which byte order, judged from its leading bytes.
+ *
+ * A byte-order mark decides first: `FF FE` is UTF-16LE and `FE FF` is UTF-16BE. The one exception
+ * is `FF FE 00 00`, which is also the UTF-32LE mark; this check does not decode UTF-32, so that
+ * prefix is left to the heuristic below, which UTF-32 text does not satisfy and a UTF-16LE file
+ * whose first character is U+0000 still does.
+ *
+ * Without a mark, the NUL bytes of the first {@link UTF16_SAMPLE_BYTES} are counted by offset
+ * parity. An ASCII character in UTF-16LE is its own byte followed by a NUL, so the NULs fall at
+ * odd offsets; UTF-16BE puts them at even ones. A byte order is inferred when the NULs at its
+ * parity are at least one sampled byte in {@link UTF16_NUL_SHARE_DIVISOR} AND outnumber the NULs
+ * at the other parity {@link UTF16_NUL_DOMINANCE} times over. Each condition excludes what the
+ * other lets through: the share keeps out a textual file with a few stray NUL bytes, and the
+ * dominance keeps out data that is merely NUL-rich - zero padding, a PNG header, a `\0\0` run -
+ * whose NULs fall at both parities alike. Text too sparse in ASCII to reach the share, such as
+ * BOM-less CJK prose, is not recognised; it is still read as UTF-8, like every text file.
+ *
+ * Only text-mode content is classified: a positively identified binary is never read as UTF-16.
+ *
+ * @example
+ *   detectUtf16(Buffer.from('key = 1', 'utf16le')); // { encoding: 'utf-16le', bom: false }
+ *   detectUtf16(Buffer.from('head\0\0\n'));          // null - balanced, sparse NUL bytes
+ *
+ * @param {Buffer} leading The file's first bytes: the whole file or its first chunk.
+ * @returns {Utf16Detection | null} `null` when the bytes are not recognisably UTF-16.
+ */
+function detectUtf16(leading) {
+  if (leading.length >= 2) {
+    const utf32LittleEndianMark = leading[2] === 0 && leading[3] === 0;
+    if (leading[0] === 0xff && leading[1] === 0xfe && !utf32LittleEndianMark) {
+      return { encoding: 'utf-16le', bom: true };
+    }
+    if (leading[0] === 0xfe && leading[1] === 0xff) {
+      return { encoding: 'utf-16be', bom: true };
+    }
+  }
+  const sample = leading.subarray(0, UTF16_SAMPLE_BYTES);
+  if (sample.length < 2) {
+    return null;
+  }
+  // Jumping from NUL to NUL keeps the common case - a text file with no NUL at all - one scan.
+  let even = 0;
+  let odd = 0;
+  for (let index = sample.indexOf(0); index !== -1; index = sample.indexOf(0, index + 1)) {
+    if (index % 2 === 0) {
+      even += 1;
+    } else {
+      odd += 1;
+    }
+  }
+  if (odd * UTF16_NUL_SHARE_DIVISOR >= sample.length && even * UTF16_NUL_DOMINANCE <= odd) {
+    return { encoding: 'utf-16le', bom: false };
+  }
+  if (even * UTF16_NUL_SHARE_DIVISOR >= sample.length && odd * UTF16_NUL_DOMINANCE <= even) {
+    return { encoding: 'utf-16be', bom: false };
+  }
+  return null;
+}
+
+/**
+ * A fresh decoder for one file's UTF-16 reading.
+ *
+ * `ignoreBOM: true` keeps a byte-order mark in the decoded text as U+FEFF - the WHATWG option
+ * means "do not strip it" - exactly as the UTF-8 reading keeps a UTF-8 mark, so on the first line
+ * both readings count the mark as a column. The decoder is not fatal: a lone surrogate or a
+ * trailing odd byte decodes to U+FFFD rather than aborting the scan of everything after it. One
+ * decoder serves one file, because a streaming decoder carries state from chunk to chunk.
+ *
+ * @param {Utf16Encoding} encoding
+ * @returns {TextDecoder}
+ */
+function utf16Decoder(encoding) {
+  return new TextDecoder(encoding, { ignoreBOM: true });
+}
+
+/**
+ * Line then column order, which every file's findings end in.
+ *
+ * @param {Finding} left
+ * @param {Finding} right
+ * @returns {number}
+ */
+function comparePositions(left, right) {
+  return left.line - right.line || left.column - right.column;
+}
+
+/**
+ * Merge the findings of a file's UTF-16 reading into `sink`, which holds the same file's UTF-8
+ * findings and nothing else, leaving one line-then-column ordered list.
+ *
+ * Each merged finding's message ends by naming the encoding: its line and column are positions in
+ * the decoded text, and a reviewer needs to know the file was read that way to find them. The
+ * preview is untouched, so the disclosure budget is the same as for any other finding. Array sort
+ * is stable, so at an equal position the UTF-8 finding stays first.
+ *
+ * @param {ContentSink} sink One file's UTF-8 findings.
+ * @param {ContentSink} decoded The same file's UTF-16 findings.
+ * @param {Utf16Encoding} encoding
+ */
+function mergeDecodedInto(sink, decoded, encoding) {
+  if (decoded.findings.length === 0 && decoded.allowlisted.length === 0) {
+    return;
+  }
+  const suffix = `, decoded as ${UTF16_LABELS[encoding]}`;
+  /**
+   * @template {Finding} T
+   * @param {T} finding
+   * @returns {T}
+   */
+  const labelled = (finding) => ({ ...finding, message: `${finding.message}${suffix}` });
+  sink.findings.push(...decoded.findings.map(labelled));
+  sink.allowlisted.push(...decoded.allowlisted.map(labelled));
+  sink.findings.sort(comparePositions);
+  sink.allowlisted.sort(comparePositions);
+}
+
+/**
+ * Scan the whole content of a text-mode file from its bytes (see {@link ContentMode}): as UTF-8,
+ * and, when {@link detectUtf16} classifies the bytes, a second time as UTF-16.
+ *
+ * The UTF-8 reading is unconditional, so a file the heuristic misclassifies loses nothing: UTF-8
+ * content that happens to be NUL-heavy is still judged exactly as before, and its UTF-16 reading
+ * merely adds text no rule is likely to match. A classified file's two readings are gathered on
+ * their own and merged, so they reach `sink` as one line-then-column ordered list.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {Buffer} bytes The file's complete content.
+ * @param {ContentSink} sink
+ * @returns {Utf16Detection | null} The UTF-16 classification, for the report; `null` for a file
+ *   read as UTF-8 alone.
+ */
+function scanTextBytesInto(relPath, allowlist, bytes, sink) {
+  const utf16 = detectUtf16(bytes);
+  if (utf16 === null) {
+    scanTextInto(relPath, allowlist, bytes.toString('utf8'), sink);
+    return null;
+  }
+  /** @type {ContentSink} */
+  const local = { findings: [], allowlisted: [] };
+  scanTextInto(relPath, allowlist, bytes.toString('utf8'), local);
+  /** @type {ContentSink} */
+  const decoded = { findings: [], allowlisted: [] };
+  scanTextInto(relPath, allowlist, utf16Decoder(utf16.encoding).decode(bytes), decoded);
+  mergeDecodedInto(local, decoded, utf16.encoding);
+  appendSink(sink, local);
+  return utf16;
+}
+
+/**
  * Scan one file's path and content against every rule, separating the findings the allowlist
  * exempted so a caller can report how many exemptions were used.
  *
  * `content` is judged as text (see {@link ContentMode}); binary mode, and its metadata-field pass,
  * is chosen only by {@link scanRepository}, from a tracked file's own extension and leading bytes.
+ * A string is scanned as it stands. Bytes are read the way {@link scanRepository} reads a text
+ * file: as UTF-8, and again as UTF-16 when {@link detectUtf16} classifies them, whose findings
+ * name the encoding in their message.
+ *
+ * @example
+ *   scanContent('deploy.ps1', Buffer.from(script, 'utf16le'), allowlist);
  *
  * @param {string} filePath Repository-relative path, used in every finding.
- * @param {string} content File content as text.
+ * @param {string | Uint8Array} content File content as text, or its raw bytes (a `Buffer` or any
+ *   other `Uint8Array`). Anything else is converted with `String()`.
  * @param {unknown} [allowlist] Validated allowlist, the parsed allowlist file, or nothing (in
  *   which case no literal is exempt).
  * @returns {{ findings: Finding[], allowlisted: AllowlistedFinding[] }}
@@ -1820,6 +2036,12 @@ export function scanContentWithSuppressions(filePath, content, allowlist) {
   const list = resolveAllowlist(allowlist);
   /** @type {ContentSink} */
   const sink = { findings: scanPath(relPath), allowlisted: [] };
+  if (content instanceof Uint8Array) {
+    // A view, not a copy: `Buffer` gives the detector `indexOf` and the UTF-8 reading `toString`.
+    const bytes = Buffer.from(content.buffer, content.byteOffset, content.byteLength);
+    scanTextBytesInto(relPath, list, bytes, sink);
+    return sink;
+  }
   const text = typeof content === 'string' ? content : String(content ?? '');
   scanTextInto(relPath, list, text, sink);
   return sink;
@@ -1832,7 +2054,8 @@ export function scanContentWithSuppressions(filePath, content, allowlist) {
  * allowlist is an argument rather than a hidden dependency.
  *
  * @param {string} filePath Repository-relative path, used in every finding.
- * @param {string} content File content as text.
+ * @param {string | Uint8Array} content File content as text, or its raw bytes, read as
+ *   {@link scanContentWithSuppressions} describes.
  * @param {unknown} [allowlist] Validated allowlist, the parsed allowlist file, or nothing.
  * @returns {Finding[]} Findings in line then column order.
  * @throws {CheckSecretsError} With code `allowlist-invalid` when `allowlist` is malformed.
@@ -2034,19 +2257,29 @@ function fileRead(operation) {
 }
 
 /**
- * How {@link scanRegularFile} read a file: as text, or in binary mode as the format it names.
+ * How {@link scanRegularFile} read a file: as text (`scanned`), as text read both as UTF-8 and as
+ * the UTF-16 byte order it names (`utf16`), or in binary mode as the format it names (`binary`).
  *
- * @typedef {{ kind: 'scanned' } | { kind: 'binary', format: string }} RegularFileOutcome
+ * @typedef {{ kind: 'scanned' } | { kind: 'utf16', encoding: Utf16Encoding, bom: boolean } |
+ *   { kind: 'binary', format: string }} RegularFileOutcome
  */
 
 /**
- * The outcome for a file read in the mode `format` selects.
+ * The outcome for a file read in the mode `format` selects, with the UTF-16 classification of a
+ * text-mode file.
  *
  * @param {string | null} format What {@link identifyBinary} returned.
+ * @param {Utf16Detection | null} utf16 What {@link detectUtf16} returned for a text-mode file;
+ *   `null` for a binary, which is never classified.
  * @returns {RegularFileOutcome}
  */
-function regularFileOutcome(format) {
-  return format === null ? { kind: 'scanned' } : { kind: 'binary', format };
+function regularFileOutcome(format, utf16) {
+  if (format !== null) {
+    return { kind: 'binary', format };
+  }
+  return utf16 === null
+    ? { kind: 'scanned' }
+    : { kind: 'utf16', encoding: utf16.encoding, bom: utf16.bom };
 }
 
 /* ---------------------------------------------------------------------------
@@ -2854,31 +3087,97 @@ function appendSink(sink, local) {
 }
 
 /**
- * Stream a file larger than {@link MAX_SCAN_BYTES} through the per-line rule pass in
- * {@link STREAM_CHUNK_BYTES} chunks. The first chunk decides the mode: a file it identifies as a
- * binary format is streamed in binary mode, and every other file as text.
+ * Incremental line splitting for text that arrives in decoded pieces.
  *
- * Line semantics are exactly those of `content.split(/\r?\n/)` in {@link scanTextInto}, so a file
- * reports the same findings at the same lines and columns whichever path reads it:
+ * @typedef {object} LineAssembler
+ * @property {(text: string) => void} push Consume newly decoded text, scanning every line it
+ *   completes.
+ * @property {() => void} end Scan the final line - the text after the last `\n`, which may be
+ *   empty - once the input is exhausted.
+ */
+
+/**
+ * A {@link LineAssembler} that scans each line through {@link scanLineInto} into `sink` as soon as
+ * its terminator arrives.
+ *
+ * Line semantics are exactly those of `content.split(/\r?\n/)` in {@link scanTextInto}, so text
+ * fed in pieces reports the same findings at the same lines and columns as the same text split
+ * whole:
  *
  *   - `\n` ends a line, and a `\r` immediately before it belongs to the terminator - including a
- *     `\r` that ended the previous chunk while its `\n` opened this one, because the pieces of a
+ *     `\r` that ended the previous piece while its `\n` opened this one, because the pieces of a
  *     line are joined before the `\r` is stripped;
- *   - a lone `\r`, and a `\r` at the very end of the file, stay in the line;
+ *   - a lone `\r`, and a `\r` at the very end of the input, stay in the line;
  *   - lines are numbered from 1, and the text after the last `\n` is the final line.
  *
- * Bytes are decoded by one `StringDecoder` for the whole file. In text mode it holds back a
- * multi-byte UTF-8 sequence split across two chunks until its remaining bytes arrive, so a
+ * Newlines are searched for in each piece only, and the pieces of a line are joined once when it
+ * ends, so a long line costs linear time and a credential that straddles two pieces is matched on
+ * the joined line.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {ContentSink} sink
+ * @returns {LineAssembler}
+ */
+function lineAssembler(relPath, allowlist, sink) {
+  /** @type {string[]} */
+  let pieces = [];
+  let lineNumber = 1;
+  return {
+    push(text) {
+      let start = 0;
+      let newline = text.indexOf('\n');
+      while (newline !== -1) {
+        pieces.push(text.slice(start, newline));
+        let line = pieces.length === 1 ? (pieces[0] ?? '') : pieces.join('');
+        if (line.endsWith('\r')) {
+          line = line.slice(0, -1);
+        }
+        scanLineInto(relPath, allowlist, lineNumber, line, sink);
+        lineNumber += 1;
+        pieces = [];
+        start = newline + 1;
+        newline = text.indexOf('\n', start);
+      }
+      if (start < text.length) {
+        pieces.push(text.slice(start));
+      }
+    },
+    end() {
+      scanLineInto(relPath, allowlist, lineNumber, pieces.join(''), sink);
+      // An empty line is never scanned, so a second call cannot report the last line twice.
+      pieces = [];
+    },
+  };
+}
+
+/**
+ * Stream a file larger than {@link MAX_SCAN_BYTES} through the per-line rule pass in
+ * {@link STREAM_CHUNK_BYTES} chunks. The first chunk decides the mode: a file it identifies as a
+ * binary format is streamed in binary mode, and every other file as text - and, when
+ * {@link detectUtf16} classifies that same chunk as UTF-16, as UTF-16 too. The detector samples
+ * {@link UTF16_SAMPLE_BYTES}, which is no larger than a chunk, so a file is classified exactly as
+ * the in-memory path would classify it.
+ *
+ * Each reading has its own decoder and its own {@link lineAssembler}, so each keeps exactly the
+ * line and column semantics of {@link scanTextInto} over the text it decodes. The UTF-8 (or
+ * latin1) reading is decoded by one `StringDecoder` for the whole file. In text mode it holds back
+ * a multi-byte UTF-8 sequence split across two chunks until its remaining bytes arrive, so a
  * character straddling a chunk boundary decodes once, correctly, instead of as two replacement
  * characters that would shift every later column on its line; in binary mode it decodes latin1,
- * where every byte is a character of its own. Newlines are searched for in each decoded chunk
- * only, and the pieces of a line are joined once when it ends, so a long line costs linear time
- * and a credential that straddles a chunk boundary is matched on the joined line.
+ * where every byte is a character of its own. The UTF-16 reading is decoded by one streaming
+ * `TextDecoder` (see {@link utf16Decoder}), which likewise carries an odd trailing byte or the
+ * leading half of a surrogate pair over to the next chunk inside its own state - never as a view
+ * of the chunk buffer, which the next read overwrites.
+ *
+ * The UTF-16 reading's findings are merged into `sink` when the stream ends, or when a read fails:
+ * both readings' findings from the part already read are real and are kept.
  *
  * @param {number} fd Open descriptor of the file.
  * @param {string} relPath Repository-relative POSIX path.
  * @param {Allowlist} allowlist Validated allowlist.
- * @param {ContentSink} sink
+ * @param {ContentSink} sink This file's findings, and only this file's: the UTF-16 reading is
+ *   merged into it in line then column order.
  * @returns {RegularFileOutcome}
  * @throws {TrackedFileReadError} When a read fails; findings from the part already read stay in
  *   `sink`, because they are real.
@@ -2886,45 +3185,49 @@ function appendSink(sink, local) {
 function streamScanFile(fd, relPath, allowlist, sink) {
   const chunk = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
   let bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, 0));
-  const format = identifyBinary(relPath, chunk.subarray(0, bytesRead));
+  const leading = chunk.subarray(0, bytesRead);
+  const format = identifyBinary(relPath, leading);
+  // A positively identified binary is never read as UTF-16; a text file is classified here, from
+  // the first chunk, before the buffer is reused.
+  const utf16 = format === null ? detectUtf16(leading) : null;
   // Binary mode decodes latin1; its metadata-field pass is the caller's (see scanRegularFile),
   // because it needs random access to the file rather than the stream.
   const decoder = new StringDecoder(format === null ? 'utf8' : 'latin1');
-  /** @type {string[]} */
-  let pieces = [];
-  let lineNumber = 1;
+  const lines = lineAssembler(relPath, allowlist, sink);
+  /** @type {ContentSink} */
+  const decodedSink = { findings: [], allowlisted: [] };
+  const wide =
+    utf16 === null
+      ? null
+      : {
+          decoder: utf16Decoder(utf16.encoding),
+          lines: lineAssembler(relPath, allowlist, decodedSink),
+        };
 
-  /** @param {string} text Newly decoded text. */
-  const consume = (text) => {
-    let start = 0;
-    let newline = text.indexOf('\n');
-    while (newline !== -1) {
-      pieces.push(text.slice(start, newline));
-      let line = pieces.length === 1 ? (pieces[0] ?? '') : pieces.join('');
-      if (line.endsWith('\r')) {
-        line = line.slice(0, -1);
+  try {
+    let position = 0;
+    while (bytesRead > 0) {
+      position += bytesRead;
+      const bytes = chunk.subarray(0, bytesRead);
+      lines.push(decoder.write(bytes));
+      if (wide !== null) {
+        wide.lines.push(wide.decoder.decode(bytes, { stream: true }));
       }
-      scanLineInto(relPath, allowlist, lineNumber, line, sink);
-      lineNumber += 1;
-      pieces = [];
-      start = newline + 1;
-      newline = text.indexOf('\n', start);
+      const offset = position;
+      bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, offset));
     }
-    if (start < text.length) {
-      pieces.push(text.slice(start));
+    lines.push(decoder.end());
+    lines.end();
+    if (wide !== null) {
+      wide.lines.push(wide.decoder.decode());
+      wide.lines.end();
     }
-  };
-
-  let position = 0;
-  while (bytesRead > 0) {
-    position += bytesRead;
-    consume(decoder.write(chunk.subarray(0, bytesRead)));
-    const offset = position;
-    bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, offset));
+  } finally {
+    if (utf16 !== null) {
+      mergeDecodedInto(sink, decodedSink, utf16.encoding);
+    }
   }
-  consume(decoder.end());
-  scanLineInto(relPath, allowlist, lineNumber, pieces.join(''), sink);
-  return regularFileOutcome(format);
+  return regularFileOutcome(format, utf16);
 }
 
 /**
@@ -2932,10 +3235,12 @@ function streamScanFile(fd, relPath, allowlist, sink) {
  * binary format - in binary mode (see {@link ContentMode}).
  *
  * A file up to {@link MAX_SCAN_BYTES} is read whole; a larger one is streamed by
- * {@link streamScanFile}. Either way the leading bytes decide binary identification and every line
- * goes through {@link scanLineInto}; a binary's metadata fields then go through
- * {@link scanMetadataFieldsInto}, over the buffer or the open descriptor. A binary's findings are
- * gathered for the file on its own first, so the two passes merge into one position-ordered list.
+ * {@link streamScanFile}. Either way the leading bytes decide binary identification and, for a
+ * text file, UTF-16 classification (see {@link detectUtf16}), and every line goes through
+ * {@link scanLineInto}; a binary's metadata fields then go through
+ * {@link scanMetadataFieldsInto}, over the buffer or the open descriptor. A binary's findings, and
+ * a UTF-16 file's, are gathered for the file on its own first, so its two passes merge into one
+ * position-ordered list.
  *
  * @param {string} absolute Absolute path of the file.
  * @param {string} relPath Repository-relative POSIX path.
@@ -2951,15 +3256,14 @@ function scanRegularFile(absolute, relPath, size, allowlist, sink) {
     const buffer = fileRead(() => readFileSync(absolute));
     const format = identifyBinary(relPath, buffer);
     if (format === null) {
-      scanTextInto(relPath, allowlist, buffer.toString('utf8'), sink);
-    } else {
-      /** @type {ContentSink} */
-      const local = { findings: [], allowlisted: [] };
-      scanTextInto(relPath, allowlist, buffer.toString('latin1'), local);
-      scanMetadataFieldsInto(relPath, allowlist, format, bufferSource(buffer), local);
-      appendSink(sink, local);
+      return regularFileOutcome(null, scanTextBytesInto(relPath, allowlist, buffer, sink));
     }
-    return regularFileOutcome(format);
+    /** @type {ContentSink} */
+    const local = { findings: [], allowlisted: [] };
+    scanTextInto(relPath, allowlist, buffer.toString('latin1'), local);
+    scanMetadataFieldsInto(relPath, allowlist, format, bufferSource(buffer), local);
+    appendSink(sink, local);
+    return regularFileOutcome(format, null);
   }
   const fd = fileRead(() => openSync(absolute, 'r'));
   /** @type {ContentSink} */
@@ -3109,8 +3413,10 @@ function unscanned(file, reason, detail) {
  *     the checkout, and it is the link that is tracked.
  *   - A regular file is read (streamed when large) and scanned: as text, or byte for byte in binary
  *     mode when it is a positively identified binary, which is reported as `binary` so the report
- *     lists it. A regular file standing where git tracks a symbolic link is scanned too: that is
- *     how a checkout with `core.symlinks=false` stores the link, as a file holding its target.
+ *     lists it. A text file {@link detectUtf16} classifies as UTF-16 is read as UTF-8 and as
+ *     UTF-16, and is reported as `utf16` so the report lists it too. A regular file standing where
+ *     git tracks a symbolic link is scanned too: that is how a checkout with `core.symlinks=false`
+ *     stores the link, as a file holding its target.
  *   - Anything else is `unscanned`: `missing` when the path is absent from the work tree,
  *     `unreadable` when the operating system refuses to stat or read it, and `wrong-type` when the
  *     entry is not what git tracks - a directory or another non-regular entry, a symbolic link
@@ -3124,7 +3430,8 @@ function unscanned(file, reason, detail) {
  * @param {ContentSink} sink
  * @param {Map<string, string | null>} ancestry The run's {@link symlinkedAncestor} cache.
  * @returns {{ kind: 'scanned' } | { kind: 'binary', entry: BinaryFile } |
- *   { kind: 'skipped', entry: SkippedFile } | { kind: 'unscanned', entry: UnscannedFile }}
+ *   { kind: 'utf16', entry: Utf16File } | { kind: 'skipped', entry: SkippedFile } |
+ *   { kind: 'unscanned', entry: UnscannedFile }}
  */
 function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
   const { file, mode } = tracked;
@@ -3170,9 +3477,13 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
       );
     }
     const outcome = scanRegularFile(absolute, file, stats.size, allowlist, sink);
-    return outcome.kind === 'binary'
-      ? { kind: 'binary', entry: { file, format: outcome.format, bytes: stats.size } }
-      : outcome;
+    if (outcome.kind === 'binary') {
+      return { kind: 'binary', entry: { file, format: outcome.format, bytes: stats.size } };
+    }
+    if (outcome.kind === 'utf16') {
+      return { kind: 'utf16', entry: { file, encoding: outcome.encoding, bom: outcome.bom } };
+    }
+    return outcome;
   } catch (error) {
     if (error instanceof TrackedFileReadError) {
       return unscanned(file, 'unreadable', error.message);
@@ -3205,6 +3516,18 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
  * @property {string} file Repository-relative POSIX path.
  * @property {string} format The identified format, for example `png`.
  * @property {number} bytes Size in bytes.
+ */
+
+/**
+ * A tracked text file {@link detectUtf16} classified as UTF-16, so it was scanned against every
+ * content rule twice: as UTF-8, like every text file, and as the text its UTF-16 decoding yields,
+ * whose findings name the encoding in their message. It is counted in `filesScanned` as well.
+ *
+ * @typedef {object} Utf16File
+ * @property {string} file Repository-relative POSIX path.
+ * @property {Utf16Encoding} encoding The byte order it was decoded in.
+ * @property {boolean} bom Whether a byte-order mark announced it; `false` when the NUL parity of
+ *   its leading bytes did.
  */
 
 /**
@@ -3244,12 +3567,14 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
  * @property {number} filesTracked Paths git tracks; never zero, because an empty tracked subject
  *   is a precondition failure rather than a report (see {@link scanRepository}).
  * @property {number} filesScanned Files whose content - or, for a symbolic link, whose target
- *   text - was read and scanned, binaries included.
+ *   text - was read and scanned, binaries and UTF-16 files included.
  * @property {Finding[]} findings Violations, in file then line then column order.
  * @property {AllowlistedFinding[]} allowlisted Matches an allowlist entry exempted.
  * @property {BinaryFile[]} binaries The scanned files that were positively identified binaries:
  *   scanned against every content rule byte for byte and by metadata field, compressed payloads
  *   not inflated.
+ * @property {Utf16File[]} utf16 The scanned text files classified as UTF-16: scanned against
+ *   every content rule as UTF-8 and as UTF-16. Always present; empty when there are none.
  * @property {SkippedFile[]} skipped Submodules, whose content is another repository's.
  * @property {UnscannedFile[]} unscanned Files that could not be examined; non-empty means the run
  *   proves nothing and exits {@link EXIT_ERROR}.
@@ -3259,8 +3584,9 @@ function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
  * Scan a checkout: enumerate tracked files, apply every rule, and return the report.
  *
  * Every tracked entry ends up in exactly one of three places: scanned (counted in
- * `filesScanned`, and listed in `binaries` too when it was scanned in binary mode), `skipped` (a
- * submodule), or `unscanned` (see {@link examineTrackedFile}). An unscanned file does not throw -
+ * `filesScanned`, and listed in `binaries` too when it was scanned in binary mode, or in `utf16`
+ * when it was also read as UTF-16), `skipped` (a submodule), or `unscanned` (see
+ * {@link examineTrackedFile}). An unscanned file does not throw -
  * the rest of the tree is still scanned and reported, so one missing file does not hide a
  * credential elsewhere - but it makes the report's `exitCode` {@link EXIT_ERROR} and `ok` false.
  *
@@ -3301,6 +3627,8 @@ export function scanRepository(options = {}) {
   const sink = { findings: [], allowlisted: [] };
   /** @type {BinaryFile[]} */
   const binaries = [];
+  /** @type {Utf16File[]} */
+  const utf16 = [];
   /** @type {SkippedFile[]} */
   const skipped = [];
   /** @type {UnscannedFile[]} */
@@ -3319,6 +3647,9 @@ export function scanRepository(options = {}) {
     } else if (outcome.kind === 'binary') {
       filesScanned += 1;
       binaries.push(outcome.entry);
+    } else if (outcome.kind === 'utf16') {
+      filesScanned += 1;
+      utf16.push(outcome.entry);
     } else if (outcome.kind === 'skipped') {
       skipped.push(outcome.entry);
     } else {
@@ -3344,6 +3675,7 @@ export function scanRepository(options = {}) {
     findings,
     allowlisted,
     binaries,
+    utf16,
     skipped,
     unscanned: unscannedFiles,
   };
@@ -3411,9 +3743,19 @@ function renderReport(report) {
     lines.push('', ...findingsExplanation(), '');
   }
 
-  const binaryNote = report.binaries.length > 0 ? ` (${report.binaries.length} binary)` : '';
+  // Each kind of scan beyond plain text is counted only when it happened, so a repository with
+  // neither binaries nor UTF-16 files prints the bare count.
+  /** @type {string[]} */
+  const scannedNotes = [];
+  if (report.binaries.length > 0) {
+    scannedNotes.push(`${report.binaries.length} binary`);
+  }
+  if (report.utf16.length > 0) {
+    scannedNotes.push(`${report.utf16.length} UTF-16`);
+  }
+  const scannedNote = scannedNotes.length > 0 ? ` (${scannedNotes.join(', ')})` : '';
   const parts = [
-    `${report.filesScanned} ${plural(report.filesScanned, 'file')} scanned${binaryNote}`,
+    `${report.filesScanned} ${plural(report.filesScanned, 'file')} scanned${scannedNote}`,
     `${report.findings.length} ${plural(report.findings.length, 'finding')}`,
     `${report.allowlisted.length} allowlisted`,
   ];
@@ -3442,6 +3784,14 @@ function helpText() {
     '',
     ...RULES.map((rule) => `  ${rule.id.padEnd(18)} ${rule.summary}`),
     '',
+    'Text is read as UTF-8. A text file that is recognisably UTF-16 - a UTF-16LE or UTF-16BE',
+    'byte-order mark, or NUL bytes concentrated at odd (little-endian) or even (big-endian)',
+    `offsets of its first ${String(UTF16_SAMPLE_BYTES / 1024)} KiB - is checked a second time as ` +
+      'its UTF-16 decoding, whose',
+    'findings name the encoding; the report counts it as scanned and lists it under "utf16". Still',
+    'read as UTF-8 only: BOM-less UTF-16 text too sparse in ASCII to meet that threshold, UTF-32,',
+    'and every other legacy encoding.',
+    '',
     'A positively identified binary - its extension and leading bytes agree on one of the',
     `formats ${binaryFormats} -`,
     'is checked against the same rules byte for byte, and its plaintext metadata fields are',
@@ -3451,10 +3801,10 @@ function helpText() {
     'and stored entries and the archive comment; the WOFF and WOFF2 private data block. PDF',
     'delimits its values itself. Nothing is decompressed, so a credential inside compressed data -',
     'PNG zTXt, compressed iTXt and image data, PDF Flate streams, deflated ZIP and VSIX entries,',
-    'compressed WOFF and WOFF2 tables - is not seen, nor is text a format encodes (UTF-16,',
-    'hexadecimal). The report counts binaries as scanned and lists them under "binaries". A',
-    'submodule is skipped, because its content is another repository\u2019s, and is listed under',
-    '"skipped".',
+    'compressed WOFF and WOFF2 tables - is not seen, nor is text a format encodes (UTF-16 inside',
+    'a binary, hexadecimal). The report counts binaries as scanned and lists them under',
+    '"binaries". A submodule is skipped, because its content is another repository\u2019s, and is',
+    'listed under "skipped".',
     '',
     `The two example files ${ALLOWED_ENV_FILES.join(' and ')} are the only`,
     'environment files that may be tracked. The non-secret placeholders this repository has to',

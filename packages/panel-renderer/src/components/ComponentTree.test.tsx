@@ -137,7 +137,13 @@ import type {
   PanelEventCoordinates,
 } from '../host/PanelActions';
 import { renderTriggerAppearance } from '../utils/color';
-import { formatCount, formatDurationCompact, formatRenderTriggerLabel } from '../utils/format';
+import {
+  containsDirectionControl,
+  formatCount,
+  formatDurationCompact,
+  formatRenderTriggerLabel,
+  formatUntrustedText,
+} from '../utils/format';
 import { ComponentTree } from './ComponentTree';
 
 /*
@@ -3567,5 +3573,115 @@ describe('ComponentTree shared selection', () => {
 
     rerender(drivenPanel(spec, stub.provider, spies.actions, null));
     expect(selectedRowNames()).toEqual([]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured names
+ *
+ * A component name, an instance key, a location and the node's own title are
+ * untrusted, and an invisible right-to-left override (U+202E) in one of them
+ * draws the characters after it backwards. Every place this view puts such
+ * text — each row's label and toggle name, the key chip, the source chip, and
+ * the tree's own name on its raw container — prints each control as its
+ * visible escape (`\u202E`); the location handed to the host is the object
+ * the datum holds.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The right-to-left override, and the pop that ends it. */
+const RLO = '\u202E';
+const PDF = '\u202C';
+
+/** The visible escape printed in the override's place. */
+const RLO_MARKER = '\\u202E';
+
+/**
+ * Every place in a rendered tree where a raw direction control would reach a
+ * reader: the text, and every attribute but a `data-*` one (data, not display).
+ *
+ * @param root The rendered tree.
+ * @returns A description of each offending sink; empty when there is none.
+ */
+function rawDirectionSinks(root: Element): string[] {
+  const sinks: string[] = [];
+
+  if (containsDirectionControl(root.textContent)) {
+    sinks.push('textContent');
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-') && containsDirectionControl(attribute.value)) {
+        sinks.push(`${element.tagName.toLowerCase()}[${attribute.name}]`);
+      }
+    }
+  }
+
+  return sinks;
+}
+
+describe('ComponentTree direction controls', () => {
+  const rootName = `Example${RLO}Root${PDF}`;
+  const childName = `Example${RLO}Child`;
+  const childSource: SourceLocation = Object.freeze({
+    ...LEAF_SOURCE,
+    file: `src/example/${RLO}child.tsx`,
+    symbol: childName,
+  });
+  const structure: readonly ComponentTreeNode[] = [
+    makeTreeNode({
+      component: rootName,
+      key: `key-${RLO}1`,
+      children: [
+        makeTreeNode({
+          id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0`,
+          component: childName,
+          depth: 1,
+          source: childSource,
+        }),
+      ],
+    }),
+  ];
+
+  it('reveals every name, the key, the chip and the tree’s own title', async () => {
+    const title = `Mounted ${RLO}components`;
+    const stub = resolvingProvider(makeSnapshot({ roots: structure }));
+
+    renderComponent(makeNode({ title }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // The raw container is named by the revealed title.
+    const tree = await screen.findByRole('tree', { name: formatUntrustedText(title) });
+
+    expect(rowNames()).toEqual([formatUntrustedText(rootName), formatUntrustedText(childName)]);
+    expect(
+      within(tree).getByRole('button', { name: `Collapse ${formatUntrustedText(rootName)}` }),
+    ).toBeDefined();
+    expect(tree.textContent).toContain(`key-${RLO_MARKER}1`);
+
+    // Nothing a reader sees, hovers or hears carries a raw control.
+    expect(rawDirectionSinks(document.body)).toEqual([]);
+  });
+
+  it('hands the host the very location the datum holds', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: structure }));
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    const chip = within(rowNamed(formatUntrustedText(childName))).getByRole('button', {
+      name: `Open ${formatUntrustedText(`${childSource.file}:${String(childSource.line)}:${String(childSource.column)}`)}`,
+    });
+    await user.click(chip);
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(childSource);
+    expect(childSource.file).toContain(RLO);
   });
 });

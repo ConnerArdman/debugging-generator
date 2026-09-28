@@ -17,6 +17,8 @@
  *     the armed signals and "Ready to capture" — with no synthesised title; a
  *     follow-up's second plan and instrumentation appear after the follow-up.
  *   - **Verbatim text.** Messages and details render exactly as received.
+ *   - **Direction controls are shown, never obeyed**: a U+202E/U+202C pair in
+ *     a message, a detail line or a stage failure prints as visible escapes.
  *   - **Status markers.** Each status yields exactly one marker modifier, a
  *     decorative glyph hidden from assistive technology and an announced word;
  *     a failed stage is always drawn as failed (AAP 0.5.5).
@@ -1369,5 +1371,63 @@ describe('ProgressSteps privacy', () => {
     for (const [method, spy] of consoleSpies) {
       expect(spy, `console.${method} must never be called`).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('ProgressSteps direction controls', () => {
+  /**
+   * A right-to-left override (U+202E) and its pop (U+202C) around markup: a
+   * progress line names components, routes and files the pipeline found in
+   * the project. Every code point is written as an escape so this suite is
+   * not itself a carrier of what it defends against.
+   */
+  const SPOOF = '\u202E</td><script>alert(7)</script>\u202C';
+
+  /** Any of the twelve Unicode bidirectional formatting controls, raw. */
+  const RAW_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+  /**
+   * What a reader must see: each control of {@link SPOOF} printed as its
+   * visible escape and every other character untouched. Spelled out here
+   * rather than by calling the formatter, so the suite pins the output.
+   */
+  function revealed(text: string): string {
+    return text.replaceAll('\u202E', '\\u202E').replaceAll('\u202C', '\\u202C');
+  }
+
+  const ENTRIES: readonly ProgressEntry[] = [
+    makeEntry({ stage: 'understand', message: `Read the question ${SPOOF}` }),
+    makeEntry({
+      stage: 'investigate',
+      message: `Located the component ${SPOOF}`,
+      detail: `src/spoof/${SPOOF}.tsx:12`,
+      ts: TS + 1,
+    }),
+  ];
+
+  it('shows each control of a message and a detail line as a visible escape', () => {
+    const { container } = render(<ProgressSteps entries={ENTRIES} />);
+
+    expect(lines(container)).toEqual(messagesOf(ENTRIES).map(revealed));
+    expect(container.querySelector('.dgv-progress__detail')?.textContent).toBe(
+      revealed(`src/spoof/${SPOOF}.tsx:12`),
+    );
+
+    expect(container.textContent).not.toMatch(RAW_CONTROL);
+    for (const element of Array.from(container.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        expect(attribute.value).not.toMatch(RAW_CONTROL);
+      }
+    }
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('td')).toBeNull();
+  });
+
+  it('shows the controls of a stage failure as visible escapes', () => {
+    render(<ProgressSteps entries={ENTRIES} error={`The plan stage failed: ${SPOOF}`} />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain(revealed(`The plan stage failed: ${SPOOF}`));
+    expect(alert.textContent).not.toMatch(RAW_CONTROL);
   });
 });

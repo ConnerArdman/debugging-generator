@@ -158,6 +158,21 @@
  * the full path: a closed tooltip bubble keeps its text in the accessibility
  * tree, which is what makes the inert form's full location reachable too.
  *
+ * ## WHAT THE CHIP SAYS IS THE LOGICAL TEXT
+ *
+ * A path, a symbol and a caller's caption are untrusted: an invisible Unicode
+ * direction control in one of them (U+202E and its eleven siblings) would draw
+ * the characters after it in an order that was never captured, so a chip could
+ * read as one place and open another. Every string the chip shows, describes or
+ * announces is therefore derived in its revealed form — each control printed as
+ * its visible escape, `\u202E`, by `formatUntrustedText` — BEFORE any of them
+ * is compared or joined. That is what keeps the abbreviation test, the
+ * tooltip's de-duplication and the naming rule above true for such a value:
+ * each compares display text with display text, and
+ * {@link sourceLinkAccessibleName} returns the name the button actually
+ * carries. Only the text is revealed. The location handed to `onOpenSource` is
+ * still the very object received, raw code points and all.
+ *
  * @see ../host/PanelActions for the interaction contract and hop 2 of the chain.
  * @see ../utils/format for the path, chip and tooltip text this file composes.
  * @see ../styles/components.css for the implementation of the classes above.
@@ -174,7 +189,12 @@ import { usePanelActions } from '../host/PanelActions';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { Tooltip } from '../primitives/Tooltip';
-import { NOT_AVAILABLE_LABEL, formatCompactPath, formatSourceTooltip } from '../utils/format';
+import {
+  NOT_AVAILABLE_LABEL,
+  formatCompactPath,
+  formatSourceTooltip,
+  formatUntrustedText,
+} from '../utils/format';
 
 /**
  * Whether a line or column can be shown as a position.
@@ -287,7 +307,12 @@ export type SourceLinkTextInputs = Pick<
   'location' | 'label' | 'labelDescription' | 'showSymbol' | 'compact'
 >;
 
-/** Everything the chip shows and announces, derived from {@link SourceLinkTextInputs}. */
+/**
+ * Everything the chip shows and announces, derived from {@link SourceLinkTextInputs}.
+ *
+ * Every string member is display text, with its direction controls revealed
+ * (see "What the chip says is the logical text" in the module header).
+ */
 interface SourceLinkText {
   /**
    * The canonical `file:line:column` the chip opens, never shortened: the
@@ -315,6 +340,15 @@ interface SourceLinkText {
  * {@link sourceLinkAccessibleName}, so what the chip shows and what it
  * announces are computed from the same strings and cannot drift apart.
  *
+ * Every input string is revealed (`formatUntrustedText`) before it is compared
+ * or joined — the two format helpers used here already return revealed text —
+ * so no decision below weighs a raw value against a revealed one: a path with
+ * a direction control in it is not "abbreviated" merely because its display
+ * differs from its code points, and a caption is recognised inside the
+ * location's own description however it was spelled. The primitives that
+ * render these strings reveal them again, which changes nothing: revealing is
+ * idempotent.
+ *
  * @param inputs The text-bearing props, as the component receives them.
  * @returns The runs, the target, the description and the abbreviation flag.
  */
@@ -324,13 +358,17 @@ function deriveSourceLinkText(inputs: SourceLinkTextInputs): SourceLinkText {
   const lineResolved = isResolvedCoordinate(location.line);
   const positionResolved = lineResolved && isResolvedCoordinate(location.column);
 
+  // The path as a reader sees it whole: the baseline the visible path is
+  // compared against, and the head of the target when a coordinate is missing.
+  const file = formatUntrustedText(location.file);
+
   // The canonical target: the shared package's own spelling when both
   // coordinates resolved, and the same shape with the unresolved one named when
   // they did not. This is the accessible name's object and the tooltip's
   // fallback, so the path is never shortened here.
   const target = positionResolved
-    ? formatSourceLocation(location)
-    : `${location.file}:${coordinateText(location.line)}:${coordinateText(location.column)}`;
+    ? formatUntrustedText(formatSourceLocation(location))
+    : `${file}:${coordinateText(location.line)}:${coordinateText(location.column)}`;
 
   // The description a tooltip shows: the shared helper's symbol-first form,
   // which is also what a row linking to the same place titles itself with, so
@@ -339,28 +377,35 @@ function deriveSourceLinkText(inputs: SourceLinkTextInputs): SourceLinkText {
   // description already carries it (a symbol of the same name), which would
   // otherwise say it twice.
   const locationDescription = positionResolved ? formatSourceTooltip(location) : target;
+  const caption =
+    labelDescription === undefined ? undefined : formatUntrustedText(labelDescription);
   const description =
     label !== undefined &&
-    labelDescription !== undefined &&
-    labelDescription.trim() !== '' &&
-    !locationDescription.includes(labelDescription)
-      ? `${labelDescription} — ${locationDescription}`
+    caption !== undefined &&
+    caption.trim() !== '' &&
+    !locationDescription.includes(caption)
+      ? `${caption} — ${locationDescription}`
       : locationDescription;
 
   // The visible path. Shortening belongs to the format helpers - this file joins
   // the line to whichever shape they returned and performs no other string work.
-  const visiblePath = compact ? basenamePosix(location.file) : formatCompactPath(location.file);
+  const visiblePath = compact
+    ? formatUntrustedText(basenamePosix(location.file))
+    : formatCompactPath(location.file);
   const derivedText = lineResolved ? `${visiblePath}:${String(location.line)}` : visiblePath;
-  const chipText = label ?? derivedText;
+  const chipText = label === undefined ? derivedText : formatUntrustedText(label);
 
-  const symbolText = label === undefined && showSymbol && !compact ? location.symbol : undefined;
+  const symbolText =
+    label === undefined && showSymbol && !compact && location.symbol !== undefined
+      ? formatUntrustedText(location.symbol)
+      : undefined;
 
   // Wrap in a tooltip exactly when the chip is not already showing everything
   // the description would: a caller's caption replaced the path, the path lost
   // ancestors, the line could not be shown, or a known symbol is hidden.
   const abbreviated =
     label !== undefined ||
-    visiblePath !== location.file ||
+    visiblePath !== file ||
     !lineResolved ||
     (location.symbol !== undefined && symbolText === undefined);
 
@@ -395,6 +440,10 @@ function collapseWhitespace(text: string): string {
  *   4. Otherwise it is `<visible text> — open <target>`: it starts with what is
  *      on screen, so a speech-input user can say it, and it still ends with the
  *      full location the chip opens.
+ *
+ * Every part is display text: a direction control in the path, the symbol or
+ * the caption appears as its visible escape (`\u202E`), exactly as the chip
+ * prints it and as the button's `aria-label` carries it.
  *
  * Pure: it reads nothing but its argument, and the inert form, which has no
  * accessible name of its own, never uses it.

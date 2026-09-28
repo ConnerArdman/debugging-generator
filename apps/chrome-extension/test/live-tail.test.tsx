@@ -8,17 +8,25 @@
  * list inside the stream region, whether the composition root passes the notices or leaves the
  * pane to read them from the store — and that the notices never show a URL's query or fragment.
  *
+ * It also pins the pane's presentation of hostile captured text (QA-SEC F02): an event whose name,
+ * attributes and source location carry markup and a right-to-left override pair renders as text,
+ * with each direction control printed as its visible `\u202E`-style escape in the row, its title
+ * and the source chip's name, while the row's selection, its source chip and the search filter
+ * keep working on the raw captured values.
+ *
  * The store is driven exactly as `src/panel/state/connection.ts` drives it, with protocol
  * envelopes minted by the protocol's own `createEnvelope`, and reset to its pristine state around
  * every case. Every mounted tree is unmounted by this file's own `afterEach`. Assertions use the
  * DOM itself (no matcher extension is installed in this project).
  */
-import { act, cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { containsDirectionControl } from '@debuggen/panel-renderer';
 import { createEnvelope } from '@debuggen/protocol';
 import { newCaptureId, newMessageId, newSessionId } from '@debuggen/shared';
-import type { CaptureId, SessionId } from '@debuggen/shared';
+import type { CaptureId, SessionId, SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
 import type { ReactElement } from 'react';
 
@@ -291,5 +299,142 @@ describe('LiveTail — events the service did not stream', () => {
 
     expect(screen.queryByText(/not streamed live/u)).toBeNull();
     expect(screen.queryByText(/Showing the newest/u)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hostile captured text: markup and direction controls (QA-SEC F02)
+// ---------------------------------------------------------------------------
+
+/**
+ * The label QA-SEC F02 ingested: markup wrapped in U+202E RIGHT-TO-LEFT OVERRIDE and U+202C POP
+ * DIRECTIONAL FORMATTING, which drew its tail reversed while `textContent` stayed logical.
+ */
+const BIDI_LABEL = 'QA_BIDI \u202E</td><script>alert(7)</script>\u202C';
+
+/** The same label as the pane prints it: each control as its visible six-character escape. */
+const REVEALED_LABEL = 'QA_BIDI \\u202E</td><script>alert(7)</script>\\u202C';
+
+/** The live grid's accessible name. */
+const GRID_NAME = 'Live events, newest first';
+
+/** Where the hostile event was resolved: a file and a symbol carrying the label. */
+const BIDI_SOURCE: SourceLocation = {
+  file: `src/server/${BIDI_LABEL}.ts`,
+  line: 12,
+  column: 3,
+  symbol: BIDI_LABEL,
+  resolvedBy: 'patch',
+  confidence: 1,
+};
+
+/**
+ * A server span whose name, attribute value, request target, statement and source location all
+ * carry {@link BIDI_LABEL}, as the service stores and tails it.
+ */
+function bidiEvent(): TelemetryEvent {
+  return {
+    ...tailEvent(1),
+    kind: 'http.server',
+    tier: 'server',
+    name: BIDI_LABEL,
+    attributes: {
+      'qa.note': BIDI_LABEL,
+      'http.target': `/api/items?label=${BIDI_LABEL}`,
+      'db.statement': `SELECT name FROM item WHERE label = '${BIDI_LABEL}'`,
+    },
+    source: BIDI_SOURCE,
+  };
+}
+
+/**
+ * Asserts that no text a reader sees, hovers or hears under `root` carries a raw direction
+ * control: its text content, and every attribute but the `data-*` ones, which are data rather
+ * than presentation and keep raw values by contract.
+ *
+ * @param root The subtree to read; the document body, so a portalled tooltip is read too.
+ */
+function expectNoRawDirectionControl(root: Element): void {
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of [root, ...root.querySelectorAll('*')]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (!attribute.name.startsWith('data-')) {
+        expect(
+          containsDirectionControl(attribute.value),
+          `${element.tagName.toLowerCase()}[${attribute.name}]`,
+        ).toBe(false);
+      }
+    }
+  }
+}
+
+/** The live grid; throws when it is not rendered. */
+function liveGrid(): HTMLElement {
+  return screen.getByRole('grid', { name: GRID_NAME });
+}
+
+describe('LiveTail — hostile captured text', () => {
+  it('prints each direction control as its visible escape in the row, its title and its chip', () => {
+    // The fixture is hostile: the raw controls are in the event the pane receives.
+    expect(containsDirectionControl(bidiEvent().name)).toBe(true);
+    render(
+      pane({
+        events: [tailEvent(0), bidiEvent()],
+        notices: [notice(`/reports/${BIDI_LABEL}`, T0 + 1_000)],
+      }),
+    );
+
+    const grid = liveGrid();
+    const name = within(grid).getByText(REVEALED_LABEL);
+    expect(name.getAttribute('title')).toBe(REVEALED_LABEL);
+
+    const chip = within(grid).getByRole('button', { name: /QA_BIDI/u });
+    expect(chip.getAttribute('aria-label')).toContain('\\u202E');
+    expect(chip.textContent).toContain('\\u202C');
+
+    // The markup stayed text: nothing was parsed out of it.
+    expect(document.querySelector('script')).toBeNull();
+    expect(grid.querySelector('td')).toBeNull();
+    expectNoRawDirectionControl(document.body);
+  });
+
+  it('selects the row and opens its source with the raw captured values', async () => {
+    const user = userEvent.setup();
+    const onSelectEvent = vi.fn();
+    const onOpenSource = vi.fn();
+    const hostile = bidiEvent();
+    render(pane({ events: [tailEvent(0), hostile], actions: { onOpenSource, onSelectEvent } }));
+
+    const grid = liveGrid();
+    await user.click(within(grid).getByText(REVEALED_LABEL));
+    expect(onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(onSelectEvent).toHaveBeenCalledWith({
+      eventId: hostile.id,
+      traceId: hostile.traceId,
+      spanId: hostile.spanId,
+    });
+
+    await user.click(within(grid).getByRole('button', { name: /QA_BIDI/u }));
+    expect(onOpenSource).toHaveBeenCalledTimes(1);
+    // The very location the event carried, its file and symbol still holding the raw controls.
+    expect(onOpenSource.mock.calls[0]?.[0]).toBe(BIDI_SOURCE);
+    expect(onOpenSource).toHaveBeenCalledWith(
+      expect.objectContaining({ file: `src/server/${BIDI_LABEL}.ts`, symbol: BIDI_LABEL }),
+    );
+    // The chip's own click selects nothing: the row activation above is the only one.
+    expect(onSelectEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('filters on the raw captured name, not on its revealed display', () => {
+    render(pane({ events: [tailEvent(0), bidiEvent()] }));
+    expect(within(liveGrid()).getByText('render row 0')).toBeTruthy();
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search live events' }), {
+      target: { value: '\u202E</td>' },
+    });
+
+    const grid = liveGrid();
+    expect(within(grid).getByText(REVEALED_LABEL)).toBeTruthy();
+    expect(within(grid).queryByText('render row 0')).toBeNull();
   });
 });

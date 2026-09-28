@@ -520,6 +520,16 @@ export type TelemetryFrameConnection = Pick<
   'id' | 'kind' | 'principal' | 'tabId'
 >;
 
+/**
+ * The tab a relayed frame was established for: the acting tab, and the
+ * `tokenHash` of the credential whose live binding of it was verified — the
+ * holder attribution reads the tab's durable row under. Compared, never logged.
+ */
+interface RelayedTab {
+  readonly tabId: number;
+  readonly boundBy: string;
+}
+
 /** What `../ws.ts` hands {@link TelemetryRoutes.handleTelemetryEventFrame}. */
 export interface TelemetryEventFrame {
   /** The frame, already decoded and validated by protocol's `parseMessage`. */
@@ -1575,13 +1585,13 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
    *
    * @param message The parsed frame; its envelope `tabId` and `sessionId` are read.
    * @param client The connection the frame arrived on.
-   * @returns The tab id to hand ingest, or `TAB_NOT_BOUND` (`acting-tab-required`
-   * or `session-not-bound`).
+   * @returns The tab id to hand ingest with the verified holder of its live
+   * binding, or `TAB_NOT_BOUND` (`acting-tab-required` or `session-not-bound`).
    */
   function resolveRelayedTab(
     message: TelemetryEventMessage,
     client: TelemetryFrameConnection,
-  ): Result<number, DebuggenError> {
+  ): Result<RelayedTab, DebuggenError> {
     // 1. The acting tab: the envelope's, else a single-tab connection's hello
     //    tab. The two disagreeing, or neither naming a tab, is refused — the
     //    connection's other ("primary") tab is never substituted.
@@ -1595,10 +1605,13 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       return err(refusalFor('acting-tab-required', UNKNOWN_TAB_MESSAGE, TAB_REFUSAL_HINT));
     }
 
-    // 2. That tab's live binding, made by this credential. A tab with no live
-    //    binding has no session to attribute to — a durable row surviving a
-    //    restart carries no credential and so never attributes a batch.
-    const binding = bindings.bindingForTab(acting);
+    // 2. That tab's live binding, made by this credential. A tab id is unique
+    //    only within one browser, so the lookup is this credential's own
+    //    binding of it — never another paired browser's binding of a tab with
+    //    the same id. A tab with no such live binding has no session to
+    //    attribute to — a durable row surviving a restart was proved by no
+    //    connection since, and so never attributes a batch.
+    const binding = bindings.bindingForTab(acting, client.principal);
     if (binding === undefined) {
       return err(refusalFor('session-not-bound', UNBOUND_TAB_MESSAGE, TAB_REFUSAL_HINT));
     }
@@ -1613,7 +1626,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
     if (message.sessionId !== undefined && message.sessionId !== binding.sessionId) {
       return err(refusalFor('session-not-bound', STALE_SESSION_MESSAGE, TAB_REFUSAL_HINT));
     }
-    return ok(acting);
+    return ok({ tabId: acting, boundBy: binding.boundBy });
   }
 
   /**
@@ -1653,9 +1666,10 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       );
       return tab;
     }
+    const { tabId: actingTab, boundBy } = tab.value;
     // One service-worker connection relays several tabs; a page flooding its
     // own tab must not close the admission of the others.
-    const admissionKey = throttleKey(client.id, tab.value);
+    const admissionKey = throttleKey(client.id, actingTab);
 
     // 3. Admission: a tab whose relay carried too many malformed frames has
     //    its frames refused unread — no element is looked at — for a moment.
@@ -1664,7 +1678,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       emitDebugThrottled(
         throttleKey(DEBUG_CLASS.frameAdmissionRefused, admissionKey),
         'refused a telemetry frame from a connection that relayed too many malformed ones',
-        { clientId: client.id, tabId: tab.value, retryAfterMs: Math.ceil(closedFor) },
+        { clientId: client.id, tabId: actingTab, retryAfterMs: Math.ceil(closedFor) },
       );
       return err(admissionClosedError(closedFor));
     }
@@ -1672,12 +1686,12 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
     // 4. The batch must be an array no longer than ingest accepts: refused
     //    whole, before delegation, never truncated.
     if (!Array.isArray(events)) {
-      noteMalformed(admissionKey, client.id, tab.value);
+      noteMalformed(admissionKey, client.id, actingTab);
       return err(malformedFrameError());
     }
     const batch: readonly unknown[] = events;
     if (batch.length > MAX_INGEST_BATCH) {
-      noteMalformed(admissionKey, client.id, tab.value);
+      noteMalformed(admissionKey, client.id, actingTab);
       emitDebugThrottled(
         throttleKey(DEBUG_CLASS.frameOversize, admissionKey),
         'refused an over-size telemetry frame',
@@ -1690,9 +1704,13 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
     //    The payload's delivery context rides along unchanged: `armedCaptureId`
     //    can only refuse a batch recorded for another capture (`stale-capture`),
     //    never choose one, and `droppedCount` is the producer's loss report.
+    //    `boundBy` names the credential whose live binding of the tab was just
+    //    verified, so attribution reads that credential's durable row of the
+    //    tab id and never another browser's.
     const { armedCaptureId, droppedCount } = message.payload;
     const result = await ingest.ingestFromAgent({
-      tabId: tab.value,
+      tabId: actingTab,
+      boundBy,
       events: batch,
       ...(armedCaptureId === undefined ? {} : { armedCaptureId }),
       ...(droppedCount === undefined ? {} : { droppedCount }),
@@ -1701,7 +1719,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       // Only a refusal of the frame itself counts; a service fault (the store,
       // the session secret) is not the connection's doing.
       if (result.error.code === MALFORMED_FRAME_CODE) {
-        noteMalformed(admissionKey, client.id, tab.value);
+        noteMalformed(admissionKey, client.id, actingTab);
       }
       emitThrottled(
         'warn',
@@ -1709,7 +1727,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
         'telemetry ingest refused a relayed frame',
         {
           clientId: client.id,
-          tabId: tab.value,
+          tabId: actingTab,
           errorCode: result.error.code,
           received: batch.length,
         },
@@ -1720,7 +1738,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
     // 6. A frame of which nothing was stored because every element was
     //    malformed counts against the connection too.
     if (result.value.persisted === 0 && result.value.invalid > 0) {
-      noteMalformed(admissionKey, client.id, tab.value);
+      noteMalformed(admissionKey, client.id, actingTab);
     }
     return result;
   }
