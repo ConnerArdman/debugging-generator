@@ -1,0 +1,279 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLED
+  CANCELLED
+
+  @@map("order_status")
+}
+
+enum MovementType {
+  RECEIPT
+  SHIPMENT
+  ADJUSTMENT
+  TRANSFER
+  RESERVATION
+
+  @@map("movement_type")
+}
+
+enum CartStatus {
+  ACTIVE
+  CONVERTED
+  ABANDONED
+
+  @@map("cart_status")
+}
+
+model Category {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+
+  products   Product[]
+  priceRules PriceRule[]
+
+  @@map("categories")
+}
+
+model Product {
+  id             String   @id @default(cuid())
+  sku            String   @unique
+  slug           String   @unique
+  name           String
+  description    String
+  categoryId     String   @map("category_id")
+  unitPriceCents Int      @map("unit_price_cents")
+  leadTimeDays   Int      @map("lead_time_days")
+  imageUrl       String?  @map("image_url")
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  category           Category            @relation(fields: [categoryId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  inventoryLevels    InventoryLevel[]
+  inventoryMovements InventoryMovement[]
+  priceRules         PriceRule[]
+  cartItems          CartItem[]
+  orderItems         OrderItem[]
+
+  @@index([categoryId])
+  @@map("products")
+}
+
+model Warehouse {
+  id     String @id @default(cuid())
+  code   String @unique
+  name   String
+  region String
+
+  inventoryLevels    InventoryLevel[]
+  inventoryMovements InventoryMovement[]
+
+  @@map("warehouses")
+}
+
+model InventoryLevel {
+  id           String   @id @default(cuid())
+  productId    String   @map("product_id")
+  warehouseId  String   @map("warehouse_id")
+  onHand       Int      @map("on_hand")
+  reserved     Int      @default(0)
+  reorderPoint Int      @map("reorder_point")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([productId, warehouseId])
+  @@index([warehouseId])
+  @@map("inventory_levels")
+}
+
+model InventoryMovement {
+  id            String       @id @default(cuid())
+  productId     String       @map("product_id")
+  warehouseId   String       @map("warehouse_id")
+  quantityDelta Int          @map("quantity_delta")
+  movementType  MovementType @map("movement_type")
+  reference     String?
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([warehouseId])
+  @@map("inventory_movements")
+}
+
+model PriceRule {
+  id                  String    @id @default(cuid())
+  productId           String?   @map("product_id")
+  categoryId          String?   @map("category_id")
+  minQuantity         Int       @map("min_quantity")
+  discountBasisPoints Int       @map("discount_basis_points")
+  startsAt            DateTime  @map("starts_at")
+  endsAt              DateTime? @map("ends_at")
+  active              Boolean   @default(true)
+
+  product  Product?  @relation(fields: [productId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  category Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([productId])
+  @@index([categoryId])
+  @@map("price_rules")
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  companyName String   @map("company_name")
+  contactName String   @map("contact_name")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  carts  Cart[]
+  orders Order[]
+
+  @@map("customers")
+}
+
+model Cart {
+  id String @id @default(cuid())
+
+  customerId String? @map("customer_id")
+
+  /// The session this cart belongs to. Not unique: a session that checks a cart
+  /// out shops on with the next one, and every cart it ever held stays readable
+  /// under the same token as that session's history.
+  sessionToken String @map("session_token")
+
+  /// The session's open-cart pointer: this cart holds it for as long as it is
+  /// the cart the session shops with, and `NULL` once the cart has become an
+  /// order - or once a checkout that ended without settling its payment has
+  /// set it aside, leaving the cart `ABANDONED` under its `checkoutKey` while
+  /// the session shops on with the next one. Unique, so "at most one open cart
+  /// per session" is a fact the database keeps rather than a race two requests
+  /// can both win.
+  openToken String? @unique @map("open_token")
+
+  /// The attempt that claimed this cart, by the name its checkout submission
+  /// carried. Written when a checkout claims the cart, kept when the cart
+  /// becomes an order, and cleared when a checkout that took nothing puts the
+  /// cart back, so a repeat of the same name is answered from this row after
+  /// the process that ran the attempt is gone. Unique, so one attempt name
+  /// holds at most one cart.
+  checkoutKey String? @unique @map("checkout_key")
+
+  status    CartStatus @default(ACTIVE)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  customer       Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  items          CartItem[]
+  shippingQuotes ShippingQuote[]
+
+  @@index([customerId])
+  @@index([sessionToken, updatedAt])
+  @@map("carts")
+}
+
+model CartItem {
+  id             String @id @default(cuid())
+  cartId         String @map("cart_id")
+  productId      String @map("product_id")
+  quantity       Int
+  unitPriceCents Int    @map("unit_price_cents")
+
+  cart    Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([cartId, productId])
+  @@index([productId])
+  @@map("cart_items")
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  orderNumber   String      @unique @map("order_number")
+  customerId    String      @map("customer_id")
+  status        OrderStatus @default(PENDING)
+  subtotalCents Int         @map("subtotal_cents")
+  discountCents Int         @map("discount_cents")
+  shippingCents Int         @map("shipping_cents")
+  totalCents    Int         @map("total_cents")
+  placedAt      DateTime    @default(now()) @map("placed_at")
+
+  /// Who placed this order, as the checkout collected it. The account the order
+  /// is written against may be shared by several people at the same company, so
+  /// the contact is kept on the order itself. Written as a set or not at all;
+  /// `NULL` throughout on an order written without a collected contact, which
+  /// is then described by its customer account.
+  contactName    String? @map("contact_name")
+  contactEmail   String? @map("contact_email")
+  contactCompany String? @map("contact_company")
+
+  /// Where the goods are going, as the checkout collected it. Written as a set
+  /// or not at all, so an order either carries a destination or carries none.
+  shipLine1      String? @map("ship_line1")
+  shipLine2      String? @map("ship_line2")
+  shipCity       String? @map("ship_city")
+  shipRegion     String? @map("ship_region")
+  shipPostalCode String? @map("ship_postal_code")
+  shipCountry    String? @map("ship_country")
+
+  /// What the buyer asked the packers to know, or `NULL` when they said nothing.
+  deliveryNotes String? @map("delivery_notes")
+
+  customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  items          OrderItem[]
+  shippingQuotes ShippingQuote[]
+
+  @@index([customerId])
+  @@index([placedAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id             String @id @default(cuid())
+  orderId        String @map("order_id")
+  productId      String @map("product_id")
+  quantity       Int
+  unitPriceCents Int    @map("unit_price_cents")
+  discountCents  Int    @map("discount_cents")
+  lineTotalCents Int    @map("line_total_cents")
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+model ShippingQuote {
+  id           String   @id @default(cuid())
+  orderId      String?  @map("order_id")
+  cartId       String?  @map("cart_id")
+  carrierCode  String   @map("carrier_code")
+  serviceLevel String   @map("service_level")
+  amountCents  Int      @map("amount_cents")
+  etaDays      Int      @map("eta_days")
+  quotedAt     DateTime @default(now()) @map("quoted_at")
+
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  cart  Cart?  @relation(fields: [cartId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([orderId])
+  @@index([cartId])
+  @@map("shipping_quotes")
+}

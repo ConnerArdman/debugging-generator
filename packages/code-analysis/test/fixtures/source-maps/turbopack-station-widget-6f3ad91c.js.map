@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "file": "turbopack-station-widget.js",
+  "sources": [
+    "turbopack:///[project]/src/widgets/GaugeReadout.tsx",
+    "turbopack:///[project]/src/lib/http.ts"
+  ],
+  "names": ["handleReadoutClick", "fetchGaugeIndex"],
+  "mappings": ";;;;;;;;MCoBO,eAAeC;QAOpB;;;;;;;;;;;;;QDYA,MAAMD"
+}

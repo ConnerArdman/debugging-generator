@@ -1,0 +1,258 @@
+/*
+ * CartLineRow - the stylesheet for one cart line item.
+ *
+ * Consumed only by `./CartLineRow.tsx`, which renders the `<li>`: thumbnail, product name, SKU,
+ * a stock badge with the unit price, the quantity stepper, the line total and the remove control.
+ * The surrounding `<ul>`, its scroll region and the hairline between two rows belong to
+ * `./CartLineList.module.css`; this file styles the row's own box and nothing outside it.
+ *
+ * OWNERSHIP - what this file deliberately does not do
+ *
+ *   - No separator. `CartLineList.module.css` draws `li + li { border-top: ... }`, so a
+ *     `border-bottom` here would double the rule on every row but the last and put two owners on
+ *     one hairline.
+ *   - No control chrome. The quantity stepper (`./QuantityStepper.tsx`) and the remove button
+ *     (`../ui/Button` with `variant="ghost"`) own their padding, radius, hover treatment and
+ *     focus ring; the badge and the price own their colour and size. `.controls`, `.total` and
+ *     `.remove` therefore carry placement only - a rule here that repainted a control would
+ *     silently fork its appearance from every other place it is used.
+ *   - No motion. The states this row paints - the dimming while one of its mutations is in
+ *     flight, and the held controls that go with it - are meant to read as instantaneous, and a
+ *     transition on a property that changes with state restarts on the next change rather than
+ *     settling. So this file declares no `transition` and no `animation` at all - which is also
+ *     why it needs no `@media (prefers-reduced-motion: reduce)` block of its own. Motion in this
+ *     workspace lives in the modules that introduce it, each with its own reduced-motion rule
+ *     (`../ui/Skeleton.module.css` and the `ui` group's hover transitions).
+ *
+ * TOKENS
+ *
+ * Every colour, length, radius and font in this file resolves to an `--ls-*` custom property
+ * declared by `apps/demo-app/app/globals.css`, always written with the literal fallback that
+ * mirrors the value declared there, so the row still renders sensibly if it is ever mounted
+ * without that stylesheet. Bare literals appear only where a token cannot: `0`, `auto`, `none`,
+ * keywords, unitless ratios (`4 / 3`, `font-weight: 600`, the line heights and the busy opacity)
+ * and the container-query condition, which the cascade cannot reach at all (a media or container
+ * query condition may not contain `var()`, so its length is spelled out as the same arithmetic
+ * over the spacing scale that a token would have carried - see the query below).
+ *
+ * Two file-local custom properties are declared on `.root` and used without a fallback, because
+ * `.root` itself is their only declaration site and every element that reads them is inside it.
+ * Hex is lowercase throughout: Prettier normalises CSS colours and `pnpm format:check` is a
+ * blocking gate.
+ */
+
+/* The `<li>`. One grid, five named areas on a wide row, re-mapped to two lines by the single
+ * container query at the end of the file.
+ *
+ * `min-width: 0` keeps the row from forcing its list wider than the drawer - a grid item's
+ * automatic minimum size is its content, and a long product name or a wide stepper would
+ * otherwise become a horizontal scrollbar. `align-items: start` tops the thumbnail, the details
+ * block and the figures against each other instead of stretching them to the tallest of the
+ * three. The inline padding is `0` on purpose: the horizontal inset belongs to the list's own
+ * padding, so every row's content lines up with the list header above it. */
+.root {
+  /* The thumbnail's width, and with `aspect-ratio` below its height as well. Declared here
+   * rather than on `.image` because the grid's first column is sized from it, which is what
+   * keeps the thumbnail column and the image exactly the same width in both layouts. */
+  --line-media-width: calc(var(--ls-space-6, 32px) * 2);
+  /* The floor under the line-total column, and the reason the stepper does not drift sideways
+   * from row to row. Each row is its own grid, so a content-sized total column makes every
+   * column left of it start at a different x once one row's amount is longer than another's -
+   * and it would move again the moment a quantity changed. 96px holds about ten monospaced
+   * figures at `--ls-text-md`, which covers every total this catalogue produces; it is a
+   * minimum and not a cap, so an unusually long amount still gets the width it needs (only that
+   * row shifts, and nothing is ever clipped). */
+  --line-total-width: calc(var(--ls-space-6, 32px) * 3);
+  /* Dimming for the row while one of its own mutations is in flight. 0.85 rather than something
+   * heavier: composited over `--ls-surface`, it leaves the dimmest text in the row
+   * (`--ls-text-muted`) at 5.1:1 and over `--ls-surface-sunken` at 5.0:1, both clear of WCAG AA,
+   * where a 0.6 dim would drop it to 2.9:1. The dim is a supporting cue in any case - the
+   * stepper and the remove button show their own busy state, and `aria-busy` on this element is
+   * what a screen reader announces. */
+  --line-busy-opacity: 0.85;
+
+  display: grid;
+  min-width: 0;
+  grid-template-columns:
+    var(--line-media-width)
+    minmax(0, 1fr)
+    auto
+    minmax(var(--line-total-width), max-content)
+    auto;
+  grid-template-areas: 'media details controls total remove';
+  align-items: start;
+  gap: var(--ls-space-3, 12px);
+  padding: var(--ls-space-3, 12px) 0;
+}
+
+/* `data-busy` is set by the row while its own quantity or remove mutation is in flight.
+ * `pointer-events: none` is deliberately absent: it would drop the row's controls out of hit
+ * testing while leaving them in the tab order, stranding a keyboard user on a button that no
+ * longer responds. The controls disable themselves instead, which removes them from the tab
+ * order properly, and `cursor: progress` explains the wait to a pointer user. */
+.root[data-busy='true'] {
+  cursor: progress;
+  opacity: var(--line-busy-opacity);
+}
+
+/* The thumbnail's cell. Sized by the grid column, so it needs placement only. */
+.media {
+  grid-area: media;
+  min-width: 0;
+}
+
+/* The thumbnail itself - a plain `<img>` with a literal `src` and `width`/`height` attributes,
+ * never a CSS background, so the browser can decode it lazily and the element is the only thing
+ * that knows the file name.
+ *
+ * The artwork in `public/products` is intrinsically 400x300, so the reserved 4 / 3 box matches
+ * it: `height: auto` lets the intrinsic ratio settle the height, `aspect-ratio` holds the box
+ * open before the file arrives and `object-fit: contain` keeps a product that is not 4 / 3 whole
+ * rather than cropping it. Together that is what stops the cart drawer jumping as thumbnails
+ * load. The sunken fill is visible in three states - before the image decodes, behind a
+ * transparent SVG and in place of one that fails to load - so a missing file leaves a quiet
+ * placeholder rather than a broken-image glyph on white. */
+.image {
+  width: var(--line-media-width);
+  height: auto;
+  aspect-ratio: 4 / 3;
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface-sunken, #f8fafc);
+  object-fit: contain;
+}
+
+/* Name, SKU and the badge/price row, stacked tightly. `min-width: 0` is what allows the name to
+ * ellipsize: without it this grid item's automatic minimum size is the name's longest word, and
+ * the `1fr` track would grow past the row instead of the text being clamped. */
+.details {
+  display: grid;
+  min-width: 0;
+  grid-area: details;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The product name, clamped to two lines. The `-webkit-box` trio is the interoperable spelling of
+ * a line clamp and is what every current browser implements, prefix included; `overflow: hidden`
+ * is what makes it take effect and `text-overflow: ellipsis` covers the single-line case, where
+ * the clamp has nothing to truncate. `text-decoration: none` applies when the element is itself
+ * the link to the product. */
+.name {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 15px);
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  text-decoration: none;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* A link nested inside the name keeps the name's colour rather than a user-agent blue. */
+.name a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* The underline is the affordance, for the pointer and for the keyboard, whether the link is this
+ * element or a child of it. Nothing else changes on hover, so there is no colour shift to
+ * transition and nothing that competes with the global focus ring. */
+a.name:hover,
+a.name:focus-visible,
+.name a:hover,
+.name a:focus-visible {
+  text-decoration: underline;
+}
+
+/* The product code, in the mono family with tabular digits: the identifier treatment the catalog
+ * card and the product page's specification list share, so a code reads the same on all three
+ * surfaces and codes line up down the list. */
+.sku {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
+/* The stock badge beside the unit price. Both children carry their own colour and size, so this
+ * is placement only; it wraps rather than overflowing when the details track is narrow. */
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The quantity stepper's cell. `justify-self: start` keeps the stepper at its natural width
+ * instead of stretching it across the track it shares with the details block on a narrow row. */
+.controls {
+  grid-area: controls;
+  justify-self: start;
+  min-width: 0;
+}
+
+/* The line total. Right-aligned so the figures form a column down the list, with tabular figures
+ * so that column does not shuffle as digits change - the price component supplies the monospaced
+ * family, this supplies the alignment. `nowrap` keeps a long amount on one line. */
+.total {
+  grid-area: total;
+  justify-self: end;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The remove button's cell: placement and nothing else. The ghost button owns its own box. */
+.remove {
+  grid-area: remove;
+  justify-self: end;
+}
+
+/* The one breakpoint.
+ *
+ * It is a container query, not a viewport query, because this row appears at two very different
+ * widths on the same screen: inside the ~400px cart drawer and across the main column of the
+ * `/cart` page. `CartLineList.module.css` declares `container-type: inline-size` on its scroll
+ * region, which is the nearest query container in both cases, so the row responds to the space it
+ * is actually given. Mounted with no query container anywhere above it, no condition matches and
+ * the wide layout above stands - the safe default, since it is the one that needs more room.
+ *
+ * 512px is `--ls-space-6` (32px) x 16, the same arithmetic the file-local properties above use on
+ * the spacing scale, written out because a query condition may not contain `var()`. It sits above
+ * every drawer width and well below the page column, which is what makes one breakpoint enough:
+ * the drawer always collapses and the page never does. Measured, the wide row wants about 510px -
+ * a 64px thumbnail, four 12px gaps, a ~110px stepper, the total, the remove button and a legible
+ * 180px for the name - so the switch happens exactly where the five columns stop fitting.
+ *
+ * Below it the five areas fold onto two lines - `media details` first, then
+ * `controls total remove` - over four columns, so the thumbnail column stays exactly as wide as
+ * the thumbnail while the stepper spans the first two columns and has room to breathe. The
+ * figures centre against the stepper, which is the tallest thing on the second line.
+ *
+ * The total column drops back to `auto` here, without the minimum the wide layout gives it:
+ * on the second line the stepper is pinned to the row's leading edge and the total and remove
+ * control to its trailing edge, so nothing sits between them whose position a longer amount
+ * could push around, and the width is better spent on the name.
+ *
+ * The block-end padding grows by one spacing step here, and only here. The stepper's range hint
+ * is drawn out of flow beneath it (`./QuantityStepper.module.css` states the ~21px it occupies),
+ * and on this arrangement the stepper is the row's last line, so the hint would otherwise hang
+ * across the hairline into the next row. Reserving the room permanently, rather than when the hint
+ * appears, is what keeps the hint from moving anything: the row is the same height with or
+ * without it. The wide arrangement needs nothing, because its details column is deeper than the
+ * stepper and the hint together. */
+@container (max-width: calc(32px * 16)) {
+  .root {
+    grid-template-columns: var(--line-media-width) minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      'media details details details'
+      'controls controls total remove';
+    padding-block-end: calc(var(--ls-space-3, 12px) + var(--ls-space-3, 12px));
+  }
+
+  .total,
+  .remove {
+    align-self: center;
+  }
+}

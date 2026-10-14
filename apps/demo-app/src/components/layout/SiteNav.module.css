@@ -1,0 +1,232 @@
+/*
+ * SiteNav - the storefront's primary navigation row, rendered once by `app/layout.tsx` directly
+ * beneath the sticky `SiteHeader`.
+ *
+ * Imported by exactly one file, its sibling `SiteNav.tsx`
+ * (`import styles from './SiteNav.module.css';`), and by nothing else. The seven classes below are
+ * the whole contract between the two - `root`, `inner`, `toggle`, `list`, `item`, `link`,
+ * `active`: the component uses every one of them, and this file defines no eighth.
+ *
+ * Values. Every colour, length, radius and font in this file resolves to an `--ls-*` token from
+ * `app/globals.css`, written in `var(--ls-NAME, <literal fallback>)` form so the module renders
+ * sensibly on its own and renders *this* storefront's palette inside the application. Lengths the
+ * shared scale does not name are derived from it with `calc()` through the file-local `--nav-*`
+ * properties declared on `.root`; those inherit, which is also why `.inner`, `.list` and `.link`
+ * are only meaningful inside `.root` - the component always nests them there. Two lengths are
+ * spelled as plain device pixels, exactly as `globals.css` spells them: the hairline border width
+ * and the focus-ring width. Both are single physical pixels rather than steps on a spacing scale,
+ * and scaling them with the scale would be wrong.
+ *
+ * What this file deliberately does not own:
+ *
+ *   - The disclosure control's appearance. That control is `@/components/ui/Button`, which owns
+ *     its border, fill, radius, sizing and focus ring; `.toggle` places it and stops there.
+ *   - Stacking and positioning. Only the header is pinned, with the cart drawer and the toast
+ *     region layered above it; the nav needs no layer of its own and takes part in no stacking
+ *     tier. It scrolls with the page and sits flush under the header by document order, so this
+ *     file declares no `position` and no stacking property whatsoever.
+ *   - The current route's font weight. `.active` raises the colour and draws an accent indicator,
+ *     and nothing else: a heavier label is a wider label, and changing it per route would reflow
+ *     the entire row on every navigation - a layout shift that a capture would pick up.
+ *
+ * One breakpoint, 720px, is the only width condition in the file, and it carries all four
+ * narrow/wide differences at once: the toggle disappears, the list becomes an always-visible row
+ * whatever `data-open` holds, the gutter widens by one step, and a link gives up the minimum
+ * target height it keeps in the stacked menu. A media query cannot read a custom property, so that
+ * single length is a literal by necessity.
+ */
+
+.root {
+  /* Geometry, every value a step on the shared spacing scale. */
+  --nav-gutter-inline: var(--ls-space-4, 16px);
+  --nav-stack-gap: var(--ls-space-2, 8px);
+  --nav-item-gap: var(--ls-space-1, 4px);
+  --nav-row-padding-block: var(--ls-space-2, 8px);
+  --nav-link-padding-block: var(--ls-space-2, 8px);
+  --nav-link-padding-inline: var(--ls-space-3, 12px);
+  /* The least block size a route link may have. Below the breakpoint the list is a stacked menu a
+   * reader works with a thumb, and its padding and one 13px line add up to 34px - under the 44px
+   * pointer target `globals.css` names as `--ls-target-min` - so the menu holds each link to that
+   * target. The wide layout resets this to `auto` in the breakpoint block, where the row of chips
+   * keeps its own height and a 44px chip would only make the bar taller. */
+  --nav-link-min-block: var(--ls-target-min, 44px);
+  /* Half the smallest step - 2px at the shipped scale - for the accent underline under the
+   * current route. */
+  --nav-indicator-size: calc(var(--ls-space-1, 4px) / 2);
+  /* A quarter step - 1px - between a focused chip and its ring, so the ring hugs the chip and
+   * never crosses the gap into the item beside it. */
+  --nav-focus-offset: calc(var(--ls-space-1, 4px) / 4);
+  /* The stacked list's reveal. `globals.css` names no motion token, so the duration lives here;
+   * the travel is one spacing step, upward. */
+  --nav-reveal-duration: 140ms;
+  --nav-reveal-travel: calc(var(--ls-space-1, 4px) * -1);
+
+  background: var(--ls-surface, #ffffff);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  font-family: var(
+    --ls-font-sans,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif
+  );
+}
+
+/* The centred measure. Below the breakpoint the toggle sits above the list, so this is a column;
+ * above it, a row. The inline padding is the page shell's gutter pair, so a route's chip lines up
+ * with the content of the page underneath it. */
+.inner {
+  display: flex;
+  max-width: var(--ls-page-max, 1200px);
+  min-width: 0;
+  flex-direction: column;
+  align-items: stretch;
+  margin-inline: auto;
+  padding-block: var(--nav-row-padding-block);
+  padding-inline: var(--nav-gutter-inline);
+  gap: var(--nav-stack-gap);
+}
+
+/* Placement only: the button inside is a `Button`, and its chrome is that component's. */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* The route list. `SiteNav.tsx` keeps it mounted at every width and reports the disclosure state
+ * in `data-open`, so visibility is decided here instead of by unmounting - which is what keeps
+ * the toggle's `aria-controls` pointing at an element that exists. Escape is safe against the
+ * `data-open='false'` rule below because `SiteNav.tsx` moves focus to the control before it writes
+ * that attribute, so that path never leaves focus on an element this rule stops drawing. */
+.list {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  gap: var(--nav-item-gap);
+  list-style: none;
+}
+
+.list[data-open='false'] {
+  display: none;
+}
+
+.list[data-open='true'] {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  animation: nav-list-reveal var(--nav-reveal-duration) ease-out;
+}
+
+/* One route. `min-width: 0` lets a long label shrink instead of widening the row, and the list's
+ * `align-items` is what stretches the item to the full width of the stacked layout. */
+.item {
+  display: inline-flex;
+  min-width: 0;
+}
+
+/* A route chip: the anchor is the entire hit area, so it grows to its row in the stacked layout
+ * and sizes to its label in the row. A label too long for its line truncates rather than pushing
+ * the page into a horizontal scroll. `min-block-size` reads `--nav-link-min-block` from `.root`,
+ * which is the pointer target in the stacked menu and `auto` in the wide row; `align-items` keeps
+ * the label centred in whatever height that leaves. */
+.link {
+  display: inline-flex;
+  overflow: hidden;
+  min-width: 0;
+  min-block-size: var(--nav-link-min-block);
+  flex: 1 1 auto;
+  align-items: center;
+  padding-block: var(--nav-link-padding-block);
+  padding-inline: var(--nav-link-padding-inline);
+  border-radius: var(--ls-radius-sm, 4px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 500;
+  line-height: 1.4;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Hover only where a pointer can hover, so a tap never leaves a chip stuck in the hovered fill. */
+@media (hover: hover) {
+  .link:hover {
+    background: var(--ls-surface-sunken, #f8fafc);
+    color: var(--ls-text, #0f172a);
+  }
+}
+
+/* The application's focus indicator, refined for a chip: the same ring `globals.css` draws, pulled
+ * in tight against the chip's own corner radius. */
+.link:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: var(--nav-focus-offset);
+}
+
+/* The current route. `SiteNav.tsx` applies this in addition to `.link`, so it says only what
+ * differs: the primary text tone, plus the accent underline drawn with an inset shadow, which
+ * paints inside the chip and occupies no layout at all. Weight is untouched on purpose. */
+.active {
+  color: var(--ls-text, #0f172a);
+  box-shadow: inset 0 calc(-1 * var(--nav-indicator-size)) 0 0 var(--ls-accent, #f59e0b);
+}
+
+@keyframes nav-list-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(var(--nav-reveal-travel));
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The file's single width condition. */
+@media (min-width: 720px) {
+  /* The wide gutter, and the row's chips back at their own padded 34px, which already clears the
+   * 24px minimum of WCAG 2.5.8; the 44px floor declared above belongs to the stacked menu. */
+  .root {
+    --nav-gutter-inline: var(--ls-space-5, 24px);
+    --nav-link-min-block: auto;
+  }
+
+  .inner {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .toggle {
+    display: none;
+  }
+
+  /* The disclosure is a narrow-viewport affordance. Above the breakpoint the row is always
+   * visible, whatever `data-open` was left holding when the viewport widened, so a collapsed
+   * state cannot leak into the wide layout. Both attribute selectors are repeated here because
+   * each of them outranks a bare `.list`. */
+  .list,
+  .list[data-open='false'],
+  .list[data-open='true'] {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    animation: none;
+  }
+}
+
+/* Motion introduced by a module is paired with the module's own reduced-motion rule, at its own
+ * specificity: the universal collapse in `globals.css` is a baseline for page-level motion and
+ * deliberately does not decide this for a component. */
+@media (prefers-reduced-motion: reduce) {
+  .list[data-open='true'] {
+    animation: none;
+  }
+}

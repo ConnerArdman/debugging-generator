@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "@debuggen/local-service: the local coordination service, a Node 24 process that renders no UI.",
+
+  "// format": "Strict JSON, so notes are top-level `\"// …\"` keys, which TypeScript ignores; inside `compilerOptions` such a key is an error (TS5023).",
+
+  "// compilerOptions.module": "NodeNext, because package.json declares \"type\": \"module\" and Node runs the tsup output dist/main.js directly. Relative specifiers therefore carry \".js\" (`./config.js`); tsup and esbuild resolve them to the .ts sources.",
+
+  "// compilerOptions.rootDir": "\".\" because test/integration/** lives outside src/ and belongs to the program.",
+
+  "// compilerOptions.types": "[\"node\"] only. The `ws` types resolve through its import (@types/ws).",
+
+  "// compilerOptions.lib": "Not overridden: the base's ES2023-only set keeps DOM globals out, and `fetch`, `URL` and the timers come from @types/node.",
+
+  "// compilerOptions.outDir": "Inherited: declarations only, into `${configDir}/.tsbuild`. tsc never writes dist/, which tsup owns and package.json `main` points at.",
+
+  "// compilerOptions.not-set": "No `paths`/`baseUrl`: workspace packages resolve through the pnpm symlink and each package's `exports` map. Node, tsup and esbuild follow its runtime conditions into dist/; tsc follows its source-first `types` condition to src/ (docs/ARCHITECTURE.md §3).",
+
+  "// compilerOptions.resolveJsonModule": "Inherited but unused: prompts/manifest.json and src/store/schema.sql are never imported. The prompt loader reads the manifest from disk at runtime; the store reads schema.sql from disk too, except in the packaged VSIX, whose esbuild bundle inlines the DDL as a string.",
+
+  "// include": "src/**/*.ts, with the colocated unit suites, and test/**/*.ts, the integration suite, so tests are type-checked as strictly as sources. No .tsx: the workspace has none.",
+
+  "// exclude": "`exclude` replaces the base list, so node_modules, dist and .tsbuild are repeated. test/fixtures/** holds runtime inputs, among them sample-project, a separate Next.js app with its own tsconfig.json.",
+
+  "// references": "The seven dependencies in layering order, then panel-renderer, a devDependency referenced only for the render oracle under test/integration/render/, the one directory eslint.config.js lets import it; src/** never does. `tsc -b` type-checks this program against the referenced projects' .tsbuild declarations, so `pnpm typecheck` never reads a stale dist/. No apps/* reference: the extensions reach this service over HTTP and WebSocket.",
+
+  "extends": "../../tsconfig.base.json",
+
+  "compilerOptions": {
+    "composite": true,
+
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "rootDir": ".",
+
+    "types": ["node"]
+  },
+
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+
+  "exclude": ["node_modules", "dist", ".tsbuild", "test/fixtures/**"],
+
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/telemetry" },
+    { "path": "../../packages/code-analysis" },
+    { "path": "../../packages/instrumentation" },
+    { "path": "../../packages/panel-schema" },
+    { "path": "../../packages/model-provider" },
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/panel-renderer" }
+  ]
+}

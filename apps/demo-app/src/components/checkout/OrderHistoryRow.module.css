@@ -1,0 +1,216 @@
+/*
+ * Lumen Supply - one row of the order history.
+ *
+ * Scope is exactly the `<li>` that `OrderHistoryRow.tsx` renders. The `<ul>` reset, the hairline
+ * between rows, the visible column-header strip and the pager belong to
+ * `OrderHistoryList.module.css`; the status chip belongs to `../ui/Badge`; money typography
+ * belongs to `../ui/Price`. This file places those parts on one grid and owns the row's own
+ * hover and focus affordance - nothing more.
+ *
+ * The orders page lists hundreds of rows, so the grid is deliberately uniform: four tracks whose
+ * widths are a function of the container and of nothing else, tabular numerals in every numeric
+ * cell and a monospace order reference. No track is sized from its contents, because every row is
+ * its own grid container: an `auto` or `max-content` track would resolve to that row's own badge
+ * word, item count and money string, and the column edges would then wander by tens of pixels
+ * from row to row and match no header strip. A track measured from the container is what makes a
+ * column edge drawn at the top of the page the same edge at the bottom.
+ *
+ * WHY THE FOUR TRACKS SHARE THE ROW RATHER THAN CROWDING ITS END
+ * Each track is `minmax(<floor>, <fraction>)`, so the four of them divide the row 2:1:1:1 and the
+ * floors below are minimums rather than widths. Dividing the surplus this way spreads the four
+ * columns across the row, which is how the reader scans one order as a single line rather than as
+ * two distant clusters. The fractions resolve identically for the header strip and for every row,
+ * because both are laid out in boxes of the same width, which is what the alignment contract below
+ * relies on.
+ *
+ * Alignment contract with `OrderHistoryList.module.css`, whose `.columns` header strip (order,
+ * status, items, total) states the same template:
+ *
+ *     grid-template-columns:
+ *       minmax(0, 2fr)
+ *       minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+ *       minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+ *       minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr);
+ *     column-gap: var(--ls-space-3, 12px);
+ *
+ * The three custom properties are the seam: a container may declare them once - custom properties
+ * inherit, and CSS Modules leaves their names untouched - and the strip and every row then read
+ * the same minimums without either file hardcoding them twice. The defaults above are 96px, 80px
+ * and 128px, each comfortably wider than the content it holds (the longest status chip, a
+ * two-digit item count, a seven-figure currency amount), so nothing spills into the gap even in a
+ * container too narrow for the fractions to reach those figures - the grid freezes a track at its
+ * floor and divides what is left among the rest.
+ *
+ * The two numeric cells are end-aligned, so their header labels are end-aligned too, and the
+ * strip hides itself in the same container query that collapses this row.
+ *
+ * Every colour, length, radius and font size resolves to an `--ls-*` custom property declared by
+ * `app/globals.css`, each with the literal fallback that mirrors it, so the module renders
+ * correctly on its own as well as inside the application. Hex fallbacks are lowercase because
+ * Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 2fr)
+    minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+    minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+    minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr);
+  align-items: center;
+  /* The column gap is the half of the contract the header strip has to repeat. The row gap only
+   * ever applies in the stacked arrangement at the end of this file, where the cells occupy two
+   * lines, so it is the tighter step. */
+  column-gap: var(--ls-space-3, 12px);
+  row-gap: var(--ls-space-2, 8px);
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  border-radius: var(--ls-radius-sm, 4px);
+  /* Declared so the hover tint has a start value to interpolate from. Durations are not part of
+   * the token contract, so this timing is stated literally; every length in the file is a token or
+   * a calc() over one, the sole exception being the container-query breakpoint at the end, which
+   * the syntax forbids from reading a token at all. */
+  background-color: transparent;
+  transition: background-color 150ms ease-out;
+}
+
+.identity {
+  display: flex;
+  min-width: 0;
+  grid-row: 1;
+  grid-column: 1;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The column readers scan. Monospace with tabular figures is what keeps three hundred references
+ * in a straight edge; the ellipsis keeps a long one inside the flexible track instead of forcing
+ * the grid wider, and leaves the text selectable. */
+.orderNumber {
+  overflow: hidden;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-md, 15px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.placed {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* Placement only: the chip's own padding, radius, colour and border are `../ui/Badge`'s. */
+.statusCell {
+  display: flex;
+  grid-row: 1;
+  grid-column: 2;
+  align-items: center;
+}
+
+.itemsCell {
+  grid-row: 1;
+  grid-column: 3;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: end;
+}
+
+/*
+ * The word beside the item count - "7 items" - which exists only for the stacked arrangement at
+ * the end of this file. While the header strip is on screen the column is headed "Items" and the
+ * figure needs no unit of its own, so the span is removed from the layout entirely rather than
+ * merely hidden: a unit here would widen the narrowest of the four tracks for no reader.
+ */
+.itemsUnit {
+  display: none;
+}
+
+/* Alignment only: `../ui/Price` owns the money typography variants. The family and the figure
+ * mode are restated here so the totals form a straight right edge even when a row renders the
+ * amount as plain text. */
+.totalCell {
+  grid-row: 1;
+  grid-column: 4;
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: end;
+}
+
+/*
+ * The whole-row tint under the pointer. It is a reading aid rather than an affordance, and that
+ * distinction is why it is the only state this row has: the row holds no control, so there is
+ * nothing here to focus and no `:focus-within` ring to draw. Four values spread across a
+ * page-wide row are read by travelling along it, and a tinted band is what keeps the eye on the
+ * order it started on - the same job the zebra tint does in a dense table.
+ *
+ * It lives behind a hover-capable-pointer query so a tap on a touch device does not leave a row
+ * looking permanently picked out.
+ */
+@media (hover: hover) {
+  .root:hover {
+    background-color: var(--ls-surface-sunken, #f8fafc);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}
+
+/* One collapse point, expressed as a container query because this list is as likely to sit in a
+ * narrow page column as to span the page: `OrderHistoryList.module.css` declares
+ * `container-type: inline-size` on the list region, and the rule below reads that container's
+ * inline size rather than the viewport's.
+ *
+ * The value is 32rem - 512px at the default 16px root, sixteen times the 32px `--ls-space-6`
+ * step - written as arithmetic over that step in rem so it also tracks the reader's root font
+ * size. A container condition is evaluated before custom properties are substituted, so `var()`
+ * cannot appear inside the parentheses; the calc() is as close as the syntax allows to naming the
+ * token. The header strip hides itself at this same width, because a stacked row has no columns
+ * left to label.
+ *
+ * Two columns and two lines: the order identity beside its status, then the item count beside the
+ * total. The second track is fixed at the widest of the three minimums above rather than divided
+ * as a fraction, because there are only two tracks left and no surplus to spread: a fixed width
+ * is what keeps the chip and the amount on one straight right edge down the whole list, while
+ * everything else lives in the flexible first track - nothing overflows however narrow the
+ * container becomes.
+ *
+ * The item count is the one cell that changes what it says here rather than only where it sits.
+ * It moves to the start of the second line, directly beneath the date, and the strip that headed
+ * it "Items" is gone - so it reveals its own unit and reads "7 items" instead of leaving a bare
+ * integer under a date, which is easily taken for part of it. `inline` rather than
+ * `inline-block`: the unit is a word in the middle of the cell's own line, and it wraps with the
+ * figure. */
+@container (max-width: calc(2rem * 16)) {
+  .root {
+    grid-template-columns:
+      minmax(0, 1fr)
+      var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+  }
+
+  .statusCell {
+    grid-column: 2;
+    justify-content: flex-end;
+  }
+
+  .itemsCell {
+    grid-row: 2;
+    grid-column: 1;
+    text-align: start;
+  }
+
+  .itemsUnit {
+    display: inline;
+  }
+
+  .totalCell {
+    grid-row: 2;
+    grid-column: 2;
+  }
+}

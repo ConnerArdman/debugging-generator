@@ -1,0 +1,338 @@
+/*
+ * Lumen Supply - catalog product tile geometry.
+ *
+ * Consumed only by `ProductCard.tsx`, which puts `.root` (plus `.selected` while the tile's quick
+ * specs are open) on a `@/components/ui/Card` and the remaining classes on its own elements. The
+ * primitives the tile composes - `Card`, `Pill`, `Badge`, `Price`, `Button` - own their surface,
+ * typography and interaction states. This file owns the tile's geometry and the two accents that
+ * belong to the tile itself: the outline that marks an expanded tile and the focus ring on the
+ * product link, which is the tile's accessible name.
+ *
+ * Token contract: every colour, space, radius, type size and family is read as
+ * `var(--ls-NAME, <literal fallback>)`. `app/globals.css` declares the tokens once for the
+ * application and each fallback mirrors the declaration there, so this module also renders
+ * sensibly on its own. Geometry the token set does not model - the media ratio, the title clamp,
+ * the accent width, the hairline, the grid tracks - is declared once on `.root` as a file-local
+ * `--catalog-*` property whose own value is a `var(--ls-catalog-*, <literal>)` lookup: a future
+ * global override has a name to target, descendants inherit the resolved value, and no bare value
+ * is repeated at a use site. The container-query widths further down are stated bare, because a
+ * query condition cannot read a custom property.
+ *
+ * Nothing here restyles a primitive's chrome - its colour, border, radius or weight - and nothing
+ * here animates: `Card` owns the tile's hover elevation together with the reduced-motion treatment
+ * of that transition, so this file introduces no transition of its own and needs no reduced-motion
+ * block. Where the tile's width asks a primitive for less room - the add control's inline padding,
+ * the stock chip's compact step in a narrow artwork box - the rule that does it says why.
+ */
+
+.root {
+  /* File-local geometry, resolved once here and inherited by every element below. */
+  --catalog-card-fill: var(--ls-catalog-card-fill, 100%);
+  --catalog-media-ratio: var(--ls-catalog-media-ratio, 4 / 3);
+  --catalog-media-columns: var(--ls-catalog-media-columns, minmax(0, 1fr));
+  --catalog-media-rows: var(--ls-catalog-media-rows, auto minmax(0, 1fr));
+  --catalog-body-columns: var(--ls-catalog-body-columns, minmax(0, 1fr));
+  --catalog-accent-width: var(--ls-catalog-accent-width, 2px);
+  --catalog-hairline: var(--ls-catalog-hairline, 1px);
+  --catalog-title-lines: var(--ls-catalog-title-lines, 2);
+  --catalog-title-leading: var(--ls-catalog-title-leading, 1.3);
+  --catalog-specs-columns: var(--ls-catalog-specs-columns, max-content minmax(0, 1fr));
+  --catalog-actions-columns: var(--ls-catalog-actions-columns, max-content minmax(0, 1fr));
+
+  display: grid;
+  block-size: var(--catalog-card-fill, 100%);
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * `Card` wraps the tile's content in one slot element of its own and declares no layout for it -
+ * its stylesheet owns the surface and leaves arrangement to the caller - so the tile's single
+ * content column is composed here, on that slot, rather than by reaching into the primitive's own
+ * class names. The column is as tall as the card, which is what lets `.actions` settle at the foot
+ * of a tile whose product name is shorter than its neighbour's.
+ */
+.root > * {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * An expanded tile. The outline uses --ls-accent, the shared token for a selected surface, and is
+ * supplementary to the specs list itself, the toggle's label and its `aria-expanded` state, so the
+ * colour is never the only thing that reports the state.
+ */
+.selected {
+  outline: var(--catalog-accent-width, 2px) solid var(--ls-accent, #f59e0b);
+  outline-offset: var(--ls-space-1, 4px);
+}
+
+/*
+ * The artwork box. It holds the tile's 4:3 ratio at every width, so the tiles in a row stay the
+ * same height whatever their availability reads, and it stacks its two children in one column: the
+ * stock chip in a first row sized to the chip, and the artwork in a second row that takes the rest.
+ * The chip gets a row of its own rather than a place over the picture because the picture has no
+ * corner it can promise to leave empty - a drawing or a photograph can reach the top edge, and in
+ * the two-up grid on a phone the chip is nearly as wide as the box - so an overlay would always be
+ * covering something. Stacked, the chip stays inside the box it describes and the artwork is never
+ * under it.
+ *
+ * The explicit `minmax(0, 1fr)` column holds the track to the box: an implicit `auto` column would
+ * grow to the chip's single-line width and carry the artwork past the rounded corner with it. The
+ * box is also an inline-size container, so the chip's compact steps further down follow the width
+ * this box actually has - which the grid's column count decides - rather than the viewport's.
+ */
+.media {
+  display: grid;
+  grid-template-columns: var(--catalog-media-columns, minmax(0, 1fr));
+  grid-template-rows: var(--catalog-media-rows, auto minmax(0, 1fr));
+  container-type: inline-size;
+  aspect-ratio: var(--catalog-media-ratio, 4 / 3);
+  overflow: hidden;
+  gap: var(--ls-space-1, 4px);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface-sunken, #f8fafc);
+}
+
+/* The catalog artwork is 4:3, and so is its placeholder; `contain` keeps either undistorted in the
+ * row below the chip, which is wider than 4:3 once the chip has taken its share of the box. The
+ * image comes first in the markup, so its row is stated here rather than left to auto-placement. */
+.image {
+  grid-row: 2;
+  grid-column: 1;
+  inline-size: var(--catalog-card-fill, 100%);
+  block-size: var(--catalog-card-fill, 100%);
+  object-fit: contain;
+}
+
+/*
+ * The stock chip, at the box's top-end corner and inset by one space step from the two edges it
+ * sits against; the matching inset on the start side keeps it off the far corner if a wording ever
+ * runs the chip the box's full width. Wider than the narrow boxes below, the chip keeps the size the
+ * product page shows it at: the longest wording the catalog prints, a four-digit low-stock count,
+ * fits on one line with both insets to spare, and `Badge` keeps it on that line.
+ */
+.stock {
+  grid-row: 1;
+  grid-column: 1;
+  justify-self: end;
+  align-self: start;
+  margin-block-start: var(--ls-space-2, 8px);
+  margin-inline: var(--ls-space-2, 8px);
+}
+
+/*
+ * A narrow box - the two-up grid on a phone - is about as wide as that longest wording at the
+ * product page's size, so the chip takes the compact step `Badge` itself offers for a card corner:
+ * the smaller type and the inline padding pulled in one space step. The insets tighten to match,
+ * and every wording then fits on one line inside the box again.
+ *
+ * `StockBadge` asks `Badge` for its default `md` step, and `Badge` states that step as a class plus
+ * the size attribute, so the selector names the box, the chip's wrapper and that size: one
+ * specificity step above the rule it displaces, whichever order the two stylesheets load in.
+ */
+@container (max-width: 10rem) {
+  .stock {
+    margin-block-start: var(--ls-space-1, 4px);
+    margin-inline: var(--ls-space-1, 4px);
+  }
+
+  .media > .stock > [data-size='md'] {
+    padding-inline: var(--ls-space-1, 4px);
+    font-size: var(--ls-text-xs, 12px);
+  }
+}
+
+/*
+ * The narrowest box, the two-up grid at the smallest phone widths, where even the compact chip is
+ * a dot's width too wide. The leading dot repeats the tone that the chip's border and text already
+ * carry - it is `aria-hidden` decoration and the wording states the availability - so it is the
+ * part given up to keep the wording whole and on one line.
+ */
+@container (max-width: 8.25rem) {
+  .media > .stock > * > [aria-hidden='true'] {
+    display: none;
+  }
+}
+
+/*
+ * The name, code and price stack. The single explicit track is what keeps a long unbroken product
+ * code from setting the tile's width: an implicit `auto` track is floored at its widest child's
+ * minimum content size, so a 40-character code would widen the tile past its grid cell, while
+ * `minmax(0, 1fr)` holds the track to the cell and leaves wrapping to the children below.
+ */
+.body {
+  display: grid;
+  grid-template-columns: var(--catalog-body-columns, minmax(0, 1fr));
+  min-inline-size: 0;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The heading is the type treatment; the anchor inside it carries the box. */
+.title {
+  margin: 0;
+  min-inline-size: 0;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-md, 15px);
+  line-height: var(--catalog-title-leading, 1.3);
+}
+
+/*
+ * The product name, held to two lines so an industrial description cannot stretch one tile past
+ * the others in its row, and clipped by the same element that carries the focus ring below: an
+ * element's own overflow never clips its own outline, whereas a clamp on the heading would cut
+ * the ring off along every edge. Surplus lines stay inside this box, so nothing paints over the
+ * product code underneath it.
+ */
+.link {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--catalog-title-lines, 2);
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Hover is gated so a touch activation does not leave the underline stuck on the tile. */
+@media (hover: hover) {
+  .link:hover {
+    text-decoration: underline;
+  }
+}
+
+.link:focus-visible {
+  outline: var(--catalog-accent-width, 2px) solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+  border-radius: var(--ls-radius-sm, 4px);
+}
+
+/* Product codes carry no break opportunity of their own, so one is granted here rather than
+ * letting an unbroken run reach past the tile.
+ *
+ * The leading is stated rather than inherited: the cart row's `.sku` and the product page's
+ * specification list also declare 1.4, so the same code occupies the same height on each of the
+ * three surfaces that print it. At the smallest type step 1.4 is the leading a single line of code
+ * wants - the body's 1.5 is set for paragraphs. */
+.sku {
+  margin: 0;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
+/* Current price, any comparison price and its saving share a baseline, and wrap together in a
+ * narrow track. */
+.priceRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+.category {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-inline-size: 0;
+  gap: var(--ls-space-1, 4px);
+}
+
+/*
+ * The action row is the last thing in the column's flow before the specs list, and the automatic
+ * leading margin absorbs whatever height the tile has to spare, so every tile in a row presents
+ * its controls on the same line.
+ *
+ * A two-column grid rather than a wrapping flex row. The row holds three things of three
+ * different weights - a secondary disclosure, the committing action at the primary `lg` step, and
+ * an optional badge reporting what the cart already holds - and a flex row would have laid them out
+ * in whatever order the wrap happened to fall, leaving the primary action beside the toggle on a
+ * wide tile and stranded on a line of its own with a ragged edge on a narrow one. Two named
+ * places settle it: the secondary control and the badge share the first row, and `.add` spans
+ * both tracks on the second, so the tile ends on its conclusion at every width.
+ *
+ * `row dense` is what puts the badge back up beside the toggle. The badge is the row's third
+ * element in the document, after the spanning `.add`, so ordinary auto-placement would leave the
+ * cursor past that spanning item and start a third row for it; the dense packing step backfills
+ * the empty cell in the first row instead. Placement only - nothing here reorders the DOM, so the
+ * toggle stays the tile's first tab stop and the add control its second, exactly as they are
+ * written.
+ *
+ * The first track is sized to the toggle and the second takes the rest, so the badge sits next to
+ * the control it qualifies rather than halfway across the tile. `minmax(0, 1fr)` on that second
+ * track is what lets a long "N in cart" label shrink instead of widening the tile's grid cell.
+ */
+.actions {
+  display: grid;
+  grid-template-columns: var(--catalog-actions-columns, max-content minmax(0, 1fr));
+  grid-auto-flow: row dense;
+  align-items: center;
+  justify-items: start;
+  margin-block-start: auto;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The committing action: `Button` owns its height, padding and colour at the `lg` step the
+ * product page's control also asks for, and this rule only says where it sits. It spans both
+ * tracks and fills them, so the widest, tallest thing in the row is the one press that changes
+ * the cart. */
+.add {
+  grid-column: 1 / -1;
+  justify-self: stretch;
+}
+
+/* The inline padding is the one thing the committing action does not take from the `lg` step. A
+ * stretched button centres its label, so that padding buys nothing visually here - and at `lg` it
+ * costs 48px, which is more than the narrowest card column can spare: in the two-up grid at the
+ * smallest width the column's content box is about 128px against a label that wants 100px, so the
+ * full padding would ellipsise the label to "Add to ..." on every card. One space step leaves the
+ * label whole there, while the height, type size and colour - the things that make this the
+ * tile's primary action and tie it to the product page's control - stay exactly as `Button` sets
+ * them.
+ *
+ * The selector is this specific on purpose. `Button` states its padding as a class plus the size
+ * attribute, so a bare `.add` is a specificity step below it and would lose however the two
+ * stylesheets happen to be ordered; naming the track parent and the size puts this one step above
+ * that rule instead of relying on source order, and says out loud which declaration it displaces. */
+.actions > .add[data-size='lg'] {
+  padding-inline: var(--ls-space-2, 8px);
+}
+
+/* Quick specs: a term column sized to its longest label and a value column that takes the rest,
+ * separated from the controls above by the shared hairline. */
+.specs {
+  display: grid;
+  grid-template-columns: var(--catalog-specs-columns, max-content minmax(0, 1fr));
+  align-items: baseline;
+  margin: 0;
+  border-block-start: var(--catalog-hairline, 1px) solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-2, 8px);
+  column-gap: var(--ls-space-2, 8px);
+  row-gap: var(--ls-space-1, 4px);
+}
+
+.specsTerm {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* Spec values are identifiers and counts - a stock keeping unit, a category key, an on-hand
+ * quantity - so they read in the monospaced face with figures aligned, and an unbroken code wraps
+ * rather than widening the column. */
+.specsValue {
+  margin: 0;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}

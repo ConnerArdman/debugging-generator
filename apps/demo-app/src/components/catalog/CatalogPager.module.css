@@ -1,0 +1,193 @@
+/*
+ * CatalogPager - the catalog's page-navigation strip.
+ *
+ * Styles src/components/catalog/CatalogPager.tsx, whose markup is a <nav> holding the Previous
+ * control, the numbered <ul>, the Next control and the "Page n of m" line. Previous and Next are
+ * `next/link` anchors while a page exists in that direction and inert <span>s when one does not,
+ * so both shapes share a single chip rule and the inert one restates the few declarations that
+ * have to mark it as unavailable - its ink, its stroke and its cursor. Eight classes are
+ * exported and the component uses all eight: root, list, item, link, current, disabled, ellipsis
+ * and summary.
+ *
+ * A page chip is the one appearance in this folder that is defined locally instead of inherited
+ * from a `ui` primitive, so it is written to read as the same object as Button and Pill: hairline
+ * border, small radius, surface fill, and the accent fill for the page you are on.
+ *
+ * Token contract: every colour, length and type value reads an --ls-* custom property declared in
+ * app/globals.css and states the value that property resolves to as the var() fallback, so this
+ * module reads sensibly on its own and paints the storefront palette in the application. Hex is
+ * lowercase because Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ * The four values globals.css does not name - the chip hairline, the chip's minimum box, the
+ * focus ring's width and the active chip's weight - are file-local properties written in the same
+ * var(--ls-NAME, <literal>) form, so a shared token can take any of them over later without an
+ * edit at the usage site; the fifth, the layer a focused chip is lifted to, reads the stacking
+ * tier globals.css already declares for content that must paint above its own siblings.
+ *
+ * `box-sizing` is restated on the chip so its minimum box means the same thing here as it does in
+ * the application: globals.css resets the box model for every element, and a chip whose minimum
+ * were read as a content box would be half again as large wherever that reset is absent.
+ *
+ * This module introduces no transition and no animation, so it adds no reduced-motion rule of its
+ * own; the baseline in app/globals.css has nothing here to collapse.
+ */
+
+/* The strip: one centred row that wraps rather than overflowing a narrow column. */
+.root {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ls-space-2, 8px);
+  padding-block: var(--ls-space-4, 16px);
+}
+
+/* The numbered pages. The list marker and the user-agent inline padding are cleared here because
+ * app/globals.css resets a list's margin and deliberately nothing else. */
+.list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  gap: var(--ls-space-1, 4px);
+  list-style: none;
+}
+
+/* The <li> around a page link: a flex item exactly as wide as the chip it holds. */
+.item {
+  display: inline-flex;
+}
+
+/* The chip, shared by a page link and by an inert Previous/Next <span> so an unavailable
+ * direction keeps its place in the row instead of collapsing it.
+ *
+ * The chip's minimum box reads --ls-control-min, 36px by fallback, so the storefront's control size
+ * is set in one place by declaring that token. Below the narrow-viewport breakpoint at the end of
+ * this file the numbered list is hidden, leaving the wider Previous/Next targets and the summary
+ * line. */
+.link,
+.disabled {
+  --pager-hairline: var(--ls-border-width, 1px);
+  --pager-chip-min: var(--ls-control-min, 36px);
+
+  display: inline-flex;
+  box-sizing: border-box;
+  min-width: var(--pager-chip-min);
+  min-height: var(--pager-chip-min);
+  align-items: center;
+  justify-content: center;
+  padding-block: var(--ls-space-1, 4px);
+  padding-inline: var(--ls-space-3, 12px);
+  border: var(--pager-hairline) solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* Hover is gated on a device that genuinely has a pointer, so a tap does not leave a chip looking
+ * hovered after the finger has gone. The active chip is excluded on purpose: a bare `.link:hover`
+ * outweighs `.current` and would wash the accent fill out from under the page you are on. */
+@media (hover: hover) {
+  .link:not(.current):hover {
+    background: var(--ls-surface-sunken, #f8fafc);
+  }
+}
+
+/* Keyboard focus refines the application-wide indicator in app/globals.css rather than replacing
+ * it. The ring sits clear of the chip's own border, so it stays legible over the accent fill as
+ * well as over the surface one.
+ *
+ * The offset is wider than the gap between two chips, so the focused chip is lifted for the
+ * duration of the focus: without it the next chip's opaque fill paints over the ring's inner edge
+ * and the reader gets a three-sided bracket instead of a closed ring. Lifting the chip rather
+ * than narrowing the offset or widening the gap keeps both of those measurements at their token
+ * values, and it changes no geometry - `position: relative` carries no offset of its own. */
+.link:focus-visible {
+  --pager-focus-ring-width: var(--ls-focus-width, 2px);
+  --pager-focus-layer: var(--ls-z-sticky, 1);
+
+  position: relative;
+  z-index: var(--pager-focus-layer);
+  outline: var(--pager-focus-ring-width) solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+}
+
+/* The page you are on. Declared after the shared chip rule so its fill and border win. The weight
+ * is a second, non-colour cue; a monospace face keeps every digit's advance width fixed whatever
+ * the weight, so emphasising this chip moves no neighbour and the numbers hold still from page to
+ * page.
+ *
+ * The label takes --ls-ink because it is the legible pairing on the amber --ls-accent fill,
+ * measuring 8.31:1 - the same pairing app/globals.css uses in its ::selection rule. The fallbacks
+ * mirror the declared amber. */
+.current {
+  --pager-current-weight: var(--ls-font-weight-strong, 600);
+
+  border-color: var(--ls-accent, #f59e0b);
+  background: var(--ls-accent, #f59e0b);
+  color: var(--ls-ink, #0f172a);
+  font-weight: var(--pager-current-weight);
+}
+
+/* An out-of-range Previous or Next. The component renders a <span> carrying role="link" and
+ * aria-disabled, which has no activation behaviour at all - no href and no handler, so there is
+ * nothing to suppress: what makes this chip inert is its markup, not its styling.
+ *
+ * Unavailability is stated three times over, and only one of those is a colour. The border turns
+ * dashed - a shape a reader takes in at a glance and one that survives greyscale, a colour-vision
+ * deficiency and a forced-colours mode that discards this palette outright - the cursor reports
+ * the same thing on the way to a click that would do nothing, and the label is muted. The
+ * `border-style` here overrides the shared chip's `solid` while the colour below keeps the muted
+ * hairline, so the box and its width match the shared chip and only the stroke changes. The chip
+ * stays hoverable, which is what lets the `not-allowed` cursor show.
+ *
+ * NO `opacity` REDUCTION, ON PURPOSE. The muted ink measures ~7.6:1 on the chip's surface fill;
+ * blending the same ink at 0.6 opacity over that fill drops it to about 3.0:1, under the 4.5:1
+ * minimum for body-sized text. A dimmed chip would therefore trade one accessibility defect for a
+ * worse one, so the cue is carried by shape and cursor and the label is left at full strength.
+ *
+ * `cursor` and `border-style` take keywords rather than tokens: there is no palette or scale for
+ * them to read, and the file's token contract covers colours, lengths and type values. */
+.disabled {
+  border-style: dashed;
+  border-color: var(--ls-mist, #cbd5e1);
+  color: var(--ls-text-muted, #475569);
+  cursor: not-allowed;
+}
+
+/* The gap marker between two page windows. It is an <li> of its own, hidden from assistive
+ * technology by the component, so it only has to sit on the numbers' rhythm. */
+.ellipsis {
+  display: inline-flex;
+  align-items: center;
+  padding-inline: var(--ls-space-1, 4px);
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* "Page 3 of 9": the strip's plain-language position, in the body face, muted, and tabular so
+ * both numbers keep their width as the page changes. */
+.summary {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Phones. Nine numbered pages plus both controls and the summary wrap into three rows on a narrow
+ * screen, so below this width the numbers stand down and navigation is carried by Previous, Next
+ * and the summary line - which between them still reach every page, one step at a time. A media
+ * feature cannot read a custom property, so this breakpoint is the one length in the file written
+ * as a bare literal; `rem` keeps it tied to the reader's own browser font size. */
+@media (max-width: 30rem) {
+  .list {
+    display: none;
+  }
+}

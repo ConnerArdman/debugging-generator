@@ -1,0 +1,122 @@
+/*
+ * CheckoutButton - emphasis, width and caption rhythm for the checkout column's primary action.
+ *
+ * Scope. The control itself is `../ui/Button`, a native `<button>` that already owns its geometry
+ * (the `[data-size]` scale, the corner radius, the border width), its focus indicator, its
+ * disabled treatment, its inline busy indicator and the transition those states ride on. Nothing
+ * here restates any of that. This module adds three things and stops: the accent that makes the
+ * primary action of the checkout column the strongest control on the page, the full-width box the
+ * column wants, and the caption line underneath. The one primitive state it does replace is the
+ * disabled one, and only for the accent it adds: fading an amber fill leaves its label unreadable,
+ * so the unavailable control is drawn on a quiet ground instead (see that rule).
+ *
+ * Accent and the cascade. `Button.module.css` paints its fills through `[data-variant]` rules, so
+ * a lone `.action` rule would either lose to them or tie and be settled by whichever of the two
+ * stylesheets the bundler happens to emit second. The accent rules below therefore carry both the
+ * wrapper class and the primitive's own variant hook, which makes them win on selector
+ * specificity - a property of this file rather than of the build - and nothing here is forced.
+ *
+ * Tokens. Every colour, space, type size and shadow resolves to an `--ls-*` custom property from
+ * `app/globals.css` and repeats that file's literal as its fallback, so the block renders the
+ * brand palette in the application and something sensible on its own. Derived lengths are built
+ * with `calc()` over those tokens instead of a raw measurement. Hex spellings are lowercase to
+ * match Prettier's normalisation, which `pnpm format:check` enforces.
+ */
+
+/* The block: the control with its caption stacked underneath, filling the column it sits in. */
+.root {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * The accent. Amber carries the brand and ink carries the label on top of it (8.3:1), which is
+ * the pairing `app/globals.css` documents for this token - amber is never a fill behind white
+ * text. The secondary and ghost controls elsewhere in the form stay quiet against it.
+ *
+ * `padding-block` deepens the box beyond the primitive's `lg` step while leaving the inline
+ * padding to the primitive, and the type size is stated rather than inherited so the label keeps
+ * its scale whatever size the consumer asks the primitive for.
+ */
+.root .action[data-variant] {
+  width: 100%;
+  padding-block: var(--ls-space-4, 16px);
+  border-color: var(--ls-amber, #f59e0b);
+  background-color: var(--ls-amber, #f59e0b);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.06));
+  color: var(--ls-ink, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+}
+
+/*
+ * Hover, and deliberately not gated behind `(hover: hover)`. The primitive changes its own fill
+ * on hover without that gate, so gating this rule would hand the control back to the primitive's
+ * fill in every environment that applies `:hover` while reporting no hover capability - a
+ * coarse-pointer tap, a remote or kiosk session, a headless browser - and the label, which this
+ * module keeps dark, would be left on the wrong ground. Holding the accent in all of them costs
+ * only a hover that lingers after a tap, in the same colour one step deeper.
+ *
+ * Both ends of the mix are tokens: amber leaning towards ink reads as pressure on the same accent
+ * and keeps the ink label at 7.2:1. The transition it arrives on is the primitive's.
+ */
+.root .action[data-variant]:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 92%, var(--ls-ink, #0f172a));
+  background-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 92%, var(--ls-ink, #0f172a));
+}
+
+/*
+ * In flight. The accent steps back towards paper white and the lift is dropped, so the control
+ * reads as occupied rather than inviting, and the cursor says the same thing. Declared after the
+ * accent above, at the specificity that also carries it past the primitive's own cursor rules.
+ * No motion is introduced here: the indicator inside the primitive is the only moving part.
+ *
+ * The control is also disabled while pending, so the primitive's own `:disabled` treatment draws
+ * it at 55% opacity; that dimming belongs to the primitive and is not restated here. The caption
+ * underneath carries the same message at full strength and `aria-busy` carries it to assistive
+ * technology, so the state is never announced by colour alone.
+ */
+.root .action.pending {
+  border-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 82%, var(--ls-white, #ffffff));
+  background-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 82%, var(--ls-white, #ffffff));
+  box-shadow: none;
+  cursor: progress;
+}
+
+/*
+ * Unavailable - the order cannot be placed yet - and NOT in flight, which the rule above covers.
+ *
+ * The primitive's own `:disabled` treatment fades the whole control to 55% opacity, and over the
+ * amber accent that takes the ink label to about 2.6:1, well short of the 4.5:1 its text needs to
+ * be read at all. So this state draws its own quiet ground instead of fading the accent: full
+ * opacity, the sunken surface with the hairline border and the muted text colour, which measures
+ * 7.2:1 on that surface (the figure `app/globals.css` documents for the pair). It still reads as
+ * unavailable rather than as a secondary action: the accent - the one thing that marks this as
+ * the page's primary control - is gone, there is no lift, and the primitive's `not-allowed` cursor
+ * stands. No hover applies: the accent's hover rule above and the primitive's own both exclude
+ * `:disabled`. `[data-busy]` is the primitive's in-flight hook, and excluding it is what leaves the
+ * pending look above in charge while the order is being placed.
+ */
+.root .action[data-variant]:disabled:not([data-busy='true']) {
+  border-color: var(--ls-border, #cbd5e1);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  box-shadow: none;
+  color: var(--ls-text-muted, #475569);
+  opacity: 1;
+}
+
+/*
+ * The caption under the control, which is a polite live region: it is empty most of the time and
+ * gains a line of text while the order is being placed. The reserved single line comes from the
+ * type scale times this rule's own line height, so the text arrives and leaves without moving the
+ * summary beside it or the page below it.
+ */
+.status {
+  min-height: calc(var(--ls-text-sm, 13px) * 1.4);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.4;
+  text-align: center;
+}

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
+  <!-- Cable reel category glyph, used as a CSS mask by the category glyph component, so its alpha
+       is the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px. Viewed on
+       its own, currentColor resolves to the slate root colour. -->
+  <circle cx="12" cy="12" r="8.25" />
+  <circle cx="12" cy="12" r="2.9" />
+  <path d="M17.6 17.6 C19.6 17.7 20.8 18.9 20.8 20.8" />
+</svg>

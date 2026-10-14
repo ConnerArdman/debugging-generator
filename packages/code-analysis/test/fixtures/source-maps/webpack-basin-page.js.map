@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "file": "webpack-basin-page.js",
+  "sources": [
+    "webpack://_N_E/./src/widgets/GaugeReadout.tsx",
+    "webpack://_N_E/./src/lib/http.ts",
+    "webpack://_N_E/./node_modules/react/cjs/react.development.js"
+  ],
+  "sourcesContent": [
+    "'use client';\n\n/*\n * Client-component specimen of the `sample-next-app` indexing corpus: read-only ts-morph input\n * for the @debuggen/code-analysis extractors, never installed, never built, never executed.\n *\n * Node shape this file guarantees — the JSX `onClick` attribute names the identifier\n * `handleReadoutClick`, whose `VariableDeclaration` initializer is a `useCallback` call whose\n * arrow body holds both `fetch` calls (one bare string-literal route, one template literal with\n * an interpolation) and the single hop into `fetchGaugeIndex` through the `@/lib/http` alias. Real\n * handlers are memoized exactly this way, so the extractors have to unwrap the hook call to\n * attribute those calls to `handleReadoutClick`.\n *\n * The `react` specifier stays unresolved and the JSX below untyped on purpose: nothing is\n * installed on disk for this tree, which is what proves the extractors read it AST-first.\n */\n\nimport { useState, useCallback } from 'react';\n\nimport { fetchGaugeIndex } from '@/lib/http';\n\n/**\n * Props of {@link GaugeReadout}. `gaugeId` identifies the gauge whose reading is fetched and is\n * the value the per-gauge route interpolates; `stationLabel` is the friendlier heading text a\n * basin page passes when it knows which station the gauge sits at.\n */\nexport interface GaugeReadoutProps {\n  gaugeId: string;\n  stationLabel?: string;\n}\n\n/**\n * Single gauge readout. A click reads the gauge index route, then this gauge's own reading, then\n * the shared index helper, and reports both results back into local state.\n */\nexport function GaugeReadout({ gaugeId, stationLabel }: GaugeReadoutProps) {\n  const [latestReading, setLatestReading] = useState<number | null>(null);\n  const [indexSize, setIndexSize] = useState(0);\n\n  const handleReadoutClick = useCallback(async () => {\n    const indexResponse = await fetch('/api/gauges');\n    const readingResponse = await fetch(`/api/gauges/${gaugeId}`);\n    const gaugeIndex = await fetchGaugeIndex();\n",
+    "import type { NextRequest } from 'next/server';\n\n/**\n * One row of the gauge index served by `GET /api/gauges`. The browser reaches\n * the server over HTTP alone, so the shape is declared here rather than\n * imported across that boundary.\n */\nexport interface GaugeIndexEntry {\n  id: string;\n  label: string;\n  basinId: string;\n}\n\n/**\n * Reads the gauge index from the fixture route. `request` is optional because\n * the gauge widget calls this with no argument from the browser, while a server\n * caller may pass its own request so the fixture basin hint travels along. It\n * only ever contributes request options: the route stays a bare literal inside\n * the `fetch` call.\n */\nexport async function fetchGaugeIndex(request?: NextRequest): Promise<GaugeIndexEntry[]> {\n  const forwardedBasin = request?.headers.get('x-fixture-basin');\n  const init: RequestInit = { cache: 'no-store' };\n  if (typeof forwardedBasin === 'string' && forwardedBasin.length > 0) {\n    init.headers = { 'x-fixture-basin': forwardedBasin };\n  }\n\n  const response = await fetch('/api/gauges', init);\n  if (!response.ok) {\n    return [];\n  }\n\n  return (await response.json()) as GaugeIndexEntry[];\n}\n",
+    null
+  ],
+  "names": [
+    "handleReadoutClick",
+    "fetchGaugeIndex"
+  ],
+  "mappings": ";;;;;;;;;;;;;;;MEcA;;;MFyBE,SAAMA;QACJ;;;;;;;;;;;;;;;;;MCpBJ,eAAsBC;;;;;;;QAOpB"
+}

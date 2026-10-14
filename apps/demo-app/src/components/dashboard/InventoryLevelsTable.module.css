@@ -1,0 +1,543 @@
+/*
+ * Lumen Supply - inventory-levels table (dashboard).
+ *
+ * The CSS Module for `InventoryLevelsTable.tsx`, and nothing else: it is imported by that one
+ * sibling (`import styles from './InventoryLevelsTable.module.css'`) and imports nothing itself.
+ * The dashboard shows one page of ~2 400 inventory levels across six warehouses, so the table is
+ * deliberately dense, hairline-ruled and tabular-numeral - a row of quantities has to be scannable
+ * down the column, not merely present.
+ *
+ * WHAT THIS FILE MAY CONTAIN
+ * Every value resolves to an `--ls-*` custom property declared in `app/globals.css`, written in
+ * `var(--ls-NAME, <literal fallback>)` form so the module renders sensibly on its own and renders
+ * the application's palette in the application. The fallbacks mirror the declarations in
+ * `globals.css`, lowercase, because Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate. The only bare literals are the keywords (`0`, `none`,
+ * `auto`, `inherit`, `transparent`), the structural `1px` of a hairline rule, the `2px` of the
+ * application's focus ring - `globals.css` writes that ring as `outline: 2px solid var(--ls-focus)`
+ * and this module only refines it - and relative units (`%`, `ch`, `em`) used for table sizing.
+ * Spacing arithmetic goes through `calc()` over the spacing scale, which is what that scale is
+ * plain lengths for.
+ *
+ * WHAT BELONGS TO SOMEONE ELSE
+ *   - Surface. `ui/Card` owns background, border, radius, elevation and its own padding; `.root`
+ *     is safe to hand to its `className` because it declares geometry only.
+ *   - Scrolling. `./Scroller.module.css` owns the scrollport the table sits in: the overflow axis,
+ *     the focus ring, the edge fades and the hint that says there is more to see. `.scroller`
+ *     below is only this surface's radius; the pinned first column further down withdraws the
+ *     start-edge fade for this surface and reads the `data-overflow` state `Scroller` publishes,
+ *     and neither changes how the scrollport behaves.
+ *   - Status colour. Stock state arrives as a `ui/Badge`, which carries a text label, so no rule
+ *     here tints a cell to mean "low" or "out" - colour is never this table's only signal. The one
+ *     tint this file does declare is how loudly a *figure* is printed - a muted zero, a negative
+ *     quantity in the danger tone - and the digits and the minus sign carry those facts in text.
+ *   - Category artwork. `.groupLabel` sets nothing but layout and inherits `color`; the masked
+ *     glyph inside it paints with `currentColor` through `ui/CategoryGlyph`, and no rule here
+ *     names an asset path.
+ *   - Motion. This module introduces none, so it owes no reduced-motion rule of its own; the
+ *     baseline in `globals.css` covers the page.
+ *
+ * SORTING is deliberately absent. `src/server/validation/inventory.ts` parses `page`, `pageSize`,
+ * a warehouse filter and a low-stock threshold and exposes no sort parameter, so the column
+ * headers are plain and this file defines no sort affordance that would never be rendered.
+ */
+
+/* The section wrapper: header, scroller and pager in one column. Geometry only - no background,
+ * border, radius or shadow - so it can be passed straight to `ui/Card`'s `className` without
+ * fighting the surface that component owns. `min-inline-size: 0` lets the column shrink inside a
+ * page grid track instead of forcing the track wider than the viewport. */
+.root {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* This table's own contribution to the scrollport: the rounded corner that matches the card it
+ * sits in, and nothing else.
+ *
+ * The scrollport is rendered by `./Scroller.tsx`, which owns the behaviour a scrollable region has
+ * to have - the overflow axis, the overscroll containment, the focus ring the box needs because it
+ * is focusable, the `role="region"` and accessible name, the Home/End keys, and the edge fade and
+ * one-line hint that say at rest that there is more to see. Those live in
+ * `./Scroller.module.css`; a class handed to that component composes alongside them, so this rule
+ * declares only what is specific to this surface.
+ *
+ * What the scrollport needs from the page in return: a containing block whose own inline size does
+ * not come from its contents. Its `max-inline-size: 100%` can only cap against a measure that is
+ * already bounded, and a seven-column table still reports its minimum width outwards through a
+ * scrollport, so a wrapper that sizes to its contents grows to the table and the *page* takes the
+ * horizontal scrollbar while the box is left with nothing to scroll - measured in Chrome at a 390px
+ * viewport: 459px of page overflow and the last column unreachable. The page shell this application
+ * mounts on every route holds up that end of the bargain, centring its measure as
+ * `inline-size: 100%` with a `max-inline-size` rather than as an automatic margin against
+ * fit-content, and passing `min-inline-size: 0` down its content region; `.root` above does the
+ * same here. Containment was measured as an alternative and rejected: zeroing the box's inline
+ * contribution collapses a fit-content wrapper to the width of its prose instead, which trades a
+ * narrow-viewport fault for a desktop one. */
+.scroller {
+  border-radius: var(--ls-radius-md, 8px);
+}
+
+/* `table-layout: auto` so a long product name wraps into a comfortable column instead of being
+ * squeezed to one character; the per-column minimums live on the cells, in `ch`.
+ *
+ * Those minimums are sized against the measure the page actually gives this table, not against the
+ * viewport. The dashboard's split puts the table in a column that stops growing at 742px, so a
+ * table whose columns cannot add up to less than that is clipped on every display, however wide -
+ * measured in Chrome at 1280, 1440 and 1920, where the scrollport is 742px at all three. The
+ * column sum is therefore held under the 702px this column measures at a 768px viewport, which
+ * leaves the desktop measure with room to distribute and clips nothing: the seven columns come to
+ * 674px of minimum where every one of them is squeezed to its floor, one-line column headings
+ * included (measured in Chrome at 375), and `inline-size: 100%` spends whatever the column has over
+ * that on the columns that can use it - 742px at 1280 and above. A 375px viewport, and the
+ * narrower split column between the two, are the cases seven columns genuinely cannot fit, and
+ * that is what the scroller and its affordance below are for. */
+.table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  color: var(--ls-text, #0f172a);
+  font-family: var(
+    --ls-font-sans,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif
+  );
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.45;
+}
+
+/* The `<caption>` always exists so the table is never unnamed. This class is its *visible*
+ * treatment; when the surrounding card head already shows the title, the component wraps the
+ * caption text in `ui/VisuallyHidden` and sets `data-hidden="true"`, which drops the spacing the
+ * now-invisible line would otherwise reserve. */
+.caption {
+  caption-side: top;
+  padding-block-end: var(--ls-space-2, 8px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  text-align: start;
+}
+
+.caption[data-hidden='true'] {
+  padding-block-end: 0;
+}
+
+/* `<th scope="col">`. Sticky against the scrollport, with an opaque background from the recessed
+ * surface token - transparency here would let rows slide visibly under the header. `--ls-z-sticky`
+ * is the tier `globals.css` reserves for exactly this: just above a table's own rows and below the
+ * site header, drawer and toast region.
+ *
+ * The rule under the header is an inset shadow rather than `border-block-end`, and that is not a
+ * stylistic preference. Under `border-collapse: collapse` a cell's border is painted with the
+ * table at the row's *static* position, so a pinned head cell carries its background and its text
+ * to the top of the scrollport and leaves its border behind - measured in Chrome, where the header
+ * then merges into whichever row has scrolled beneath it, invisibly so when that row is a zebra
+ * row of the same recessed colour. A shadow is a decoration of the cell box and travels with it.
+ * One hairline either way: the border is not also declared, so nothing doubles.
+ *
+ * Every label is held on one line (`white-space: nowrap`). A column heading is a name, and
+ * "UNIT PRICE" or "ON HAND" broken over two lines reads as two headings stacked in one cell; it
+ * also made the whole header row two lines tall for the sake of two of its seven labels. On one
+ * line those two labels are the widest thing in their columns - 92.8px and 69.8px with the cell's
+ * padding, measured in Chrome, wider than the figures beneath them - so they set those columns'
+ * minimum widths, and the table is sized with that in mind (see `.table`): the seven minimums
+ * still fit inside the measure the dashboard gives the table at 768px and on a desktop display.
+ *
+ * `vertical-align: baseline` keeps every label on one baseline across the row. The numeric columns'
+ * labels carry `.numericCell`'s monospace face and the others the sans face, and the two faces
+ * descend by different amounts, so aligning the cells' bottom edges would leave the monospace
+ * labels sitting visibly higher than their neighbours; aligning the first baselines does not. */
+.headCell {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: var(--ls-z-sticky, 1);
+  min-inline-size: 8ch;
+  padding: var(--ls-space-2, 8px);
+  box-shadow: inset 0 -1px 0 0 var(--ls-border, #cbd5e1);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: start;
+  text-transform: uppercase;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+/* `<th scope="row">`: the product or SKU that identifies the row. Full-strength text, not muted -
+ * it is the row's name, not a label - and wide enough that a product name has somewhere to wrap.
+ *
+ * Eighteen characters rather than twenty-two. This column's floor is the single largest term in
+ * the table's minimum width, and at 22ch it spent 163.59px of a 726px measure on a name that wraps
+ * anyway; 18ch is 133.85px, still two thirds wider than any other column and enough for a name to
+ * wrap into two or three readable lines instead of one word per line. The 30px it gives back is
+ * what brings the seven columns inside the measure the dashboard's split actually offers. */
+.rowHeadCell {
+  min-inline-size: 18ch;
+  padding: var(--ls-space-2, 8px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  color: var(--ls-text, #0f172a);
+  font-weight: 500;
+  text-align: start;
+  vertical-align: middle;
+}
+
+/* `<td>`. One spacing step on every side rather than one-and-a-half inline: seven columns pay
+ * their inline padding seven times over, so the step down from 12px to 8px returns 56px of the
+ * measure - more than twice the overhang that was clipping the last column - while a table this
+ * dense still reads as ruled columns rather than as a block of figures. */
+.cell {
+  min-inline-size: 8ch;
+  padding: var(--ls-space-2, 8px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  color: var(--ls-text, #0f172a);
+  text-align: start;
+  vertical-align: middle;
+}
+
+/* A modifier, always applied *with* `.cell`, `.headCell` or `.rowHeadCell` - it carries alignment
+ * and numerals, never the box. Required on every quantity and money column: right-aligned,
+ * monospaced and tabular so digits line up under one another down a column of movement counts. */
+.numericCell {
+  font-family: var(
+    --ls-font-mono,
+    ui-monospace,
+    'SF Mono',
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    'Liberation Mono',
+    monospace
+  );
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+  white-space: nowrap;
+}
+
+/* Zero, and below zero, in a column of figures.
+ *
+ * A quantity of nothing is a different statement from a quantity of three thousand, and at the same
+ * ink it reads as neither: a reader scanning the Reserved column cannot see which lines have
+ * nothing promised, and an empty result set looks exactly like a healthy one. Zero is therefore
+ * muted to the same token the column headings use - present, legible, and visibly not a figure to
+ * act on - and a negative available quantity, which means a location has promised more than it
+ * holds, takes the danger token and the table's own weight.
+ *
+ * Colour is not carrying either fact on its own, which is the rule this table is written to: the
+ * digit `0` and the minus sign are in the text, the Stock column states the selling state in
+ * words, and these rules only say how loudly the figure is printed. `data-figure` is set by the
+ * component from the figure itself, so the treatment follows the data rather than a class a caller
+ * remembered to add; both selectors carry the modifier as well, so they outrank `.cell`'s own
+ * colour regardless of the order the two rules are emitted in. */
+.numericCell[data-figure='zero'] {
+  color: var(--ls-text-muted, #475569);
+}
+
+.numericCell[data-figure='negative'] {
+  color: var(--ls-danger, #b42318);
+  font-weight: 600;
+}
+
+/* The product code under a product name inside the row header. */
+.sku {
+  display: block;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(
+    --ls-font-mono,
+    ui-monospace,
+    'SF Mono',
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    'Liberation Mono',
+    monospace
+  );
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 400;
+}
+
+/* Optional category grouping: each category is its own `<tbody>`, opened by one full-width row
+ * whose single `<th colSpan scope="rowgroup">` introduces the rows of that group. `color` is set
+ * here rather than on the label so the masked
+ * category glyph, which paints with `currentColor`, follows the row. */
+.groupRow {
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  color: var(--ls-text-muted, #475569);
+}
+
+/* One rule, under the label, and deliberately none above it: whatever precedes a grouping row
+ * already draws that boundary - the previous row's `border-block-end`, or the head cell's shadow
+ * when the group opens the table - and a second declaration here does not collapse with a shadow,
+ * so it measured as a 2px edge under the header in Chrome. */
+.groupRow th {
+  padding: var(--ls-space-2, 8px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  color: inherit;
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: start;
+  text-transform: uppercase;
+}
+
+.groupLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  color: inherit;
+}
+
+/* Every data row is opaque, on the page's own surface. Left transparent, an odd row would show
+ * the card through it - the same colour - but the pinned row header below takes its fill from its
+ * row with `background-color: inherit`, and a transparent row would hand it a transparent cell
+ * that the columns scrolled beneath it show straight through. Declared before the zebra rule on
+ * purpose: the two selectors carry equal specificity, so the zebra rule's later position is what
+ * lets even rows keep their recessed fill. Grouping rows are excluded because `.groupRow` states
+ * its own fill. */
+.table tbody tr:not(.groupRow) {
+  background-color: var(--ls-surface, #ffffff);
+}
+
+/* Zebra rows come from the recessed surface token `globals.css` names for this exact use. Kept
+ * faint on purpose: the hairline rules do the work of separating rows, and the fill only helps the
+ * eye track one row across seven columns. No `.zebra` class, so nothing has to be applied per row
+ * and no class here can go unused. */
+.table tbody tr:nth-of-type(even) {
+  background-color: var(--ls-surface-sunken, #f8fafc);
+}
+
+/* No rule under the table's last row: the pager follows it, and a hairline there would read as a
+ * border the table does not have. `:last-of-type` on the body keeps the hairline under the last
+ * row of every earlier category group, which is what separates it from the next group's head. */
+.table tbody:last-of-type tr:last-child > .cell,
+.table tbody:last-of-type tr:last-child > .rowHeadCell {
+  border-block-end: 0;
+}
+
+/* THE PINNED FIRST COLUMN
+ *
+ * At a phone width the seven columns cannot fit, and the reader scrolls the region sideways to
+ * reach the quantities - which, without this block, scrolls away the product name that says whose
+ * quantities they are. The row header therefore stays on the scrollport's inline-start edge while
+ * the other six columns pass beneath it, the way the header row already stays on its block-start
+ * edge. Where the table fits (the tablet and desktop measures) nothing moves and nothing here is
+ * visible.
+ *
+ * It is a block of its own rather than an edit to `.headCell` and `.rowHeadCell` above: those
+ * rules own the cells' box, and everything the pinning needs is additive to them.
+ *
+ *   - The row header sticks at `--ls-z-sticky`, the same tier as the header cells, and takes its
+ *     fill from its row. `inherit` rather than a named token is what keeps the pinned cell the
+ *     colour of the row it belongs to - the zebra fill, the hover tint and the focus-within tint
+ *     all arrive through the `<tr>` - so no state has to be restated here, and the opaque row base
+ *     above is what makes that inherited fill solid. The placeholder rows share the class, so the
+ *     loading state pins the same column.
+ *   - The corner head cell pins on both axes and sits one tier above the column beneath it, so a
+ *     pinned row header can never paint over the column's own heading. Its fill and its inset rule
+ *     are `.headCell`'s, unchanged.
+ *   - The row header's bottom hairline stays the collapsed border `.rowHeadCell` declares: measured
+ *     in Chrome at a 375px viewport with the region scrolled 200px, the rule under every pinned
+ *     name still paints, and the last row still has none. */
+.rowHeadCell {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: var(--ls-z-sticky, 1);
+  background-color: inherit;
+}
+
+.headCell:first-child {
+  inset-inline-start: 0;
+  z-index: calc(var(--ls-z-sticky, 1) + 1);
+}
+
+/* The pinned column's trailing edge, drawn only while content is scrolled beneath it - which is
+ * exactly when `Scroller` reports `data-overflow` as `start` or `both` on the frame around this
+ * scrollport. At rest the column sits where it always sits and needs no edge.
+ *
+ * Two layers, both shadows because a collapsed border stays behind at the cell's unscrolled
+ * position (the same reason `.headCell` draws its rule as a shadow): a 1px hairline in the border
+ * token on the cell's inline-end edge, and a short soft shadow in the ink colour the
+ * `--ls-shadow-*` elevations use, at `--ls-shadow-2`'s 10% depth, which is what makes the columns
+ * read as passing *under* the name rather than stopping beside it. Written for the storefront's
+ * left-to-right layout, as the scroller's own edge gradients are. The corner cell restates
+ * `.headCell`'s inset bottom rule in the same list, because a `box-shadow` declaration replaces the
+ * list rather than adding to it. */
+[data-overflow='start'] .scroller .rowHeadCell,
+[data-overflow='both'] .scroller .rowHeadCell {
+  box-shadow:
+    inset -1px 0 0 0 var(--ls-border, #8190a5),
+    calc(var(--ls-space-1, 4px) / 2) 0 var(--ls-space-1, 4px) 0
+      color-mix(in srgb, var(--ls-text, #0f172a) 10%, transparent);
+}
+
+[data-overflow='start'] .scroller .headCell:first-child,
+[data-overflow='both'] .scroller .headCell:first-child {
+  box-shadow:
+    inset 0 -1px 0 0 var(--ls-border, #8190a5),
+    inset -1px 0 0 0 var(--ls-border, #8190a5),
+    calc(var(--ls-space-1, 4px) / 2) 0 var(--ls-space-1, 4px) 0
+      color-mix(in srgb, var(--ls-text, #0f172a) 10%, transparent);
+}
+
+/* The scroller's start-edge fade is withdrawn on this surface. It is a gradient over the first
+ * spacing step of the scrollport, which is now where the pinned product names sit, so it would
+ * wash out the one column that never scrolls; the pinned column's own edge above is the signal
+ * that content continues before it. The fade is a following sibling of this scrollport, and
+ * `visibility` rather than `opacity` leaves the scroller's own opacity rules untouched. The end
+ * fade stays: nothing is pinned on that edge. */
+.scroller ~ [data-edge='start'] {
+  visibility: hidden;
+}
+
+/* A grouping row's label rides along with the pinned column, one spacing step in from the
+ * scrollport's edge - the cell's own padding at rest - so the category heading stays readable
+ * while its rows are scrolled sideways. The cell spans every column, so the label can stick
+ * across the whole table. */
+.groupRow .groupLabel {
+  position: sticky;
+  inset-inline-start: var(--ls-space-2, 8px);
+}
+
+/* Pointer highlight, behind `hover: hover` so a touch device does not leave a row stuck in the
+ * hovered state after a tap. The tint is mixed from two tokens - the focus teal over the page
+ * surface - so it carries a hue the neutral fills do not and stays legible as a highlight on
+ * either zebra parity: measured in Chrome, a tenth of the teal clears the just-noticeable
+ * difference against the recessed fill a tinted row already has, which a lighter wash did not.
+ * Grouping rows are excluded: they are headers, not data. */
+@media (hover: hover) {
+  .table tbody tr:not(.groupRow):hover {
+    background-color: color-mix(in srgb, var(--ls-focus, #0f766e) 10%, var(--ls-surface, #ffffff));
+  }
+}
+
+/* The same tint, stronger again, for the row holding keyboard focus - the focused control inside it
+ * still draws the application's own focus ring; this only says which row it is in, and it has to do
+ * so from across the table. Declared after the hover rule so focus wins when both apply. */
+.table tbody tr:not(.groupRow):focus-within {
+  background-color: color-mix(in srgb, var(--ls-focus, #0f766e) 18%, var(--ls-surface, #ffffff));
+}
+
+/* The paging footer: status first, controls at the end, wrapping to two lines when the two no
+ * longer fit. `margin-inline-end: auto` on the status is what groups the controls together, so the
+ * component needs no wrapper element around them and none is styled here. */
+.pager {
+  display: flex;
+  min-inline-size: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* "Showing 51-100 of 2,400": monospaced and tabular so the numerals hold their place as the page
+ * changes instead of shifting the line. */
+.pagerStatus {
+  margin-inline-end: auto;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(
+    --ls-font-mono,
+    ui-monospace,
+    'SF Mono',
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    'Liberation Mono',
+    monospace
+  );
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Previous/next are links, not buttons - the table is a server component and paging is a URL. The
+ * minimum box is `calc(32px + 12px)` from the spacing scale, which is the 44px pointer target the
+ * accessibility baseline asks for when no design source specifies a smaller one. */
+.pagerLink {
+  display: inline-flex;
+  min-block-size: calc(var(--ls-space-6, 32px) + var(--ls-space-3, 12px));
+  min-inline-size: calc(var(--ls-space-6, 32px) + var(--ls-space-3, 12px));
+  align-items: center;
+  justify-content: center;
+  gap: var(--ls-space-1, 4px);
+  padding: var(--ls-space-1, 4px) var(--ls-space-3, 12px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  background-color: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+@media (hover: hover) {
+  .pagerLink:hover {
+    border-color: var(--ls-focus, #0f766e);
+    background-color: color-mix(in srgb, var(--ls-focus, #0f766e) 10%, var(--ls-surface, #ffffff));
+  }
+}
+
+.pagerLink:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+}
+
+/* The page the reader is on, marked with `aria-current="page"`: the state is announced, and the
+ * border and weight make it visible too, so the marking never rests on colour alone. */
+.pagerLink[aria-current='page'] {
+  border-color: var(--ls-focus, #0f766e);
+  color: var(--ls-focus, #0f766e);
+  font-weight: 600;
+}
+
+/* A control the current page leaves nowhere to go. The component may omit the link instead; when
+ * it renders one, this is the inert treatment. */
+.pagerLink[aria-disabled='true'] {
+  border-color: var(--ls-border, #cbd5e1);
+  color: var(--ls-text-muted, #475569);
+  pointer-events: none;
+}
+
+/* Loading state. The placeholder rows reuse `.cell`, `.rowHeadCell` and `.numericCell`, so their
+ * padding and hairline are a loaded row's; this class takes the row out of the pointer affordances
+ * a real row offers. `ui/Skeleton` is `aria-hidden`, so the component supplies the status text a
+ * reader hears. */
+.skeletonRow {
+  pointer-events: none;
+}
+
+/* Height parity is the point of the loading state, and reusing the cell classes does not buy it on
+ * its own: a loaded row head stacks two lines - the product name at the table's line height and the
+ * code beneath it - where a placeholder holds one short bar, so the table grew by nearly half a row
+ * per row when the data arrived (measured in Chrome: 28.5px against 53.2px). The reserve below is
+ * that row, spelled out as what it is made of: two lines of text, the cell's block padding twice
+ * over, and the hairline. The padding and the hairline are part of the sum because `globals.css`
+ * puts every box in this application on `border-box`, so a reserve that counted the two lines alone
+ * would be eaten by the padding and leave the row 17px short - which is how the first attempt at
+ * this measured. Declared on the cells, which is where a table row's height comes from, and as
+ * `block-size`, which a table cell treats as a minimum, so a taller placeholder is never clipped. */
+.skeletonRow > .rowHeadCell,
+.skeletonRow > .cell {
+  block-size: calc(
+    var(--ls-space-6, 32px) + var(--ls-space-1, 4px) + var(--ls-space-2, 8px) * 2 + 1px
+  );
+}
+
+/* The bar inside a placeholder cell: `ui/Skeleton` paints it, the caller sizes it. One spacing
+ * step tall, which is the height of a line of 13px text with its leading trimmed away. */
+.skeletonCell {
+  display: block;
+  block-size: var(--ls-space-3, 12px);
+  inline-size: 100%;
+}
+
+/* In a numeric column the bar sits where the digits would, at the end of the cell. */
+.numericCell .skeletonCell {
+  margin-inline-start: auto;
+  max-inline-size: 8ch;
+}

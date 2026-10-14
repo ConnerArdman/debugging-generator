@@ -1,0 +1,50 @@
+{
+  "name": "@debuggen/telemetry",
+  "version": "0.1.0",
+  "description": "Evidence layer: the single telemetry event definition, redaction, trace correlation, capture aggregates, the page-injected browser agent and the Node dev-server preload.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": [
+    "./dist/node/register.mjs"
+  ],
+  "exports": {
+    ".": {
+      "types": [
+        "./src/index.ts",
+        "./dist/index.d.ts"
+      ],
+      "import": "./dist/index.js"
+    },
+    "./node/register": "./dist/node/register.mjs"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && node esbuild.agent.mjs && node esbuild.node.mjs",
+    "typecheck": "tsc -b tsconfig.json",
+    "test": "vitest run --root ../.. --project telemetry"
+  },
+  "dependencies": {
+    "@debuggen/shared": "workspace:*",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/core": "2.11.0",
+    "@opentelemetry/instrumentation": "0.222.0",
+    "@opentelemetry/instrumentation-pg": "0.74.0",
+    "@opentelemetry/resources": "2.11.0",
+    "@opentelemetry/sdk-trace-base": "2.11.0",
+    "@opentelemetry/sdk-trace-node": "2.11.0",
+    "@opentelemetry/semantic-conventions": "1.43.0",
+    "@prisma/instrumentation": "7.10.0",
+    "bippy": "0.7.3",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}

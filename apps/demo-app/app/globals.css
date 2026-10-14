@@ -1,0 +1,502 @@
+/*
+ * Lumen Supply - global stylesheet and shared design-token source.
+ *
+ * Imported exactly once, by `app/layout.tsx` (`import './globals.css';`). No other file in this
+ * workspace may import it, and no component may: everything else in the storefront is styled by
+ * its own CSS Module, which is the only styling mechanism this application uses.
+ *
+ * What this file owns, and nothing more:
+ *
+ *   1. The `--ls-*` custom properties, declared once in the single `:root` block below. Every
+ *      CSS Module under `src/components/**` reads them in `var(--ls-NAME, <literal fallback>)`
+ *      form, so a module renders sensibly on its own and renders *this* palette in the
+ *      application. The fallbacks mirror the values here; when the two ever disagree, the
+ *      declaration here is what the browser paints.
+ *   2. The element baseline: box sizing, document and body defaults, the scroll inset under the
+ *      sticky header, margin reset, heading scale, replaced-element defaults, the link reset and
+ *      the underline of class-less in-content links, form-control inheritance, the focus
+ *      indicator, reduced-motion handling and selection colour.
+ *   3. The dozen documented `.ls-*` page-composition utilities at the end of the file. Route
+ *      files under `app/**` add no CSS Modules of their own, so those classes are how a page
+ *      arranges its heading, sections and columns.
+ *
+ * Component chrome - borders, padding, badge/pill/button appearance, component focus rings,
+ * component-local animation - belongs to the component's own module. Nothing here restyles a
+ * component, and no rule here forces its way past one: the single forced declaration in the file
+ * is the standard `[hidden]` rule at the end of the baseline.
+ *
+ * One appearance: this is a light-mode storefront with a single theme. There is deliberately no
+ * dark-mode block, no `data-theme` switch and no `prefers-color-scheme` override, so a token has
+ * one value everywhere and a component never has to reason about which theme it is in.
+ *
+ * Naming trap worth reading twice: `--ls-text` is the default foreground *colour*, while
+ * `--ls-text-xs` ... `--ls-text-xl` are *font sizes*. Both families are intentional; the two
+ * groups are declared apart below.
+ *
+ * Hex values are lowercase because Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate.
+ */
+
+:root {
+  /* Raw palette. These eight are the brand's vocabulary; the semantic tokens below name them.
+   * --ls-ink and --ls-amber are fixed: public/favicon.svg and public/logo.svg paint the brand
+   * mark with exactly these two values.
+   *
+   * --ls-steel sits between slate and mist and exists for one job: a line that has to be seen.
+   * It measures 3.25:1 on white and 3.10:1 on paper, so a border drawn in it clears the 3:1
+   * non-text minimum (WCAG 1.4.11) on both light surfaces. --ls-mist (1.48:1 on white) stays in
+   * the vocabulary for what is deliberately faint and identifies nothing on its own - a spinner's
+   * track, a skeleton's shimmer, a scrollbar thumb, the caret or outline of an unavailable
+   * control. */
+  --ls-ink: #0f172a;
+  --ls-slate: #475569;
+  --ls-steel: #8190a5;
+  --ls-mist: #cbd5e1;
+  --ls-paper: #f8fafc;
+  --ls-amber: #f59e0b;
+  --ls-teal: #0f766e;
+  --ls-white: #ffffff;
+
+  /* Surfaces. `--ls-surface` is the page and card background, `--ls-surface-sunken` the recessed
+   * one (form fields, table zebra rows, skeleton placeholders), `--ls-border` the hairline.
+   *
+   * The hairline is also the edge that identifies a control - a text field, a select, a
+   * secondary button, a chip, a shipping-option card - so it is held to the 3:1 non-text minimum
+   * (WCAG 1.4.11): steel measures 3.25:1 on --ls-surface and 3.10:1 on --ls-surface-sunken. It
+   * still carries no state on its own: a state is carried by text, an icon or a status colour,
+   * and focus is drawn with --ls-focus. */
+  --ls-surface: var(--ls-white);
+  --ls-surface-sunken: var(--ls-paper);
+  --ls-border: var(--ls-steel);
+
+  /* Text colours. Both clear WCAG AA (4.5:1) on --ls-surface and on --ls-surface-sunken:
+   * primary 17.9:1 / 17.1:1, secondary 7.6:1 / 7.2:1. */
+  --ls-text: var(--ls-ink);
+  --ls-text-muted: var(--ls-slate);
+
+  /* Interaction. --ls-accent fills a selection, an active navigation marker or a selected chip
+   * and tints an interactive border; --ls-focus draws the focus ring every module writes as
+   * `outline: 2px solid var(--ls-focus)` and measures 5.5:1 against --ls-surface. The accent is a
+   * fill or a decorative accent: text over it is --ls-ink (8.3:1), and it is never a text colour
+   * on a light surface nor the only indicator of a state.
+   *
+   * --ls-accent-strong is the accent drawn as a line: a selection frame or ring that is the
+   * visible mark of a state, and so must clear the 3:1 non-text minimum (WCAG 1.4.11) against the
+   * light surfaces around it. The amber accent measures only 2.1:1 on --ls-surface, so a line
+   * that marks a state reads this darker amber instead - 5.0:1 on --ls-surface and 4.8:1 on
+   * --ls-surface-sunken - and the accent itself keeps its value, which the brand mark fixes and
+   * which ink-on-accent fills depend on. */
+  --ls-accent: var(--ls-amber);
+  --ls-accent-strong: #b45309;
+  --ls-focus: var(--ls-teal);
+
+  /* Status. The canonical four, shared by Badge, Pill, Alert and the toast region; each clears
+   * 4.5:1 as text on --ls-surface (5.5:1, 5.0:1, 6.6:1, 6.7:1) and on --ls-surface-sunken. */
+  --ls-success: #0f766e;
+  --ls-warning: #b45309;
+  --ls-danger: #b42318;
+  --ls-info: #1d4ed8;
+
+  /* Spacing scale. Plain lengths, because component modules build widths and offsets with
+   * `calc()` over them. */
+  --ls-space-1: 4px;
+  --ls-space-2: 8px;
+  --ls-space-3: 12px;
+  --ls-space-4: 16px;
+  --ls-space-5: 24px;
+  --ls-space-6: 32px;
+
+  /* Corner radii. */
+  --ls-radius-sm: 4px;
+  --ls-radius-md: 8px;
+  --ls-radius-lg: 12px;
+
+  /* Controls. Two height floors and one dimming, shared by every interactive primitive so that a
+   * control of a given density is the same height whichever primitive draws it and an unavailable
+   * one is dimmed by the same amount everywhere.
+   *
+   * --ls-control-sm is the compact floor: `Button[data-size='sm']`, `Input` and `Select` at `sm`,
+   * and the chip all read it, so a filter row that mixes a button, a field and a chip keeps one
+   * height. It matches the top of the spacing scale.
+   *
+   * --ls-target-min is the pointer-target floor of WCAG 2.5.5 / 2.5.8. It is read by the surfaces
+   * that can carry a 44px box without changing what they are - a list row's link, a pager chip,
+   * the label of a radio row. Dense controls read --ls-control-sm instead.
+   *
+   * --ls-disabled-opacity is the one disabled treatment, read by Button, Pill, Select and Input.
+   * An inactive control is exempt from the 4.5:1 text-contrast minimum (WCAG 1.4.3), so a single
+   * shared dimming serves every primitive. */
+  --ls-control-sm: 32px;
+  --ls-target-min: 44px;
+  --ls-disabled-opacity: 0.55;
+
+  /* Type. System stacks only: no web font is imported or generated, so a clean clone builds and
+   * renders with no network access. */
+  --ls-font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --ls-font-mono:
+    ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* Type scale, in rem so it honours the reader's browser font size. The comments give the
+   * rendered pixel size at the default 16px root, which is what the component fallbacks state. */
+  --ls-text-xs: 0.75rem; /* 12px */
+  --ls-text-sm: 0.8125rem; /* 13px */
+  --ls-text-md: 0.9375rem; /* 15px - the body size */
+  --ls-text-lg: 1.125rem; /* 18px */
+  --ls-text-xl: 1.5rem; /* 24px */
+
+  /* Leading for the heading role. Unitless, so one value holds at every step of the scale above
+   * and follows the reader's font size with it. Declared once and read by every place that paints
+   * the role - the element baseline below, `.ls-page-title`, `.ls-section-title`, and the heading
+   * class of any component module that states its own. A module that styles a heading reads this
+   * token rather than restating a ratio. */
+  --ls-leading-heading: 1.25;
+
+  /* Elevation. Soft and neutral, tinted with the ink colour rather than pure black. */
+  --ls-shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --ls-shadow-2: 0 4px 12px rgba(15, 23, 42, 0.1);
+
+  /* Layout. --ls-page-max is the centred measure the header, nav, main region and footer all cap
+   * themselves at; --ls-header-height is the sticky header's fixed height, which the page shell
+   * turns into its top offset, so the two must agree. */
+  --ls-page-max: 1200px;
+  --ls-header-height: 64px;
+
+  /* Stacking tiers. The order is load-bearing: a table's sticky header sits just above its rows,
+   * the site header above the page, the cart drawer above the header, and the toast region above
+   * the drawer so a notice is never hidden behind it. */
+  --ls-z-sticky: 1;
+  --ls-z-header: 30;
+  --ls-z-drawer: 40;
+  --ls-z-toast: 60;
+
+  /* This storefront has one appearance, so the single scheme is declared rather than inferred:
+   * it keeps user-agent chrome (scrollbars, form controls, spell-check underlines) light even
+   * when the operating system is set to dark. */
+  color-scheme: light;
+}
+
+/* Element baseline
+ * ---------------------------------------------------------------------------------------------
+ * Deliberately small and standards-based: enough that a page composed only of the utilities
+ * below reads correctly, and never so opinionated that a component module has to undo it. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  /* Stop mobile Safari inflating text after an orientation change. */
+  -webkit-text-size-adjust: 100%;
+  /* Keep whatever the browser scrolls to clear of the sticky header (WCAG 2.4.11). The header is
+   * `position: sticky` at the fixed --ls-header-height at every width, so without this a control
+   * reached by Tab or Shift+Tab, a `scrollIntoView()` or programmatic `focus()` target, and the
+   * skip link's or a fragment's target can all be scrolled to a position underneath the bar. The
+   * inset is the header's height plus the widest spacing step (96px at the declared values). The
+   * step is the widest one because a partly hidden field is scrolled only until its own edge meets
+   * this inset, and the label above it - a line of small text plus its gap, about 21px - has to
+   * come to rest below the bar as well, with room left for the focus ring; one 16px step measured
+   * as leaving that label under the bar. Declared on the root element because the document is the
+   * scroller these targets live in. */
+  scroll-padding-block-start: calc(var(--ls-header-height) + var(--ls-space-6));
+}
+
+/* In-page anchors (the header's skip link, a dashboard section link) glide rather than jump -
+ * but only for readers who have not asked for less motion. */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+body {
+  /* The column is what pins the footer to the bottom of a short page: the header, nav and footer
+   * size to content and the main region grows, because the page shell sets `flex: 1 1 auto`. */
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--ls-surface);
+  color: var(--ls-text);
+  font-family: var(--ls-font-sans);
+  font-size: var(--ls-text-md);
+  line-height: 1.5;
+  /* Long unbroken product codes wrap instead of widening a grid track. */
+  overflow-wrap: break-word;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  color: var(--ls-text);
+  font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
+}
+
+h1 {
+  font-size: var(--ls-text-xl);
+}
+
+h2 {
+  font-size: var(--ls-text-lg);
+}
+
+h3 {
+  font-size: var(--ls-text-md);
+}
+
+h4,
+h5,
+h6 {
+  font-size: var(--ls-text-sm);
+}
+
+/* Every image in this application is a plain `<img>` with a literal `src` and explicit width and
+ * height attributes, so the box is reserved before the file arrives; `height: auto` then lets the
+ * intrinsic ratio win once it has. */
+img,
+svg,
+video {
+  display: block;
+  max-width: 100%;
+}
+
+img {
+  height: auto;
+}
+
+/* Links come in two kinds, and the baseline treats them differently.
+ *
+ * A component's anchor - a nav item, a breadcrumb crumb, a product card title, a pager chip - is
+ * styled by the module that renders it, and every one of them carries that module's class. None
+ * wants a default underline, so the reset below clears it and lets the module decide.
+ *
+ * An in-content anchor - the way out of the not-found page or the error boundary, the recovery
+ * link in a page's empty or notice state - is written bare in a route file under `app/**`, which
+ * has no module of its own and a closed utility set with no link class in it. It carries no class
+ * at all, and without a cue of its own it would read as the sentence around it, so that sentence
+ * would give no sign that part of it navigates (WCAG 1.4.1). Those anchors are underlined, and a
+ * pointer over one thickens the line: the cue is the underline rather than a colour, so it holds
+ * on every surface and tone the link can sit in, and the link keeps the colour of its container.
+ *
+ * `:where()` keeps the second rule at the specificity of the bare `a` selector, so any module
+ * class still outranks it; `:not([class])` is what keeps a component's anchor out of it in the
+ * first place. */
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+a:where([href]:not([class])) {
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+a:where([href]:not([class])):hover {
+  text-decoration-thickness: 2px;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  /* Checkboxes and radio inputs pick up the focus colour, which clears contrast on both
+   * surfaces; a module that wants a different accent simply declares its own. */
+  accent-color: var(--ls-focus);
+}
+
+/* One focus indicator for the whole application, shown for keyboard interaction and not for a
+ * mouse press. Component modules refine it; nothing removes it. */
+:focus-visible {
+  outline: 2px solid var(--ls-focus);
+  outline-offset: 2px;
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Honour a reduced-motion preference. Durations collapse rather than dropping to zero, which keeps
+ * `animationend`/`transitionend` handlers firing and leaves a busy indicator or placeholder
+ * visible instead of blanking it.
+ *
+ * This is the baseline, not an override. The universal selector carries no specificity, so the
+ * collapse applies wherever nothing else declares those properties and yields to any rule that
+ * does - which is why every component module in this application pairs the motion it introduces
+ * with a reduced-motion rule of its own, at its own specificity. The division is deliberate:
+ * forcing the value from here would also overrule the module that has decided what its own
+ * reduced-motion treatment should be, down to a placeholder that must stay visible once its
+ * shimmer stops. Motion added to a page without a module - an element-level declaration, a
+ * transition on a utility wrapper - is what this rule is here to catch. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+    scroll-behavior: auto;
+  }
+}
+
+::selection {
+  background-color: var(--ls-accent);
+  color: var(--ls-ink);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* Page-composition utilities
+ * ---------------------------------------------------------------------------------------------
+ * Route files under `app/**` add no CSS Module of their own and define no components, so these
+ * classes are the whole vocabulary a page has for arranging its own heading, sections and
+ * columns. The set is closed and every value comes from a token above: it is a documented dozen,
+ * not a utility framework, and it stops where a component's own module begins.
+ *
+ * They belong on a page's own wrapper elements. Put one on an element a component renders and the
+ * component's module class wins the cascade for anything both of them set, because module styles
+ * are emitted after this stylesheet - which is the right outcome, since the component owns its
+ * own box, but it means the utility silently does nothing there. */
+
+/* The per-page heading block: the page title with its optional lede. */
+.ls-page-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ls-space-2);
+  margin-block-end: var(--ls-space-4);
+}
+
+/* The page's single `<h1>`. */
+.ls-page-title {
+  color: var(--ls-text);
+  font-size: var(--ls-text-xl);
+  font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
+}
+
+/* The sentence under a page title, held to a comfortable reading measure. */
+.ls-page-lede {
+  max-width: 68ch;
+  color: var(--ls-text-muted);
+  font-size: var(--ls-text-md);
+  line-height: 1.55;
+}
+
+/* A page's vertical rhythm: one column, evenly spaced, never narrower than its content allows. */
+.ls-stack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4);
+}
+
+/* Closer spacing, for a run of related rows. Declared after `.ls-stack` so it wins the cascade
+ * when both classes sit on one element. */
+.ls-stack-tight {
+  gap: var(--ls-space-2);
+}
+
+/* Wider spacing, for separating major blocks of a long page. */
+.ls-stack-loose {
+  gap: var(--ls-space-5);
+}
+
+/* A `<section>` rhythm block: its head followed by its content. */
+.ls-section {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3);
+}
+
+/* A section's heading row: title first, trailing controls pushed to the end, wrapping when the
+ * two no longer fit side by side. */
+.ls-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ls-space-2);
+}
+
+/* A section's `<h2>`. The leading is the shared heading token rather than a ratio of its own: this
+ * utility and the section-heading class of a component module dress the same role on different
+ * surfaces, so both read one value and the role keeps one leading wherever it is painted. */
+.ls-section-title {
+  color: var(--ls-text);
+  font-size: var(--ls-text-lg);
+  font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
+}
+
+/* The two-column page grid. It starts as one column and adopts the second track once there is
+ * room, so a page needs no breakpoint of its own; `align-items: start` keeps the side column at
+ * its natural height instead of stretching it to match the main one. */
+.ls-split {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: var(--ls-space-5);
+}
+
+@media (min-width: 960px) {
+  .ls-split {
+    grid-template-columns: minmax(0, 1fr) minmax(17.5rem, 22rem);
+  }
+}
+
+/* The primary column: the form, table or list a page is mainly about. It comes first in the DOM,
+ * so reading and keyboard order reach it before the summary beside it. */
+.ls-split-main {
+  min-width: 0;
+}
+
+/* The secondary column: a summary or filter panel. Position is deliberately absent - a child
+ * that wants to stick to the viewport owns that behaviour in its own module, and declaring it
+ * here would give the panel two competing owners. */
+.ls-split-side {
+  min-width: 0;
+}
+
+/* A wrapping row of page-level controls. */
+.ls-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2);
+}
+
+/* Placement for a page-level notice - an alert or a blank-slate block - so the message keeps the
+ * page's rhythm without the page reaching into the component that renders it. */
+.ls-notice {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2);
+}

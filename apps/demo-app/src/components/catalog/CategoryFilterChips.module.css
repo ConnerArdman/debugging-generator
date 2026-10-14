@@ -1,0 +1,163 @@
+/*
+ * Lumen Supply - category filter row (layout only).
+ *
+ * Consumed by `CategoryFilterChips.tsx`, which shows one `@/components/ui/Pill` per catalog
+ * category behind a leading "All products" chip. The primitive owns everything about a chip's
+ * appearance - fill, border, radius, size variants, hover, focus ring and the `[data-selected]`
+ * inversion - so this file only arranges the chips in a row.
+ *
+ * Nothing here declares `color`, `background`, `border`, `border-radius` or an outline, and that
+ * omission is load-bearing rather than incidental: `Pill.module.css` flips `color` on the selected
+ * chip, and the `CategoryGlyph` inside it paints its art with `currentColor`, so the glyph and its
+ * label only invert together while no rule in this file overrides that colour.
+ *
+ * Every length reads an `--ls-*` custom property from `app/globals.css` with the literal fallback
+ * that mirrors its declared value, so the row still lays out correctly if this module is ever
+ * rendered without the global stylesheet. The three lengths the shared scale does not model - the
+ * label's truncation measure, the scrolling row's bottom gutter and the width of its trailing fade
+ * - are file-local properties declared on `.root` and read back in the same
+ * `var(--ls-NAME, <literal>)` form; the chips inherit them from that element.
+ */
+
+.root {
+  /* File-local geometry, declared once here because the shared token set has no step for any of
+   * them: the measure a category label truncates at, the gutter that keeps a horizontal scrollbar
+   * clear of the chips on a narrow viewport, and the width of the fade that tells a reader the
+   * scrolling row continues past its trailing edge. */
+  --ls-category-chips-label-measure: 12rem;
+  --ls-category-chips-scroll-gutter: var(--ls-space-1, 4px);
+  --ls-category-chips-fade-size: var(--ls-space-6, 32px);
+
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  margin: 0;
+  padding: 0;
+  /* Harmless on a `<div>`, and the reset the component needs if it groups the chips as a list. */
+  list-style: none;
+}
+
+/*
+ * Narrow viewports: the row stops wrapping and scrolls sideways instead, so a dozen categories stay
+ * on one line rather than stacking into several and pushing the product grid down the page. A media
+ * query cannot read a custom property, so the breakpoint is written as a plain `rem` - 40rem, which
+ * is 640px at the default root font size.
+ *
+ * A row that scrolls has to say so at rest, because a touch browser shows no scrollbar until the
+ * row is moved and a chip cut at the edge otherwise reads as a chip whose label is simply cut. The
+ * row's trailing edge therefore fades out over `--ls-category-chips-fade-size`: a mask, so it
+ * dims the chips themselves - fill, border, glyph and label alike - rather than laying a colour
+ * over them that would have to match the page surface. The storefront is set left to right, so the
+ * gradient runs to the right, which is the row's inline end.
+ *
+ * The fade must never hide the last chip. The row carries the same length as trailing padding, so
+ * scrolled to its end the last chip stops a whole fade-width short of the edge and sits in full
+ * view; the matching `scroll-padding` keeps a chip that keyboard focus scrolls into view clear of
+ * the fade too. Where the browser can tie an animation to the row's own scroll position, the fade
+ * also clears once the row reaches its end (the block that follows); where it cannot, the fade
+ * stays and covers only that padding.
+ */
+@media (max-width: 40rem) {
+  .root {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-block-end: var(--ls-category-chips-scroll-gutter, 4px);
+    padding-inline-end: var(--ls-category-chips-fade-size, 32px);
+    scroll-padding-inline-end: var(--ls-category-chips-fade-size, 32px);
+    /* Opaque up to one fade-width from the trailing edge, then transparent at the edge. The mask
+     * reads alpha only, so `currentColor` - the row's opaque text colour - simply means "shown". It
+     * is sized to the row and not repeated, so the scroll-end block below can push the transparent
+     * end past the edge by widening it. */
+    mask-image: linear-gradient(
+      to right,
+      currentColor calc(100% - var(--ls-category-chips-fade-size, 32px)),
+      transparent
+    );
+    mask-size: 100% 100%;
+    mask-repeat: no-repeat;
+    /* `proximity` snaps to a chip when the gesture ends near one and leaves a deliberate
+     * mid-scroll position alone, which `mandatory` would not. */
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+    /* Keep a sideways gesture inside the row rather than handing it to the page or a back
+     * gesture. */
+    overscroll-behavior-x: contain;
+  }
+
+  /* Every chip in the scrolling row keeps its natural width and offers a snap position - addressed
+   * as a child rather than through `.chip`, so the leading chip is covered too: the component
+   * renders that one from the primitive alone, without a class of its own. */
+  .root > * {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+  }
+}
+
+/*
+ * The fade clears at the end of the row. The animation is driven by the row's own horizontal
+ * scroll position (`scroll(self inline)`), not by time, and runs only across the last fade-width of
+ * that scroll range: before it the mask is as declared above, and over it the mask is widened by one
+ * fade-width, which carries its transparent end past the row's edge, so a reader who has reached
+ * the last chip sees the row unmasked. It moves only while the reader is scrolling, and only by
+ * what the scroll itself moves, so it needs no reduced-motion counterpart.
+ *
+ * Behind `@supports` on purpose: a browser that does not know `animation-timeline` would run the
+ * same declaration as an ordinary zero-length animation and jump straight to its end state, which
+ * would remove the fade that says the row scrolls. Without the block, the fade simply stays.
+ */
+@media (max-width: 40rem) {
+  @supports (animation-timeline: scroll()) {
+    .root {
+      animation: category-chips-scroll-end linear both;
+      animation-timeline: scroll(self inline);
+      animation-range: calc(100% - var(--ls-category-chips-fade-size, 32px)) 100%;
+    }
+  }
+}
+
+@keyframes category-chips-scroll-end {
+  to {
+    mask-size: calc(100% + var(--ls-category-chips-fade-size, 32px)) 100%;
+  }
+}
+
+/*
+ * A single chip's content: its `CategoryGlyph` and label on one line. Passed to `Pill` through the
+ * `className` prop the primitive declares, which composes it with the primitive's own class - the
+ * two agree on this box being an inline flex row, so neither has to win the cascade.
+ */
+.chip {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+}
+
+/*
+ * A long category name truncates on one line rather than stretching its chip past the row. The
+ * measure comes from the file-local property on `.root`; `min-width: 0` is what lets this flex item
+ * shrink far enough for the ellipsis to appear.
+ *
+ * The bleed keeps the name's glyphs whole inside that truncating clip. `Pill`'s `line-height: 1`
+ * makes this box exactly one em tall, while the descenders of g, p, q and y and the accent over a
+ * capital reach past the em, so `overflow: hidden` shaved about a pixel off the bottom of the name.
+ * `overflow` clips at the padding edge, so a quarter-em of block padding gives the glyphs room to
+ * paint, and the equal negative block margin takes that padding back out of layout: the chip's
+ * flex line still sees a one-em box, so the chip's height and the name's position are unchanged.
+ * The inline direction carries no padding, so the ellipsis still falls at the measure. Declared
+ * here rather than on `.root` beside the other two file-local properties because this is the only
+ * element that reads it, and in `em` so it resolves against the label's own type step.
+ */
+.label {
+  --ls-category-chips-label-bleed: 0.25em;
+
+  overflow: hidden;
+  min-width: 0;
+  max-width: var(--ls-category-chips-label-measure, 12rem);
+  margin-block: calc(-1 * var(--ls-category-chips-label-bleed, 0.25em));
+  padding-block: var(--ls-category-chips-label-bleed, 0.25em);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

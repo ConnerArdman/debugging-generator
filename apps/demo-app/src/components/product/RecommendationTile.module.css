@@ -1,0 +1,220 @@
+/*
+ * RecommendationTile - one recommended product inside the recommendations rail.
+ *
+ * The tile has two styling variants, selected by the `data-variant` attribute the component
+ * writes, and the component renders the same markup from the same props in both, so this
+ * stylesheet is the only place the two differ: the `detail` tile is a vertical card, and the
+ * `compact` tile is a short row - thumbnail beside a one-line name and its price - sized to fit a
+ * single row 63px high. The arithmetic for that is stated above the `[data-variant]` rules at the
+ * foot of the file. Nothing here changes what the tile does.
+ *
+ * The tile is intentionally independent of the catalog card's module: it borrows no rule from it
+ * and imports nothing, so a tile carries none of the catalog's chrome.
+ *
+ * Values read the `--ls-*` tokens declared in `app/globals.css` and each states the literal its
+ * token contract gives, so the tile still reads correctly if it is ever mounted without that
+ * stylesheet; inside the application the declaration in `app/globals.css` is what the browser
+ * paints. Hex spellings are lowercase because Prettier normalises them and `pnpm format:check`
+ * is a blocking gate - do not "restore" the uppercase form.
+ */
+
+/* The whole tile is one link, so the surface, its hairline and its states belong to the anchor.
+ * `height: 100%` lets a tile fill the row it sits in, which is what keeps a strip of tiles even
+ * when one name wraps to two lines and its neighbour's does not. */
+.root {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  padding: var(--ls-space-2, 8px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface, #ffffff);
+  color: inherit;
+  text-decoration: none;
+  /* The shared token set carries no duration or easing token, so the 160ms ease-out values are
+   * literals rather than `var()` reads. They affect the hover treatment alone, and the
+   * reduced-motion rule below removes them. */
+  transition:
+    border-color 160ms ease-out,
+    box-shadow 160ms ease-out;
+}
+
+/* A restrained lift: the hairline takes the interactive tint and the surface gains one step of
+ * elevation. Nothing moves and nothing resizes, so a hovered tile never nudges its neighbours.
+ *
+ * The accent hairline is a supplementary hover cue that changes together with the elevation; the
+ * tile's resting border and its focus ring are what identify it. */
+.root:hover {
+  border-color: var(--ls-accent, #f59e0b);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.06));
+}
+
+/* The strip of tiles is navigated from the keyboard, so the ring is restated here at the module's
+ * own specificity rather than left to the shared indicator alone - and it is never removed.
+ *
+ * The offset is inward because a tile lives in a horizontally scrolling strip, whose box clips
+ * whatever is drawn outside it: an outward ring loses its top edge on every tile and its leading
+ * edge on the first one. Drawn just inside the border the whole ring survives, in either variant
+ * and wherever the tile is placed. */
+.root:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: -2px;
+}
+
+/* The motion above is this module's, so its reduced-motion treatment is too: the hover change
+ * lands at once instead of easing in, and the tile is otherwise identical. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}
+
+/* The thumbnail frame. The ratio matches the intrinsic 400 x 300 of the committed product
+ * artwork, so the box is already the right shape before the file arrives, and the sunken fill
+ * keeps the tile legible when images are turned off. */
+.media {
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface-sunken, #f8fafc);
+  aspect-ratio: 4 / 3;
+}
+
+/* `contain` because the artwork is drawn to its own margins: filling the frame would crop the
+ * part that identifies the item. The element baseline gives every image `height: auto`, which
+ * this overrides so the artwork uses the frame it was given. */
+.image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* The text column. `min-width: 0` is what lets the clamped name shrink instead of widening the
+ * tile, and growing the column lets the price settle on the bottom edge, so the prices of
+ * neighbouring tiles line up however long their names are. */
+.body {
+  display: flex;
+  min-width: 0;
+  flex: auto;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* Two lines, then an ellipsis: long product names are the norm here, and clamping them is what
+ * holds a row of tiles to one height. The prefixed spelling is the interoperable one and is what
+ * current engines implement. */
+.name {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Placement only. The money string comes from the shared price component, which owns its own
+ * type and colour; the automatic leading margin pushes it to the foot of the text column, and the
+ * footnote below travels down with it. */
+.price {
+  margin-block-start: auto;
+}
+
+/* The endpoint's line about why this product is being suggested, under the figure. Muted and at
+ * the smallest type step, so it reads as a footnote to the suggestion rather than a second title
+ * competing with the name above it.
+ *
+ * It is deliberately not clamped, unlike the name above. The sentence ends in the name of the
+ * product the reader is looking at - "In the same category as Flanged Needle Roller Bearing 1 in
+ * Bore" - so a clamp cuts off exactly the words that carry its meaning and leaves a footnote that
+ * trails away mid-title. Nor does a clamp buy the row an even height here: every tile in one reply
+ * carries the same sentence, because it names the product on screen rather than the tile's own, so
+ * the footnotes wrap to the same number of lines as each other - and `.root`'s `height: 100%`
+ * levels the tiles in any case. The component renders this element only when the payload words a
+ * reason, so an empty value takes no line at all. */
+.reason {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* The two variants, told apart by the attribute the component sets. Each rule below states sizes
+ * and arrangement and nothing else, so a compact tile behaves exactly like a detail tile - same
+ * markup, same link, same text.
+ *
+ * The detail variant is the card above: a 4:3 thumbnail over a two-line name, the price on the
+ * tile's bottom edge and the unclamped footnote under it, 277px tall. The footnote settles on
+ * three 18px lines whether the sentence names the catalog's shortest product or its longest, so
+ * the row does not change height from one product to the next.
+ *
+ * The compact variant is a genuinely different arrangement rather than that card made narrower,
+ * because it is sized to fit a single row 63px high, and a card does not fit a row that short.
+ * So the compact tile lays the thumbnail beside the text instead of above it and spends one line
+ * each on the name and the price:
+ *
+ *   2 x 1px border + 2 x 4px padding + 12px x 1.15 name + 12px x 1.15 price = 37.6px
+ *
+ * The thumbnail is 30px wide, so the 4:3 frame it inherits stands 22.5px tall - shorter than the
+ * text column beside it, which is therefore what decides the tile's height. Both variants keep
+ * the widths stated below, so the strip still scrolls by whole tiles, and two compact tiles plus
+ * the strip's 8px gap measure 296px. */
+.root[data-variant='detail'] {
+  width: 12rem;
+}
+
+.root[data-variant='compact'] {
+  width: 9rem;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  padding: var(--ls-space-1, 4px);
+}
+
+/* The compact tile's thumbnail: a fixed box that neither grows nor shrinks, so the text beside it
+ * takes the rest of the row rather than competing with it for width. Stated in rem like the tile
+ * widths above, and for the same reason - it is tile geometry rather than a spacing step, so no
+ * `--ls-space-*` token expresses it. */
+.root[data-variant='compact'] .media {
+  width: 1.875rem;
+  flex: 0 0 auto;
+}
+
+/* The text column, with the price on the line directly under the name: at this height a 4px gap
+ * is a tenth of the tile, and the two lines read as one pair of facts about the product without
+ * it. */
+.root[data-variant='compact'] .body {
+  gap: 0;
+}
+
+/* One line, then an ellipsis, at the smallest type step. The compact row has room for a single
+ * line of name, and the full wording stays selectable on the product page this tile links to. The
+ * leading is stated because the inherited 1.5 of body copy would add 6px to every line here and
+ * put the tile past the row's 63px; the shared token set carries no leading token, so 1.15 is a
+ * literal, exactly as the 1.25 on headings in app/globals.css is. */
+.root[data-variant='compact'] .name {
+  -webkit-line-clamp: 1;
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.15;
+}
+
+/* The figure sits under the name rather than on the tile's bottom edge: a 37.6px tile has no
+ * spare height for the automatic margin above to distribute, and compact tiles side by side each
+ * have a one-line name, so their prices line up regardless. The size and leading are restated
+ * here because ui/Price declares its own `sm` step (13px) on a class and an attribute - two
+ * classes and an attribute outrank that however the two modules are ordered. */
+.root[data-variant='compact'] .price {
+  margin-block-start: 0;
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.15;
+}
+
+/* No footnote in the compact variant. All 37.6px of a compact tile are spent on one line of name
+ * and one of price; two more lines of reason would be some 36px a row 63px high does not have,
+ * and that row clips rather than scrolls in the block axis, so the footnote would be cut in half
+ * instead of read. It is left out of the layout rather than hidden from sighted readers alone, so
+ * a compact tile announces exactly what it shows - the name and the price - and the reason is
+ * displayed in the detail variant only. */
+.root[data-variant='compact'] .reason {
+  display: none;
+}

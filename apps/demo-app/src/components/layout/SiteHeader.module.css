@@ -1,0 +1,416 @@
+/*
+ * SiteHeader - the sticky top bar of the "Lumen Supply" storefront.
+ *
+ * Imported exactly once, by its sibling `SiteHeader.tsx`
+ * (`import styles from './SiteHeader.module.css';`). It places six things and nothing else: the
+ * skip link, the brand lockup, the search form - in the row at desktop widths, in a panel below
+ * the bar at phone widths - the control that discloses that panel, the bounded track that carries
+ * a compact "frequently bought with" strip on a product route, and the right-hand cluster holding
+ * the cart control and its count chip.
+ *
+ * TOKENS
+ * `apps/demo-app/app/globals.css` declares the `--ls-*` custom properties read below and is
+ * authored in parallel with this file, so every reference is written
+ * `var(--ls-NAME, <literal fallback>)`: the fallback mirrors the value declared there, which keeps
+ * the bar presentable on its own and paints the application palette inside the application. One
+ * naming trap worth repeating: `--ls-focus` is a *colour*, not an outline shorthand, so a focus
+ * ring is written out as `<width> solid var(--ls-focus, ...)` - the same shape as the baseline
+ * `:focus-visible` rule in globals.css.
+ *
+ * THE CONSTANT-HEIGHT INVARIANT (the rule every other decision here defers to)
+ * `PageContainer.module.css` turns `--ls-header-height` into the scroll margin of the document's
+ * single `<main>` - the distance a "Skip to content" jump leaves between the top of the viewport
+ * and the first line of the route - so this bar has to be exactly that tall on every route. Hence
+ * a fixed `height` rather than a `min-height`, `flex: 0 0 auto` so the page column can never
+ * compress it, one row and one row only, and a strip track that is bounded on both axes
+ * (`min-width: 0`, `max-height: 100%`, `overflow: hidden`, a capped `max-width`). A route that made
+ * the bar taller would push everything under it down mid-interaction and park a skip-link jump
+ * underneath it.
+ *
+ * It is also why the phone-width search is a panel taken out of flow rather than a second row: an
+ * absolutely positioned box hanging off the bar's bottom edge adds nothing to the bar's height,
+ * whether it is open or closed, so the page below never moves when the disclosure opens and the
+ * scroll margin `PageContainer` applies stays correct at every width and in every state of the
+ * disclosure.
+ *
+ * WIDTH CONDITIONS
+ * Three, all at the end of the file, none of them redefining the row: 960px steps the gutter with
+ * the page shell, 1023px drops the suggestions strip, and 639px shows the disclosure control and
+ * moves the form into the panel. Every other rule in the file applies at every width.
+ *
+ * OWNERSHIP
+ * The chrome of the controls inside the bar belongs to their own modules: `Input.module.css` owns
+ * the field's border, background and focus ring; `Button.module.css` owns every button surface;
+ * `Badge.module.css` owns the chip's fill, border and radius; `RecommendationsRail.module.css` and
+ * `RecommendationTile.module.css` own the strip's heading, gaps and tile sizing. This file places
+ * those elements and never reaches inside them: no selector here names another module's class, and
+ * the wrappers (`.searchField`, `.searchSubmit`, `.searchToggle`, `.cartButton`) are where the
+ * caller's geometry lives, so a primitive's own surface stays its own to declare.
+ *
+ * One declaration is an exception, and it is the only one: `.cartControl` sets the trailing
+ * padding of the cart control itself, overriding the inline padding `Button.module.css` gives its
+ * `md` size. It is not a restatement for its own sake - the count chip is positioned against that
+ * control and overhangs it, so the room the chip needs can only be the control's own padding. It
+ * is written as three of this file's classes so specificity, and not the order the bundler emits
+ * the two modules in, is what decides it.
+ *
+ * STACKING
+ * The bar sits on `--ls-z-header` (30), and the two boxes this file lifts out of the row - the
+ * focused skip link and the phone-width search panel - are painted on that same tier, inside the
+ * bar's own stacking context. The cart drawer (`--ls-z-drawer`, 40) and the toast region
+ * (`--ls-z-toast`, 60) are deliberately above it, so nothing in this file may reach either tier.
+ */
+
+.root {
+  /* Sub-token structural widths. The shared spacing scale starts at 4px and names no hairline, no
+   * focus-ring width and no ring offset, and the clip pattern below needs a 1px box. These four
+   * are the only literals in the file that sit outside a `var()` fallback, and they are declared
+   * once, here, instead of being repeated at each use site. */
+  --header-hairline: 1px;
+  --header-collapsed-size: 1px;
+  --header-ring-width: 2px;
+  --header-ring-offset: 2px;
+
+  /* Everything else resolves through a shared token. The gutter is the same value
+   * `PageContainer.module.css` uses for the page gutter (and takes the same step at the same 960px
+   * breakpoint below), so the brand lines up with the left edge of page content. The two maxima
+   * are fractions of the page measure - 400px and 300px at the declared 1200px - so neither the
+   * field nor the strip can crowd the other out. */
+  --header-gutter: var(--ls-space-4, 16px);
+  --header-gap: var(--ls-space-3, 12px);
+  --header-cluster-gap: var(--ls-space-2, 8px);
+  --header-logo-height: var(--ls-space-5, 24px);
+  --header-search-max: calc(var(--ls-page-max, 1200px) / 3);
+  --header-strip-max: calc(var(--ls-page-max, 1200px) / 4);
+  --header-chip-offset: calc(-1 * var(--ls-space-1, 4px));
+  --header-chip-min-width: var(--ls-space-5, 24px);
+  /* The trailing room the cart control reserves for the chip that overhangs it: the inline padding
+   * `Button.module.css` gives its `md` size, plus one step of the spacing scale, so the chip
+   * reaches back across padding only and never over the last glyph of the label. Derived from the
+   * same two tokens the primitive and this file already read, so it moves with the scale. */
+  --header-chip-clearance: calc(var(--ls-space-4, 16px) + var(--ls-space-3, 12px));
+
+  /* Sticky, never fixed: the bar stays in the page column that `<body>` lays out, so it takes its
+   * own height in flow and the navigation row and the page start below it without any offset of
+   * their own. `inset-block-start` is the logical form of `top`. */
+  position: sticky;
+  inset-block-start: 0;
+  /* The invariant: one fixed height, and a flex item the column cannot shrink. */
+  height: var(--ls-header-height, 64px);
+  flex: 0 0 auto;
+  background: var(--ls-surface, #ffffff);
+  border-block-end: var(--header-hairline, 1px) solid var(--ls-border, #cbd5e1);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.06));
+  color: var(--ls-text, #0f172a);
+  font-family: var(
+    --ls-font-sans,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif
+  );
+  z-index: var(--ls-z-header, 30);
+}
+
+/* The centred measure. `height: 100%` keeps the single row exactly as tall as the bar, so nothing
+ * a child renders can add a second row's worth of height. */
+.inner {
+  display: flex;
+  height: 100%;
+  max-width: var(--ls-page-max, 1200px);
+  margin-inline: auto;
+  padding-inline: var(--header-gutter, 16px);
+  align-items: center;
+  gap: var(--header-gap, 12px);
+}
+
+/* "Skip to content" - the first focusable element in the document.
+ *
+ * Collapsed with the clip pattern rather than `display: none` or `visibility: hidden`, because
+ * both of those remove it from the focus order and there would be nothing left to skip with. It is
+ * absolutely positioned against `.root` (the bar is the nearest positioned ancestor), so the
+ * collapsed box contributes nothing to the flex row. */
+.skipLink {
+  position: absolute;
+  width: var(--header-collapsed-size, 1px);
+  height: var(--header-collapsed-size, 1px);
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Fully visible for a keyboard reader: a real chip pinned inside the bar, aligned with the page
+ * gutter, in the slot the brand lockup otherwise occupies - the rule below is what hands that slot
+ * over for as long as the link holds focus. */
+.skipLink:focus-visible {
+  inset-block-start: var(--ls-space-2, 8px);
+  inset-inline-start: var(--header-gutter, 16px);
+  width: auto;
+  height: auto;
+  padding: var(--ls-space-1, 4px) var(--ls-space-3, 12px);
+  background: var(--ls-surface, #ffffff);
+  border: var(--header-hairline, 1px) solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+  overflow: visible;
+  clip-path: none;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  line-height: 1.2;
+  text-decoration: none;
+  outline: var(--header-ring-width, 2px) solid var(--ls-focus, #0f766e);
+  outline-offset: var(--header-ring-offset, 2px);
+  z-index: var(--ls-z-header, 30);
+}
+
+/* The brand yields the bar's inline-start slot while the skip link is being read.
+ *
+ * The chip above is pinned at the gutter, inside the one 64px band the lockup occupies, and the
+ * band's height is an invariant this file may not spend: `PageContainer.module.css` reads
+ * `--ls-header-height` as the scroll margin of the document's `<main>`, so no row may be added and
+ * nothing may be shifted down. The two elements are adjacent siblings inside `.inner` -
+ * `SiteHeader.tsx` renders the link first, because it is the document's first tab stop - so the
+ * sibling combinator can say "only while that link has focus", with no state for this file to
+ * track and nothing to reset.
+ *
+ * `opacity` and not `visibility: hidden` or `display: none`, which is the whole point of the rule:
+ * a browser works out the next tab stop at the moment Tab is pressed, and either of those would
+ * have taken the lockup out of the focus order at exactly that moment - Tab off the skip link
+ * would have skipped the wordmark, which is a link to the catalog. Faded, it stays a tab stop, and
+ * it is back with its own focus ring the instant focus lands on it. Where the pointer transition
+ * at the end of the file applies, the yield fades rather than cuts; under reduced motion it cuts. */
+.skipLink:focus-visible + .brand {
+  opacity: 0;
+}
+
+/* The home link wrapping the lockup. */
+.brand {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  border-radius: var(--ls-radius-sm, 4px);
+  text-decoration: none;
+}
+
+.brand:focus-visible {
+  outline: var(--header-ring-width, 2px) solid var(--ls-focus, #0f766e);
+  outline-offset: var(--header-ring-offset, 2px);
+}
+
+/* The lockup itself. `public/logo.svg` is 200x40, and the component states those numbers as the
+ * element's `width`/`height` attributes, so the box is reserved before the file arrives; the ratio
+ * plus a token-derived height is what keeps it that shape afterwards. */
+.logo {
+  display: block;
+  width: auto;
+  height: var(--header-logo-height, 24px);
+  aspect-ratio: 5 / 1;
+}
+
+/* The search form takes the width the brand, strip and actions leave, and yields it back when the
+ * strip appears - `min-width: 0` is what allows the shrink to happen at all. */
+.search {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: var(--header-cluster-gap, 8px);
+}
+
+/* The field's width lives here because `Input` accepts no `className`. Its border, background,
+ * placeholder colour and focus ring belong to `Input.module.css` and are deliberately absent. */
+.searchField {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: var(--header-search-max, 400px);
+}
+
+/* Placement for the submit control; `Button.module.css` owns how it looks. */
+.searchSubmit {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+/* The compact disclosure's control, in the trailing cluster. Dropped entirely at the widths where
+ * the form is already in the row: there is nothing to disclose there, and an element removed with
+ * `display: none` is out of the focus order as well as out of the layout, which is what keeps the
+ * wide bar's tab order exactly what it was. The narrow breakpoint at the end of the file is the
+ * only place it is drawn, and `SiteHeader.tsx` keeps it mounted at every width so the form `id`
+ * its `aria-controls` names always belongs to a form in the document. */
+.searchToggle {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+/* The strip track - the one element in the bar whose content is not this module's to size, so it
+ * is bounded instead: it may shrink but never grow (`flex: 0 1 auto`), it is capped in width, and
+ * it is capped in height by the bar itself with anything taller clipped. The rail inside keeps its
+ * own heading, gaps and tile sizing, and nothing here selects into it. */
+.miniRail {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: var(--header-strip-max, 300px);
+  max-height: 100%;
+  align-items: center;
+  overflow: hidden;
+}
+
+/* The trailing cluster. `margin-inline-start: auto` pins it to the end of the row even when the
+ * search field and the strip have both shrunk to their minimum. */
+.actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--header-cluster-gap, 8px);
+  margin-inline-start: auto;
+}
+
+/* Placement plus the positioning context the count chip is offset against - nothing else, since
+ * the control inside is a `Button` and owns its own surface. */
+.cartButton {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+/* The trailing room the chip overhangs into, on the cart control itself.
+ *
+ * The chip is offset against `.cartButton` and is wider than the corner it is pinned to, so it
+ * reaches back into the control. Where it reaches has to be padding: at the primitive's `md`
+ * inline padding the chip crossed the end of the "Cart" label and covered its last glyph, so this
+ * adds a step of the spacing scale to the trailing side and the chip clears the text. The label
+ * itself is untouched - the control grows by that one step, and `.actions` is pinned to the end of
+ * the row, so the row is measured from the same edge it was.
+ *
+ * Three classes deliberately: this has to beat `Button.module.css`'s `.root[data-size='md']`
+ * padding, and a single class would tie the outcome to which module's rules the bundler emits
+ * first. `.actions .cartButton .cartControl` is (0,3,0) against that rule's (0,2,0), so
+ * specificity decides it and source order cannot. It is the one selector in this file that
+ * overrides a declaration of another module's, and it overrides padding alone. */
+.actions .cartButton .cartControl {
+  padding-inline-end: var(--header-chip-clearance, 28px);
+}
+
+/* The count chip. Position and numerals only: `Badge` owns the fill, border and radius.
+ *
+ * The chip is lifted just past the control's top-right corner, overhanging the trailing padding
+ * the rule above reserves for it rather than the label, never takes a pointer event that was meant
+ * for the control beneath it, and reserves a width that suits two digits so the row does not nudge
+ * sideways as the count changes - tabular figures in the monospace stack are what make every digit
+ * the same width. */
+.cartBadge {
+  position: absolute;
+  inset-block-start: var(--header-chip-offset, -4px);
+  inset-inline-end: var(--header-chip-offset, -4px);
+  min-width: var(--header-chip-min-width, 24px);
+  justify-content: center;
+  font-family: var(
+    --ls-font-mono,
+    ui-monospace,
+    'SF Mono',
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    'Liberation Mono',
+    monospace
+  );
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* One width breakpoint for the page gutter, taking the same step at the same 960px as
+ * `PageContainer.module.css` and `SiteFooter.module.css`, so the brand keeps aligning with the
+ * left edge of page content and of the footer columns on either side of it. */
+@media (min-width: 960px) {
+  .root {
+    --header-gutter: var(--ls-space-5, 24px);
+  }
+}
+
+/* Below the desktop measure there is no room for the strip beside the field, so the track is not
+ * displayed; the strip is shown from 1024px up. */
+@media (max-width: 1023px) {
+  .miniRail {
+    display: none;
+  }
+}
+
+/* Phone widths, and the only place in the file where anything the bar places leaves the row. The
+ * brand, a field wide enough to read a term in, that field's submit control and the cart cluster
+ * cannot share one row here without every one of them shrinking past legibility, so the form
+ * becomes a panel that the disclosure control in the trailing cluster opens.
+ *
+ * The constant-height invariant survives it untouched, which is the whole reason for the mechanism:
+ * the panel is absolutely positioned against `.root` - `position: sticky` makes the bar the
+ * containing block, exactly as `.skipLink` above relies on - so it is out of flow and contributes
+ * nothing to the fixed height. It hangs from the bar's own bottom edge (`inset-block-start: 100%`)
+ * across the bar's full width, painted on the bar's surface with the bar's hairline and the
+ * elevation token one step up from it, on the bar's own stacking tier: an extension of the bar
+ * rather than content of the page it covers. No second row, and no height anywhere in the block.
+ *
+ * `SiteHeader.tsx` keeps the form mounted at every width and reports the disclosure state in
+ * `data-open`, so visibility is decided here instead of by unmounting - which is what keeps the
+ * toggle's `aria-controls` pointing at an element that exists. Escape is safe against the closed
+ * rule below because that file moves focus to the toggle before it writes the attribute, so the
+ * path never leaves focus inside a panel this rule stops drawing. */
+@media (max-width: 639px) {
+  .searchToggle {
+    display: inline-flex;
+  }
+
+  .search {
+    position: absolute;
+    inset-block-start: 100%;
+    inset-inline: 0;
+    display: none;
+    padding-block: var(--ls-space-3, 12px);
+    padding-inline: var(--header-gutter, 16px);
+    background: var(--ls-surface, #ffffff);
+    border-block-end: var(--header-hairline, 1px) solid var(--ls-border, #cbd5e1);
+    box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+    z-index: var(--ls-z-header, 30);
+  }
+
+  .search[data-open='true'] {
+    display: flex;
+  }
+
+  /* The panel is as wide as the bar, so the field takes all of it: the desktop cap is a fraction
+   * of the page measure and would leave a gap between the field and its submit control here. */
+  .searchField {
+    max-width: none;
+  }
+}
+
+/* The only motion this file introduces: the brand's opacity is transitioned rather than switched,
+ * declared behind `hover: hover` so a touch reader never gets a hover state stuck on. It carries
+ * two changes of that one property - the pointer fade declared here, and the yield to the focused
+ * skip link above - and neither is announced by motion alone. */
+@media (hover: hover) {
+  .brand {
+    transition: opacity 160ms ease-out;
+  }
+
+  .brand:hover {
+    opacity: 0.85;
+  }
+}
+
+/* Its reduced-motion counterpart, last so it wins on source order: the hover appearance stays, the
+ * animation of it does not. */
+@media (prefers-reduced-motion: reduce) {
+  .brand {
+    transition: none;
+  }
+}

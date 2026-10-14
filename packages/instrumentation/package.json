@@ -1,0 +1,42 @@
+{
+  "name": "@debuggen/instrumentation",
+  "version": "0.1.0",
+  "description": "Reversible instrumentation layer: instrumentation plan schemas, the adapter contract and registry, the built-in adapters, and the AST function-timing patcher with hash-recorded backups, conflict detection and cleanup.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": [
+        "./src/index.ts",
+        "./dist/index.d.ts"
+      ],
+      "import": "./dist/index.js"
+    },
+    "./schema": {
+      "types": [
+        "./src/schema/index.ts",
+        "./dist/schema/index.d.ts"
+      ],
+      "import": "./dist/schema/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project instrumentation"
+  },
+  "dependencies": {
+    "@debuggen/code-analysis": "workspace:*",
+    "@debuggen/shared": "workspace:*",
+    "@debuggen/telemetry": "workspace:*",
+    "diff": "9.0.0",
+    "ts-morph": "28.0.0",
+    "zod": "4.6.5"
+  }
+}

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Fasteners</title>
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. The nut stays an
+       unfilled outline, so it never reads as the brand mark. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polygon points="152,203.22 140,224 116,224 104,203.22 116,182.44 140,182.44" stroke="#0F172A" stroke-width="8" />
+    <circle cx="128" cy="203.22" r="9" stroke="#475569" stroke-width="6" />
+    <path d="M191 150 H209 M191 170 H209 M191 190 H209 M191 210 H209" stroke="#475569" stroke-width="6" />
+    <polygon points="230,96 215,121.98 185,121.98 170,96 185,70.02 215,70.02" stroke="#0F172A" stroke-width="8" />
+    <path d="M190 121.98 V224 H210 V121.98" stroke="#0F172A" stroke-width="8" />
+    <circle cx="272" cy="201" r="23" stroke="#0F172A" stroke-width="8" />
+    <circle cx="272" cy="201" r="10" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>

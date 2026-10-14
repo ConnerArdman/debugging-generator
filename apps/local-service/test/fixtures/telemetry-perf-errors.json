@@ -1,0 +1,255 @@
+[
+  {
+    "id": "evt_pe00000000000001",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d01",
+    "kind": "interaction",
+    "name": "click Refresh conditions",
+    "startTime": 1789819200000,
+    "duration": 1000,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click",
+      "target.selector": "#trail-conditions-refresh",
+      "target.tagName": "button",
+      "target.text": "Refresh conditions",
+      "componentChain": ["ConditionsPanel", "TrailCard"],
+      "interactionId": 4712,
+      "inputDelay": 2.5,
+      "processingStart": 1789819200002.5,
+      "processingEnd": 1789819200011
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000004",
+    "seq": 1
+  },
+  {
+    "id": "evt_pe00000000000002",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d02",
+    "parentSpanId": "0000000000000d01",
+    "kind": "navigation",
+    "name": "navigate /trails",
+    "startTime": 1789819200000,
+    "duration": 380,
+    "tier": "browser",
+    "attributes": {
+      "url": "/trails",
+      "navigation.type": "navigate",
+      "domContentLoaded": 1789819200262,
+      "loadEventEnd": 1789819200372.5
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000004",
+    "seq": 2
+  },
+  {
+    "id": "evt_pe00000000000003",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d03",
+    "parentSpanId": "0000000000000d02",
+    "kind": "perf.entry",
+    "name": "resource /_next/static/chunks/main-app.js",
+    "startTime": 1789819200040,
+    "duration": 9.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource",
+      "url": "/_next/static/chunks/main-app.js",
+      "initiator.type": "script",
+      "transferSize": 18240,
+      "encodedBodySize": 17984,
+      "decodedBodySize": 61440,
+      "renderBlockingStatus": "non-blocking"
+    },
+    "status": "unset",
+    "producerId": "prd_browser000000004",
+    "seq": 3
+  },
+  {
+    "id": "evt_pe00000000000004",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d04",
+    "parentSpanId": "0000000000000d02",
+    "kind": "perf.entry",
+    "name": "resource /_next/static/css/app-layout.css",
+    "startTime": 1789819200058.5,
+    "duration": 14.25,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource",
+      "url": "/_next/static/css/app-layout.css",
+      "initiator.type": "link",
+      "transferSize": 4096,
+      "encodedBodySize": 3840,
+      "decodedBodySize": 15872,
+      "renderBlockingStatus": "blocking"
+    },
+    "status": "unset",
+    "producerId": "prd_browser000000004",
+    "seq": 4
+  },
+  {
+    "id": "evt_pe00000000000005",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d05",
+    "parentSpanId": "0000000000000d01",
+    "kind": "perf.longtask",
+    "name": "longtask",
+    "startTime": 1789819200120,
+    "duration": 72,
+    "tier": "browser",
+    "attributes": {
+      "attribution": "window",
+      "blockingTime": 22
+    },
+    "status": "unset",
+    "producerId": "prd_browser000000004",
+    "seq": 5
+  },
+  {
+    "id": "evt_pe00000000000006",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d06",
+    "parentSpanId": "0000000000000d01",
+    "kind": "perf.longtask",
+    "name": "longtask",
+    "startTime": 1789819200340.5,
+    "duration": 118.5,
+    "tier": "browser",
+    "attributes": {
+      "attribution": "window",
+      "blockingTime": 68.5
+    },
+    "status": "unset",
+    "producerId": "prd_browser000000004",
+    "seq": 6
+  },
+  {
+    "id": "evt_pe00000000000007",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d07",
+    "parentSpanId": "0000000000000d01",
+    "kind": "error",
+    "name": "TypeError in TrailCard",
+    "startTime": 1789819200410,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "error.type": "TypeError",
+      "error.message": "Cannot read properties of undefined (reading 'snowLineMeters')",
+      "error.stack": "TypeError: Cannot read properties of undefined (reading 'snowLineMeters')\n    at handleShowReport (src/components/TrailCard.tsx:45:18)\n    at onClick (src/components/TrailCard.tsx:71:38)",
+      "error.source": "src/components/TrailCard.tsx:45:18",
+      "component": "TrailCard"
+    },
+    "status": "error",
+    "producerId": "prd_browser000000004",
+    "seq": 7,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 45,
+      "column": 18,
+      "symbol": "handleShowReport",
+      "endLine": 63,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_pe00000000000008",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d08",
+    "parentSpanId": "0000000000000d01",
+    "kind": "server.error",
+    "name": "Error in GET /api/trail-report",
+    "startTime": 1789819200520,
+    "duration": 0,
+    "tier": "server",
+    "attributes": {
+      "error.type": "Error",
+      "error.message": "Trail report feed was unavailable while its cache refreshed",
+      "http.route": "/api/trail-report"
+    },
+    "status": "error",
+    "producerId": "prd_server0000000004",
+    "seq": 1
+  },
+  {
+    "id": "evt_pe00000000000009",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d09",
+    "parentSpanId": "0000000000000d01",
+    "kind": "fetch",
+    "name": "GET /api/trail-conditions",
+    "startTime": 1789819200600,
+    "duration": 96,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/trail-conditions?window=7d",
+      "http.status_code": 503,
+      "initiator": "src/components/TrailCard.tsx:49:30",
+      "sameOrigin": true,
+      "traceparentInjected": true
+    },
+    "status": "error",
+    "producerId": "prd_browser000000004",
+    "seq": 8,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 49,
+      "column": 30,
+      "symbol": "handleShowReport",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    }
+  },
+  {
+    "id": "evt_pe00000000000010",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d0a",
+    "parentSpanId": "0000000000000d01",
+    "kind": "perf.longtask",
+    "name": "longtask",
+    "startTime": 1789819200700,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "attribution": "window",
+      "blockingTime": 1
+    },
+    "status": "unset",
+    "producerId": "prd_browser000000004",
+    "seq": 9
+  },
+  {
+    "id": "evt_pe00000000000011",
+    "traceId": "3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e",
+    "spanId": "0000000000000d0b",
+    "parentSpanId": "0000000000000d01",
+    "kind": "error",
+    "name": "SyntaxError in TrailCard",
+    "startTime": 1789819200905,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "error.type": "SyntaxError",
+      "error.message": "Unexpected end of JSON input",
+      "error.stack": "SyntaxError: Unexpected end of JSON input\n    at handleShowReport (src/components/TrailCard.tsx:56:36)",
+      "error.source": "src/components/TrailCard.tsx:56:36",
+      "component": "TrailCard"
+    },
+    "status": "error",
+    "producerId": "prd_browser000000004",
+    "seq": 10,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 45,
+      "column": 18,
+      "symbol": "handleShowReport",
+      "endLine": 63,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  }
+]

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Safety gear</title>
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="116" y="146" width="168" height="20" rx="10" stroke="#0F172A" stroke-width="8" />
+    <path d="M152 146 C152 104 172 88 200 88 C228 88 248 104 248 146 Z" fill="#F59E0B" stroke="#0F172A" stroke-width="8" />
+    <path d="M186 100 C178 111 174 122 173 135" stroke="#475569" stroke-width="6" />
+    <path d="M214 100 C222 111 226 122 227 135" stroke="#475569" stroke-width="6" />
+    <path d="M140 193 L124 186" stroke="#475569" stroke-width="6" />
+    <path d="M260 193 L276 186" stroke="#475569" stroke-width="6" />
+    <path d="M192 195 Q200 185 208 195" stroke="#475569" stroke-width="6" />
+    <rect x="138" y="187" width="52" height="34" rx="14" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+    <rect x="210" y="187" width="52" height="34" rx="14" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+  </g>
+</svg>

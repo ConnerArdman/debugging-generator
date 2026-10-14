@@ -1,0 +1,77 @@
+{
+  "before": {
+    "id": "evt_4k9p2s7d1f6h3jbn",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "d2a70f45c93b8e61",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/items?itemId=?&page=?",
+      "http.status_code": 200,
+      "initiator": "fetchItemList",
+      "http.request.header.authorization": "Bearer example-placeholder",
+      "http.request.header.cookie": "sid=example-placeholder",
+      "http.request.header.x-api-key": "example-placeholder",
+      "http.request.header.x-auth-token": "example-placeholder",
+      "http.request.header.accept": "application/json",
+      "http.response.header.set-cookie": ["sid=example-placeholder; Path=/", "theme=light; Path=/"]
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 7,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    }
+  },
+  "after": {
+    "id": "evt_4k9p2s7d1f6h3jbn",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "d2a70f45c93b8e61",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/items?itemId=?&page=?",
+      "http.status_code": 200,
+      "initiator": "fetchItemList",
+      "http.request.header.authorization": "[redacted]",
+      "http.request.header.cookie": "[redacted]",
+      "http.request.header.x-api-key": "[redacted]",
+      "http.request.header.x-auth-token": "[redacted]",
+      "http.request.header.accept": "application/json",
+      "http.response.header.set-cookie": ["[redacted]", "[redacted]"]
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 7,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": [
+      "http.request.header.authorization",
+      "http.request.header.cookie",
+      "http.request.header.x-api-key",
+      "http.request.header.x-auth-token",
+      "http.response.header.set-cookie"
+    ]
+  }
+}

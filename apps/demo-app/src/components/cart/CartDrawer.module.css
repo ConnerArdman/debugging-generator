@@ -1,0 +1,303 @@
+/*
+ * CartDrawer - the cart slide-over dialog.
+ *
+ * The only consumer is `./CartDrawer.tsx`, which portals this exact tree into `document.body`:
+ *
+ *   .overlay            the fixed scrim; a click on it, and only on it, closes the dialog
+ *     .panel            role="dialog" aria-modal="true" aria-labelledby=... tabIndex={-1}
+ *       .head           <h2 class="title">, the unit-count Badge, .close (a ghost Button)
+ *       .body           <CartLineList variant="drawer" />  <- the only scrolling region
+ *       .foot           <CartTotalsPanel variant="drawer" />, .checkoutLink, .cartLink
+ *
+ * Nine classes and nothing else: a tenth would be dead CSS the component never references.
+ *
+ * Conventions, all of them set by `app/globals.css`:
+ *
+ *   - Every value is `var(--ls-NAME, <literal>)`, so the module reads sensibly on its own and
+ *     paints the storefront palette inside the application. The fallbacks repeat the values
+ *     declared there, lowercase, because Prettier normalises CSS colours to lowercase and
+ *     `pnpm format:check` is a blocking gate. Bare literals appear only where a token would be
+ *     meaningless: `0`, `none`, `auto`, `transparent`, `100%`, unitless numbers, line heights,
+ *     border widths and animation timing.
+ *   - Logical properties throughout (`inset`, `border-inline-start`, `padding-block`,
+ *     `margin-inline-start`), matching the `margin-block-end` of the global page utilities.
+ *   - Motion is declared here and paired with this module's own reduced-motion rule, at this
+ *     module's specificity, rather than left to the global baseline that only collapses
+ *     durations. The panel's entrance is LTR-shaped (it slides in from the inline end, which is
+ *     the right): this storefront ships one direction and sets no `dir` anywhere.
+ *   - Component chrome stays with the component. The close control is a `../ui/Button
+ *     variant="ghost"`, which owns its padding, radius, hover and focus ring, so `.close`
+ *     carries placement and nothing else. The footer's two links are `next/link` anchors with no
+ *     `Button` nested inside them, so their appearance is the one piece of control chrome this
+ *     file does own.
+ *
+ * Two behaviours here are load-bearing and easy to undo by accident:
+ *
+ *   1. Page scrolling IS locked while the drawer is open, and not from here. The lock belongs to
+ *      `document.documentElement`, which is not in this module's tree and which no CSS Module
+ *      class can name, so `./CartDrawer.tsx` applies it as two inline declarations for exactly as
+ *      long as the sheet is showing - `overflow: hidden`, plus `scrollbar-gutter: stable` when it
+ *      measured a classic scrollbar before locking - and restores both on cleanup. The gutter half
+ *      is what answers the layout shift this storefront must not produce: the page's scrollbar
+ *      goes away with the lock, the space it occupied stays reserved, and nothing behind the scrim
+ *      moves. On a viewport with overlay scrollbars the measurement is zero and nothing is
+ *      reserved, because reserving anything there would create that shift rather than prevent it.
+ *      No rule here may add `overflow: hidden` to an ancestor or a padding compensation of its own:
+ *      a second lock would fight the component's, and the restore would put back only one of them.
+ *      `.body`'s `overscroll-behavior: contain` is still what keeps a scroll gesture from chaining
+ *      through to the page behind once the list reaches its end - with the page locked it can no
+ *      longer scroll the document, and it would still chain into the nearest scroll port.
+ *   2. `.overlay`'s `z-index: var(--ls-z-drawer, 40)` is this dialog's single stacking context.
+ *      It sits above the site header (`--ls-z-header` 30) and below the toast region
+ *      (`--ls-z-toast` 60), so a notice raised by a failed line mutation is never hidden behind
+ *      the drawer. Nothing below `.overlay` declares `position` or `z-index`, so no descendant
+ *      can open a competing context. Raising the drawer above the toast tier is not an available
+ *      fix for anything: the toast region documents the same contract from its own side.
+ *      The corner the two surfaces share is divided by reservation instead - `./CartDrawer.tsx`
+ *      publishes `.foot`'s measured height as `--ls-toast-inset-block-end` on `document.body`
+ *      while the sheet is open, and `../ui/ToastViewport.module.css` adds it to the notice
+ *      column's own block-end inset, so a notice stacks above this footer rather than over its
+ *      Checkout link. That reservation is a measurement of `.foot`, so a rule that changes the
+ *      footer's height needs nothing here, while one that takes it out of the layout flow (a
+ *      `position: absolute`, a transform that moves it) would publish a height the notice column
+ *      is no longer clear of.
+ */
+
+/* The scrim, and the flex row that anchors the sheet to the inline end of the viewport. */
+.overlay {
+  position: fixed;
+  z-index: var(--ls-z-drawer, 40);
+  display: flex;
+  justify-content: flex-end;
+  inset: 0;
+  /* The ink colour at 55%, mixed from the token rather than written out as a second, transparent
+   * copy of it, so the value stays declared in exactly one place. */
+  background: color-mix(in srgb, var(--ls-ink, #0f172a) 55%, transparent);
+  animation: overlay-fade-in 140ms ease-out;
+}
+
+/* The sheet itself: a three-row grid whose middle row is the only thing that scrolls.
+ *
+ * `--drawer-width` is file-local and built from the spacing scale, so the sheet's measure follows
+ * the same rhythm as its padding; `min()` then caps it at the viewport, which is what lets a
+ * 360px-wide phone show a full-width sheet with no horizontal overflow and no breakpoint of this
+ * module's own invention. */
+.panel {
+  --drawer-width: calc(var(--ls-space-6, 32px) * 13);
+
+  display: grid;
+  width: min(var(--drawer-width), 100%);
+  height: 100%;
+  /* `minmax(0, 1fr)` rather than the implicit `auto` column, for the same reason the global
+   * `.ls-split` utility writes it: an `auto` track takes its base size from its widest item's
+   * min-content width, so one long word in the head or a list row would widen all three rows past
+   * the sheet instead of being wrapped or truncated inside it. */
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: minmax(0, 1fr);
+  border-inline-start: 1px solid var(--ls-border, #cbd5e1);
+  background: var(--ls-surface, #ffffff);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+  /* The component focuses this container programmatically on open (`tabIndex={-1}`) to move the
+   * reader into the dialog, and the container is not itself a control, so the focus indicator
+   * would be noise around the whole sheet. This is the only outline suppression in the file:
+   * every control inside keeps the global `--ls-focus` ring, and the two footer anchors below
+   * restate it. */
+  outline: none;
+  animation: panel-slide-in 200ms ease-out;
+}
+
+/* Same suppression at a specificity that beats the global `:focus-visible` baseline, so the
+ * result does not depend on which stylesheet the bundler emits first. */
+.panel:focus-visible {
+  outline: none;
+}
+
+/* Title row: heading, count badge, then the close control pushed to the end. `min-width: 0` is the
+ * second half of the column pinning above - a grid item's automatic minimum size is its
+ * min-content width, so the three rows each waive it and let their own content wrap or truncate
+ * within the sheet. */
+.head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  padding-block: var(--ls-space-3, 12px);
+  padding-inline: var(--ls-space-4, 16px);
+}
+
+/* The dialog's accessible name; `aria-labelledby` on the panel points at this element.
+ *
+ * `min-width: 0` and the single-line truncation are what keep the row honest: a flex item's
+ * automatic minimum size is its min-content width, so without them a long heading would push the
+ * close control out past the sheet's inline edge and grow this row at the scrolling row's expense.
+ * Truncation is visual only; the heading keeps its full text, which is what `aria-labelledby`
+ * reads. */
+.title {
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Placement only - the ghost Button owns every other aspect of its appearance. */
+.close {
+  margin-inline-start: auto;
+}
+
+/* The middle grid row, and the sheet's one scroll container. `min-height: 0` is what makes a `1fr`
+ * row scroll instead of growing past the panel and pushing the footer out of view;
+ * `overscroll-behavior: contain` keeps the gesture inside the list once it bottoms out, and the
+ * block-end padding is the room the last row scrolls up into above the footer.
+ *
+ * Nothing inside it scrolls on its own: `CartLineList.module.css` declares no height cap and no
+ * overflow for its drawer arrangement, so the list is this row's content and a gesture anywhere
+ * over it moves this row and nothing else. A nested scroller would cut the last line at this
+ * row's edge and split one gesture between two regions.
+ *
+ * `scrollbar-gutter: stable` reserves the scrollbar's width whether or not the list is long enough
+ * to need one, so on a platform with space-taking scrollbars the rows do not shift sideways as
+ * lines come and go. This row owns its width and its vertical scroll and stops there: how a long
+ * product code or SKU inside a line row wraps or breaks is the list row's own module to decide,
+ * and clipping it from here would only hide it. */
+.body {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-block: var(--ls-space-3, 12px);
+  padding-inline: var(--ls-space-4, 16px);
+}
+
+/* Totals and the two actions, stacked. A fixed grid row, so it needs no `position: sticky` to
+ * stay visible while the list above it scrolls; the opaque background keeps a scrolled row from
+ * showing through.
+ *
+ * This block's height is measured by the component and published as the toast region's
+ * reservation (numbered note 2 above), so it stays in the grid's flow: whatever these paddings and
+ * the totals panel add up to is what the notice column is lifted clear of. */
+.foot {
+  display: grid;
+  min-width: 0;
+  gap: var(--ls-space-2, 8px);
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+  background: var(--ls-surface, #ffffff);
+  padding-block: var(--ls-space-3, 12px);
+  padding-inline: var(--ls-space-4, 16px);
+}
+
+/* The footer's `next/link` anchors. They are anchors, not buttons, and they wrap no button, so
+ * the whole treatment lives here: a full-width target with its label centred on both axes, sized
+ * from the spacing and type scales. The `min-height` is the spacing scale's way of writing 44px,
+ * which keeps each link a comfortable touch target even if the reader's font metrics make the
+ * label shorter than the padding suggests. */
+.checkoutLink,
+.cartLink {
+  display: flex;
+  min-height: calc(var(--ls-space-6, 32px) + var(--ls-space-3, 12px));
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--ls-radius-md, 8px);
+  padding-block: var(--ls-space-2, 8px);
+  padding-inline: var(--ls-space-4, 16px);
+  font-size: var(--ls-text-md, 15px);
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  text-decoration: none;
+  transition:
+    background-color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+/* Primary action: the brand accent as a fill, with ink as the label - the pairing the token
+ * contract sanctions (8.3:1), since the accent is never a text colour on a light surface. */
+.checkoutLink {
+  border-color: var(--ls-accent, #f59e0b);
+  background: var(--ls-accent, #f59e0b);
+  color: var(--ls-ink, #0f172a);
+}
+
+/* Secondary action: quiet, bordered, on the panel surface. */
+.cartLink {
+  border-color: var(--ls-border, #cbd5e1);
+  background: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+}
+
+/* Hover only where a pointer can actually hover, so a tap on a touch screen does not leave a
+ * sticky hover state behind. */
+@media (hover: hover) {
+  .checkoutLink:hover {
+    border-color: color-mix(in srgb, var(--ls-accent, #f59e0b) 86%, var(--ls-ink, #0f172a));
+    background: color-mix(in srgb, var(--ls-accent, #f59e0b) 86%, var(--ls-ink, #0f172a));
+  }
+
+  .cartLink:hover {
+    border-color: color-mix(in srgb, var(--ls-border, #cbd5e1) 55%, var(--ls-ink, #0f172a));
+    background: var(--ls-surface-sunken, #f8fafc);
+  }
+}
+
+/* Press feedback, which a touch reader gets too. */
+.checkoutLink:active {
+  border-color: color-mix(in srgb, var(--ls-accent, #f59e0b) 74%, var(--ls-ink, #0f172a));
+  background: color-mix(in srgb, var(--ls-accent, #f59e0b) 74%, var(--ls-ink, #0f172a));
+}
+
+.cartLink:active {
+  border-color: color-mix(in srgb, var(--ls-border, #cbd5e1) 55%, var(--ls-ink, #0f172a));
+  background: color-mix(in srgb, var(--ls-surface-sunken, #f8fafc) 88%, var(--ls-ink, #0f172a));
+}
+
+/* The keyboard focus ring, restated at the module's specificity because these two anchors are the
+ * controls this file styles. The colour is `--ls-focus`, the one focus colour the application
+ * uses, and the fallback repeats what `app/globals.css` declares for it. */
+.checkoutLink:focus-visible,
+.cartLink:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* Entrance: the scrim fades, the sheet slides in from the inline end. Both are short enough to
+ * read as the dialog arriving rather than as an animation to sit through. */
+@keyframes overlay-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes panel-slide-in {
+  from {
+    transform: translateX(100%);
+  }
+
+  to {
+    transform: none;
+  }
+}
+
+/* A reader who has asked for less motion gets the drawer already in place, and no colour
+ * cross-fade on the footer actions. State still changes; only the movement between states goes
+ * away. */
+@media (prefers-reduced-motion: reduce) {
+  .overlay,
+  .panel {
+    animation: none;
+    transform: none;
+  }
+
+  .checkoutLink,
+  .cartLink {
+    transition: none;
+  }
+}

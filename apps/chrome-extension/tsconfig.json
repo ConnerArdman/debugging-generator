@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "@debuggen/chrome-extension: one program covering the devtools page, the React panel, the module service worker, the content bridge, manifest.config.ts, vite.config.ts and test/**. Vite + @crxjs builds the shipped bundle into dist/; tsc does not.",
+
+  "// format": "Strict JSON, so notes are top-level `\"// …\"` keys, which TypeScript ignores; inside `compilerOptions` such a key is an error (TS5023).",
+
+  "// compilerOptions.emit": "Declaration-only emit into .tsbuild, never dist/, which a developer loads unpacked and Playwright passes to --load-extension. Emit stays enabled because tests/tsconfig.json references this project, and `tsc -b` rejects a referenced project that disables emit (TS6310).",
+
+  "// compilerOptions.rootDir": "\".\" because the inputs span src/, test/ and the two root-level configs.",
+
+  "// compilerOptions.lib": "ES2023 plus DOM and DOM.Iterable (`lib` replaces the base array): every surface, the service worker included, runs in a browser context. No \"WebWorker\": its declarations conflict with DOM's (TS6200, silenced only by the inherited `skipLibCheck`), and the service worker needs nothing beyond `chrome.*` and the DOM-typed globals.",
+
+  "// compilerOptions.types": "\"chrome\" for the `chrome.*` namespace. \"node\" serves only manifest.config.ts, vite.config.ts and test/**, but `types` applies program-wide, so the rule for src/** is kept by review: code bundled into browser contexts uses no `node:*` builtin, `process`, `Buffer` or `@debuggen/shared/node`.",
+
+  "// compilerOptions.jsx": "Restates the base's \"react-jsx\" because the panel is written in .tsx.",
+
+  "// compilerOptions.module": "`module`/`moduleResolution` are not overridden: bundler resolution matches Vite's resolver, and relative specifiers in src/** and test/** are extensionless.",
+
+  "// compilerOptions.allowImportingTsExtensions": "true for vite.config.ts alone, which imports ./manifest.config.ts with its extension: Vite's `native` config loader runs the config through Node's ESM resolver, which never adds an extension, and the default loader warns on every build about an extensionless relative import. Legal only because this program emits declarations only (`emitDeclarationOnly`); keep src/** and test/** extensionless.",
+
+  "// compilerOptions.resolveJsonModule": "Inherited but unused: test/manifest.test.ts reads the built dist/manifest.json at runtime instead of importing it, so a build artefact never becomes a program input.",
+
+  "// compilerOptions.allowJs": "Inherited false: public/agent.iife.js is the telemetry agent that scripts/copy-agent.mjs copies from packages/telemetry/dist, never a program input.",
+
+  "// compilerOptions.not-set": "No `paths`/`baseUrl`: workspace packages resolve through the pnpm symlink and each package's `exports` map. Vite follows its runtime conditions into dist/; tsc follows its source-first `types` condition to src/ (docs/ARCHITECTURE.md §3).",
+
+  "// include": "src/** and test/** in .ts and .tsx, plus manifest.config.ts, the manifest's permission and content-script contract, and vite.config.ts. The .html entry pages are Vite inputs, not program inputs.",
+
+  "// exclude": "`exclude` replaces the base list, so dist, .tsbuild and node_modules are repeated; public/ holds copied assets, never sources.",
+
+  "// references": "shared, telemetry, panel-schema, panel-renderer and protocol; they order the build, and `tsc -b` type-checks this program against their .tsbuild declarations, so `pnpm typecheck` never reads a stale dist/. Never add code-analysis, model-provider or instrumentation, which are service-side, or any apps/* workspace, which is reached over the wire or not at all.",
+
+  "extends": "../../tsconfig.base.json",
+
+  "compilerOptions": {
+    "composite": true,
+
+    "rootDir": ".",
+
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo",
+
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+
+    "types": ["chrome", "node"],
+
+    "jsx": "react-jsx",
+
+    "allowImportingTsExtensions": true
+  },
+
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx",
+    "manifest.config.ts",
+    "vite.config.ts"
+  ],
+
+  "exclude": ["dist", ".tsbuild", "node_modules", "public"],
+
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/telemetry" },
+    { "path": "../../packages/panel-schema" },
+    { "path": "../../packages/panel-renderer" },
+    { "path": "../../packages/protocol" }
+  ]
+}

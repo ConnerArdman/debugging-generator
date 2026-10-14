@@ -1,0 +1,671 @@
+/**
+ * The data-transfer shapes the Lumen Supply storefront is built on.
+ *
+ * Every route handler response, every route handler request body and every
+ * value that crosses the boundary from a server component into a client
+ * component is described here, so the server layer, the route handlers, the
+ * pages and the React tree all speak one vocabulary. The module has no imports
+ * and no runtime behaviour - nothing here reads a request, a database or the
+ * environment - which is what lets a browser component and a database-backed
+ * service share it.
+ *
+ * Four conventions hold throughout, and they are why the shapes below do not
+ * simply re-export the database models:
+ *
+ * 1. **Money is an integer number of US cents.** Every monetary field is a
+ *    plain `number` whose name ends in `Cents`. Integer cents neither
+ *    accumulate the rounding error a floating-point currency amount does nor
+ *    need a decimal type to survive arithmetic.
+ * 2. **Timestamps are ISO-8601 strings in UTC** — exactly what
+ *    `Date.prototype.toISOString()` produces. Consumers render them with an
+ *    explicitly pinned locale and time zone.
+ * 3. **Nothing appears here that JSON cannot carry**: no `Date`, no `Decimal`,
+ *    no `bigint`, no class instance. Those values are converted once, at the
+ *    service boundary, because everything below is serialized on its way from
+ *    a server component to a client component and from a route handler to the
+ *    browser.
+ * 4. **A bound both sides must hold to travels with the shapes.** The module is
+ *    types with two exceptions, {@link MAX_SHIPMENT_UNITS} and
+ *    {@link MAX_PAYMENT_CENTS}, and the exceptions are the point: a request one
+ *    side may not send and a request the other side refuses are the same rule,
+ *    and a rule stated twice is a rule that drifts.
+ *    A bound is admitted here only when both sides must act on the figure
+ *    itself; a *shape* - what a postal code looks like, what an email is - stays
+ *    each surface's own, because a shape is checked where a value arrives and
+ *    never has to be quoted back to a customer.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Unions
+ * ------------------------------------------------------------------------- */
+
+/** Lifecycle of an order, mirroring the `order_status` database enum. */
+export type OrderStatus = 'PENDING' | 'PAID' | 'FULFILLED' | 'CANCELLED';
+
+/** Why an inventory movement was recorded, mirroring the `movement_type` database enum. */
+export type MovementType = 'RECEIPT' | 'SHIPMENT' | 'ADJUSTMENT' | 'TRANSFER' | 'RESERVATION';
+
+/** Lifecycle of a cart, mirroring the `cart_status` database enum. */
+export type CartStatus = 'ACTIVE' | 'CONVERTED' | 'ABANDONED';
+
+/**
+ * How freely a product can be sold right now.
+ *
+ * It is a presentation state the server derives from the stock on hand, the
+ * units already promised and the product's reorder point — not a stored column.
+ * The product stock badge and the dashboard's low-stock list both read it so
+ * neither has to re-apply a threshold of its own.
+ */
+export type StockState = 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK';
+
+/** Orderings the catalog listing accepts; `featured` is the server's default. */
+export type CatalogSort = 'featured' | 'price_asc' | 'price_desc' | 'name_asc';
+
+/**
+ * The machine-readable failure reason carried by {@link StorefrontErrorBody}.
+ *
+ * `NETWORK_FAILURE` and `MALFORMED_RESPONSE` are produced only by the browser
+ * client — the exchange did not complete, or the response was not the JSON the
+ * caller expected — and a route handler never returns either. Neither says the
+ * request went unserved: a reply can be lost or unreadable after the server has
+ * acted on it, so for a request that changes something they mean "unknown",
+ * which is why the browser client also records whether the reason it carries was
+ * the server's own.
+ *
+ * One member is a statement about money rather than about a request, and the
+ * checkout surfaces depend on it: `PAYMENT_STATUS_UNKNOWN` is the single code
+ * with which the storefront cannot rule out that an amount was authorized —
+ * the processor was sent one and did not answer readably, or it approved one
+ * and the order behind it could not be completed. **Every other code a checkout
+ * returns means no amount was captured**, which is what lets a customer be told
+ * plainly whether to place the order again. A caller that treats an unknown
+ * outcome as a definite one is stating something the server did not.
+ */
+export type StorefrontErrorCode =
+  | 'VALIDATION_FAILED'
+  | 'NOT_FOUND'
+  | 'OUT_OF_STOCK'
+  | 'CART_CONFLICT'
+  | 'PAYMENT_DECLINED'
+  | 'PAYMENT_STATUS_UNKNOWN'
+  | 'INTERNAL_ERROR'
+  | 'NETWORK_FAILURE'
+  | 'MALFORMED_RESPONSE';
+
+/* ---------------------------------------------------------------------------
+ * Envelopes and errors
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One page of a listing response.
+ *
+ * `page` is 1-based, and `total` counts every row the filter matched rather than
+ * the rows in `items`, so a caller can size a pager without a second request.
+ */
+export type PagedList<T> = {
+  items: T[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
+/**
+ * The body a route handler returns when it fails, and the body the browser
+ * client parses to build an error state.
+ *
+ * `details` is the one deliberately unshaped value in this module: a validation
+ * failure attaches the field paths it rejected, and a consumer must narrow the
+ * value before reading it instead of trusting a shape the server may widen.
+ */
+export interface StorefrontErrorBody {
+  error: {
+    code: StorefrontErrorCode;
+    message: string;
+    details?: unknown;
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * Catalog
+ * ------------------------------------------------------------------------- */
+
+/** A category as the catalog's filter chips list it. */
+export interface CategoryOption {
+  id: string;
+  name: string;
+  slug: string;
+  productCount: number;
+}
+
+/** An image together with the alternative text a screen reader announces for it. */
+export interface ProductImage {
+  url: string;
+  alt: string;
+}
+
+/** One labelled row of a product's specification table. */
+export interface ProductSpec {
+  label: string;
+  value: string;
+}
+
+/**
+ * A product as a catalog card presents it: enough to price it, badge its stock
+ * and link to its detail page, and deliberately nothing more.
+ */
+export interface ProductSummary {
+  id: string;
+  sku: string;
+  slug: string;
+  name: string;
+  categoryName: string;
+  categorySlug: string;
+  /** What the customer pays today, in cents. */
+  priceCents: number;
+  /** The undiscounted price in cents, or `null` when the product is not discounted. */
+  listPriceCents: number | null;
+  imageUrl: string | null;
+  stockState: StockState;
+  /** Units available to promise, summed across every warehouse. */
+  availableQuantity: number;
+}
+
+/**
+ * A product as its detail page presents it: the catalog payload plus the copy,
+ * the media, the specification rows and the per-warehouse stock behind the
+ * badge.
+ */
+export interface ProductDetail extends ProductSummary {
+  description: string;
+  images: ProductImage[];
+  specs: ProductSpec[];
+  /** Business days between an order being placed and the product being dispatched. */
+  leadTimeDays: number;
+  /** Stock per warehouse; see {@link InventoryLevelRow}. */
+  availability: InventoryLevelRow[];
+  updatedAt: string;
+}
+
+/**
+ * The query parameters the catalog listing accepts.
+ *
+ * Every field is optional, and a caller omits the ones it does not constrain:
+ * this workspace compiles with `exactOptionalPropertyTypes`, so an unconstrained
+ * parameter is an absent key rather than a key holding `undefined`.
+ */
+export interface CatalogQuery {
+  categorySlug?: string;
+  search?: string;
+  sort?: CatalogSort;
+  /** 1-based page number; the server applies its default when omitted. */
+  page?: number;
+  pageSize?: number;
+}
+
+/* ---------------------------------------------------------------------------
+ * Inventory
+ * ------------------------------------------------------------------------- */
+
+/** A stocking location, as the dashboard's warehouse filter lists it. */
+export interface WarehouseSummary {
+  id: string;
+  code: string;
+  name: string;
+  region: string;
+}
+
+/**
+ * Stock for one product at one warehouse.
+ *
+ * `available` is `onHand - reserved`: reserved units are still on the shelf but
+ * already promised to an order, so only the available ones may be sold again.
+ *
+ * `reorderPoint` is the level this line is restocked at, at this warehouse, and
+ * it is what makes the row self-describing: a line is out of stock when nothing
+ * is available, low when the available units have fallen to the point (plus
+ * whatever headroom the reader asked to allow for), and in stock above it. A
+ * consumer that classified a line by the product's own selling state instead
+ * would be reading a figure summed across every warehouse and measured against
+ * no headroom, which is a different question than the one a row answers.
+ */
+export interface InventoryLevelRow {
+  warehouseId: string;
+  warehouseName: string;
+  productId: string;
+  onHand: number;
+  reserved: number;
+  available: number;
+  reorderPoint: number;
+}
+
+/**
+ * One recorded change to stock, in the columns the movements table keeps.
+ *
+ * `quantityDelta` is signed — a receipt adds units and a shipment removes them —
+ * and `reference` names the document behind the movement when there is one.
+ */
+export interface InventoryMovementRow {
+  id: string;
+  productId: string;
+  warehouseId: string;
+  quantityDelta: number;
+  movementType: MovementType;
+  reference: string | null;
+  createdAt: string;
+}
+
+/** A product sitting at or below its reorder point at one warehouse. */
+export interface LowStockRow {
+  productId: string;
+  sku: string;
+  productName: string;
+  warehouseName: string;
+  available: number;
+  reorderPoint: number;
+}
+
+/**
+ * The inventory dashboard's payload: totals across every warehouse, the
+ * warehouses themselves, one page of stock lines and the rows the low-stock
+ * list renders.
+ *
+ * `movementVolume` is the units the recorded stock changes account for, counting
+ * a receipt and a shipment alike as the units they moved. It reads as
+ * throughput rather than as a balance, which is why it is far larger than
+ * `totalOnHand` and why nothing is subtracted from it.
+ *
+ * `generatedAt` is the instant the server computed the totals, which the page
+ * prints so a reader can tell how current the figures are.
+ */
+export interface InventorySummary {
+  totalSkus: number;
+  totalOnHand: number;
+  totalReserved: number;
+  lowStockCount: number;
+  movementVolume: number;
+  warehouses: WarehouseSummary[];
+
+  /**
+   * One page of the individual stock lines the filters matched - a product at a
+   * stocking location - as the dashboard's table renders them.
+   *
+   * `total` counts every line the filters matched rather than the lines on the
+   * page, and `page`/`pageSize` are the window the answer was built with, so
+   * the table's pager is sized from the payload rather than from the address
+   * bar. A page number past the end of the listing is answered as an empty page
+   * rather than as a failure.
+   */
+  levels: PagedList<InventoryLevelRow>;
+
+  /**
+   * The catalog entries naming the products on that page of stock lines,
+   * matched by `id`.
+   *
+   * A stock line names its product by identifier only, and the table needs a
+   * name, a code, a unit price and the category to group under; they are
+   * carried here rather than folded into {@link InventoryLevelRow} because one
+   * product holds several lines, and because the same row shape is what a
+   * product's own detail page lists its per-location stock with. A line whose
+   * product is missing from this list still renders, identified by the
+   * identifier it carries.
+   */
+  levelProducts: ProductSummary[];
+
+  /**
+   * The lines at or below their reorder point, most urgent first, bounded to
+   * the most urgent few rather than paged: this is a list of what to act on
+   * today, and `lowStockCount` above is the number of lines the filters matched
+   * in total.
+   */
+  lowStock: LowStockRow[];
+
+  generatedAt: string;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cart
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One line of a cart.
+ *
+ * `unitPriceCents` is the price the line was captured at, and `lineTotalCents`
+ * is that price taken `quantity` times. Both are computed by the server, so no
+ * consumer multiplies money of its own.
+ */
+export interface CartLine {
+  id: string;
+  productId: string;
+  sku: string;
+  slug: string;
+  name: string;
+  imageUrl: string | null;
+  quantity: number;
+  unitPriceCents: number;
+  lineTotalCents: number;
+}
+
+/**
+ * A cart as every consumer reads it.
+ *
+ * The contents are `lines`, which reads the same in the cart drawer, the header
+ * badge and the checkout summary; `itemCount` is the quantity summed across
+ * those lines rather than the number of lines.
+ */
+export interface CartView {
+  id: string;
+  status: CartStatus;
+  lines: CartLine[];
+  itemCount: number;
+  subtotalCents: number;
+  updatedAt: string;
+}
+
+/** The request body that puts a quantity of one product into the cart. */
+export interface CartItemDraft {
+  productId: string;
+  quantity: number;
+}
+
+/**
+ * The request body that sets one line of the cart to an exact quantity.
+ *
+ * `lineId` is the {@link CartLine.id} the server published rather than a
+ * product identifier: a cart holds one line per product, and a line is the
+ * thing a shopper changes the quantity of.
+ *
+ * `quantity` is the number of units the line holds afterwards, not a delta, so
+ * the same request applied twice leaves the cart where one application left it.
+ * It is at least one unit, because a line of nothing is a line that is gone and
+ * removing one is {@link CartLineRemoval}'s job.
+ */
+export interface CartLineQuantityDraft {
+  lineId: string;
+  quantity: number;
+}
+
+/** The request body that takes one line, named by its {@link CartLine.id}, out of the cart. */
+export interface CartLineRemoval {
+  lineId: string;
+}
+
+/**
+ * Every change `POST /api/cart/items` accepts, tagged by the change being asked
+ * for.
+ *
+ * The four members are the cart's whole write surface: add units of a product,
+ * set a line to a quantity, take one line out, and take every line out. They
+ * share one endpoint because a cart's contents are one resource, and each of
+ * them is answered with the same authoritative {@link CartView} — so a browser
+ * that changed the cart never has to work out what the cart now holds, and the
+ * prices and totals it displays remain the server's.
+ *
+ * `operation` is a literal on every member, which makes the union
+ * discriminated: a body that omits the tag or invents a value is refused by the
+ * endpoint's schema instead of being treated as some other change, and the
+ * server switches on a value the compiler has already narrowed to one shape.
+ */
+export type CartMutation =
+  | ({ operation: 'add' } & CartItemDraft)
+  | ({ operation: 'set' } & CartLineQuantityDraft)
+  | ({ operation: 'remove' } & CartLineRemoval)
+  | { operation: 'empty' };
+
+/* ---------------------------------------------------------------------------
+ * Checkout and orders
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The request body that turns the cart into an order.
+ *
+ * It carries no cart identifier on purpose: the cart belongs to the browser's
+ * own session and the server resolves it from the storefront's cookie, so a
+ * caller can neither name nor guess somebody else's. `shippingOptionId` echoes
+ * back the {@link ShippingOption} the customer chose, and `notes` is `null`
+ * when they left the field empty.
+ */
+export interface CheckoutDraft {
+  contact: CustomerContact;
+  shippingAddress: ShippingAddress;
+  shippingOptionId: string;
+  notes: string | null;
+
+  /**
+   * What the caller calls this attempt to place the order — its own value, kept
+   * for as long as the attempt is unresolved and sent again with every retry of
+   * it.
+   *
+   * Placing an order is not a repeatable request: a reply that is lost on the
+   * way back leaves the caller unable to tell a request that never arrived from
+   * one that placed an order and charged for it. Sending the same value again is
+   * how a caller says "this is that attempt, not another one", and the endpoint
+   * answers a repeat with the order the attempt already placed - see
+   * {@link CheckoutResult.outcome} - rather than placing a second one. A new
+   * order is a new value.
+   *
+   * It identifies nothing but the attempt: it is the caller's to mint, carries
+   * no cart, customer or session identity, and the server reads no meaning from
+   * its content.
+   */
+  idempotencyKey: string;
+}
+
+/**
+ * Which of the two things a successful checkout response describes.
+ *
+ * `placed` is an order this request wrote. `already_placed` is the order the
+ * attempt named by {@link CheckoutDraft.idempotencyKey} had already written -
+ * the answer to a retry whose first reply was lost - so a caller can say so
+ * instead of reporting a second sale that did not happen.
+ */
+export type CheckoutOutcome = 'placed' | 'already_placed';
+
+/** One line of a placed order, priced as it stood when the order was placed. */
+export interface OrderLine {
+  id: string;
+  productId: string;
+  sku: string;
+  name: string;
+  quantity: number;
+  unitPriceCents: number;
+  lineTotalCents: number;
+}
+
+/**
+ * An order as the order list renders it.
+ *
+ * The breakdown reconciles:
+ * `subtotalCents - discountCents + shippingCents + taxCents === totalCents`.
+ */
+export interface OrderSummary {
+  id: string;
+  orderNumber: string;
+  status: OrderStatus;
+  placedAt: string;
+  itemCount: number;
+  subtotalCents: number;
+  discountCents: number;
+  shippingCents: number;
+  taxCents: number;
+  totalCents: number;
+}
+
+/**
+ * An order as the confirmation screen and the order detail view render it: the
+ * list payload plus its lines, the service it ships by, where it ships to and
+ * what the buyer asked the packers to know.
+ *
+ * `shippingOption` is `null` for an order whose chosen service was not
+ * recorded. `notes` is `null` when the buyer left the delivery notes empty, and
+ * for an order written without a collected contact or destination;
+ * `shippingAddress` reads back with empty fields for such an order, which says
+ * the store does not know where that order went rather than inventing a
+ * destination for it.
+ */
+export interface OrderDetail extends OrderSummary {
+  lines: OrderLine[];
+  shippingOption: ShippingOption | null;
+  contact: CustomerContact;
+  shippingAddress: ShippingAddress;
+  notes: string | null;
+}
+
+/**
+ * The response body of a completed checkout: the order created and how its
+ * payment resolved.
+ *
+ * `payment` is `null` in one situation only, and it is not an incomplete order:
+ * an `already_placed` result read back from the store's own record carries the
+ * order as it stands, and the authorization that paid for it is not retained
+ * with it, so the order's `status` is what says whether it is paid.
+ */
+export interface CheckoutResult {
+  order: OrderDetail;
+  payment: PaymentAuthorization | null;
+  outcome: CheckoutOutcome;
+}
+
+/* ---------------------------------------------------------------------------
+ * Shipping and payment
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The most units the carriers this store sells rate as one shipment.
+ *
+ * It is a refusal rather than a cap, and that is why the figure is published
+ * here rather than kept behind the endpoint that enforces it. A consignment of
+ * more units than this travels as more than one shipment and is quoted once per
+ * shipment, so `GET /api/shipping/quote` answers a larger count with 400 rather
+ * than rating the first five hundred pieces of it — and a rate taken on fewer
+ * pieces than travel is the price of a shipment nobody is sending.
+ *
+ * Three surfaces hold to it and all three read it from here, because a client
+ * that guessed it wrong would either send a request already known to be refused
+ * or quietly quote the wrong shipment: the browser gates on it before it asks
+ * for a quote (`useFreightQuote` in `@/hooks/useShippingEta`, which reports an
+ * over-ceiling cart to the checkout form instead of asking), the endpoint's
+ * query schema bounds `itemCount` by it (`@/server/validation/shipping`), and
+ * the stand-in carrier's body schema states the same ceiling for the pieces it
+ * will rate (`@/server/validation/mocks`). The shipping service applies it once
+ * more against the values it hands the carrier, so a caller that reaches it by
+ * another route is refused there too.
+ */
+export const MAX_SHIPMENT_UNITS = 500;
+
+/**
+ * The largest amount, in US cents, the store's payment processor authorizes in
+ * one payment: 100 000 000 cents, which is $1,000,000.00.
+ *
+ * Like {@link MAX_SHIPMENT_UNITS} it is a refusal rather than a cap - an order
+ * above it is not charged in part - and it is published here because three
+ * surfaces have to agree on it, and a surface that guessed it wrong would turn
+ * a refusal that says what to change into one that says nothing. The stand-in
+ * processor's body schema bounds `amountCents` by it (`@/server/validation/
+ * mocks`); the payment service refuses a larger amount itself, before anything
+ * is sent (`@/server/services/payment.service`), so the checkout answers with
+ * the validation failure it is and returns the cart to its session untouched
+ * rather than reporting a processor that turned the request away; and the
+ * checkout form names the figure in the copy it shows for that answer, so a
+ * buyer is told to reduce the order rather than to try again.
+ *
+ * The browser does not gate on it before submitting, because it cannot: the
+ * amount charged is the total the server prices - promotions, freight and all
+ * - when the order is placed, which no figure on the page is guaranteed to
+ * equal.
+ */
+export const MAX_PAYMENT_CENTS = 100_000_000;
+
+/**
+ * A destination address. `line2` holds `null` rather than being absent when the
+ * customer leaves it blank, so the shape is the same on the way in and out.
+ */
+export interface ShippingAddress {
+  line1: string;
+  line2: string | null;
+  city: string;
+  region: string;
+  postalCode: string;
+  country: string;
+}
+
+/** Who is buying. `company` is `null` for a customer purchasing as an individual. */
+export interface CustomerContact {
+  name: string;
+  email: string;
+  company: string | null;
+}
+
+/**
+ * One shipping service offered at checkout.
+ *
+ * `id` is what {@link CheckoutDraft} sends back, `label` is the wording the
+ * picker shows, and `estimatedDays` is transit time in business days.
+ */
+export interface ShippingOption {
+  id: string;
+  carrier: string;
+  service: string;
+  label: string;
+  priceCents: number;
+  estimatedDays: number;
+}
+
+/**
+ * The response body of a shipping quote.
+ *
+ * The name ends in `Result` so a server module can hold it beside the persisted
+ * quote model without having to alias either name.
+ *
+ * `id` names the quote the store recorded for the service it offered, so a
+ * checkout can put the order it places on the very quote its customer chose
+ * rather than on whichever quote was taken most recently. It is `null` for a
+ * quote the store did not record, which is either of two cases: nothing was on
+ * offer, so there was no rate to record, or the quote was taken for a
+ * destination rather than for a cart - the checkout form's own lookup, which is
+ * a question asked and answered and not a commitment either side keeps.
+ *
+ * The destination is echoed as both of its halves, because a rate means nothing
+ * without them: `44301` is one place in the United States and another in
+ * Mexico, and the two are quoted differently. A caller comparing what it asked
+ * for with what it was answered therefore compares the pair.
+ */
+export interface ShippingQuoteResult {
+  id: string | null;
+  options: ShippingOption[];
+  destinationPostalCode: string;
+  destinationCountry: string;
+  quotedAt: string;
+}
+
+/**
+ * How the payment behind a checkout resolved.
+ *
+ * `reference` is the processor's identifier for the attempt, and `declineReason`
+ * carries the wording to show the customer when `authorized` is `false`; it is
+ * `null` on an approval.
+ */
+export interface PaymentAuthorization {
+  authorized: boolean;
+  reference: string;
+  amountCents: number;
+  processedAt: string;
+  declineReason: string | null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Recommendations
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One product suggested alongside another. `reason` is the short human wording
+ * the rail prints beneath the tile to say why it is being suggested.
+ */
+export interface RecommendationItem {
+  productId: string;
+  sku: string;
+  slug: string;
+  name: string;
+  priceCents: number;
+  imageUrl: string | null;
+  reason: string;
+}

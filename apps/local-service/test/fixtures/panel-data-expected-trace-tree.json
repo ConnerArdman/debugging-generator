@@ -1,0 +1,154 @@
+{
+  "description": "Expected `trace` result of POST /sessions/:id/panel-data for `query` once every event of telemetry-trace-cross-tier.json is ingested into one capture: the response is exactly { source, trace } with trace a TraceTree and no paging echo (`paged` is false, so `total` and `nextOffset` must be absent). Node entries use the TraceNode vocabulary: `spanId`, `eventId`, `kind` and `tier` are the node's `event.spanId`, `event.id`, `event.kind` and `event.tier`; `depth`, `orphaned`, `orphanReason`, `missingParentSpanId`, `lineage` and `children` are the node's own properties, each optional one listed only where the correlator sets it. `expectedPreOrderSpanIds` is the flattenTrace depth-first pre-order produced by running correlateTrace over the fixture: parent before child, placed siblings by ascending startTime (then producerId, seq, ingestSeq), and repaired orphans appended after the primary root's placed children, which is why 0000000000000a09 (startTime 1789819201000) follows 0000000000000a08 (startTime 1789819201175.5). The render 0000000000000a07 is the async-continuation child of the settled fetch 0000000000000a02, not of the interaction. The db.query 0000000000000a09 names parent 0000000000000aff, which is no event's spanId, so it is kept, flagged `orphaned` (CORRELATION_ATTRIBUTE_KEYS[0]) with orphanReason `missing-parent`, and attached at depth 1 as the last child of the root, never dropped and never wrapped in a synthetic node.",
+  "fixture": "telemetry-trace-cross-tier.json",
+  "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+  "query": {
+    "source": "trace",
+    "filter": {
+      "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e"
+    }
+  },
+  "paged": false,
+  "expectedResultKeys": ["source", "trace"],
+  "expectedNodeCount": 9,
+  "expectedRootCount": 1,
+  "expectedRootSpanId": "0000000000000a01",
+  "expectedTreeAggregates": {
+    "maxDepth": 5,
+    "orphanCount": 1,
+    "startTime": 1789819200000,
+    "endTime": 1789819201179,
+    "totalDuration": 1179,
+    "tiers": ["browser", "server", "db"],
+    "kinds": [
+      "interaction",
+      "render",
+      "commit",
+      "fetch",
+      "http.server",
+      "route.handler",
+      "function",
+      "db.query"
+    ],
+    "producerIds": ["prd_browser000000001", "prd_server0000000001"],
+    "duplicateSpanIds": [],
+    "truncated": false
+  },
+  "expectedPreOrderSpanIds": [
+    "0000000000000a01",
+    "0000000000000a02",
+    "0000000000000a03",
+    "0000000000000a04",
+    "0000000000000a05",
+    "0000000000000a06",
+    "0000000000000a07",
+    "0000000000000a08",
+    "0000000000000a09"
+  ],
+  "expectedTree": {
+    "spanId": "0000000000000a01",
+    "eventId": "evt_ct00000000000001",
+    "kind": "interaction",
+    "tier": "browser",
+    "depth": 0,
+    "orphaned": false,
+    "children": [
+      {
+        "spanId": "0000000000000a02",
+        "eventId": "evt_ct00000000000002",
+        "kind": "fetch",
+        "tier": "browser",
+        "depth": 1,
+        "orphaned": false,
+        "children": [
+          {
+            "spanId": "0000000000000a03",
+            "eventId": "evt_ct00000000000003",
+            "kind": "http.server",
+            "tier": "server",
+            "depth": 2,
+            "orphaned": false,
+            "children": [
+              {
+                "spanId": "0000000000000a04",
+                "eventId": "evt_ct00000000000004",
+                "kind": "route.handler",
+                "tier": "server",
+                "depth": 3,
+                "orphaned": false,
+                "children": [
+                  {
+                    "spanId": "0000000000000a05",
+                    "eventId": "evt_ct00000000000005",
+                    "kind": "function",
+                    "tier": "server",
+                    "depth": 4,
+                    "orphaned": false,
+                    "children": [
+                      {
+                        "spanId": "0000000000000a06",
+                        "eventId": "evt_ct00000000000006",
+                        "kind": "db.query",
+                        "tier": "db",
+                        "depth": 5,
+                        "orphaned": false,
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "spanId": "0000000000000a07",
+            "eventId": "evt_ct00000000000007",
+            "kind": "render",
+            "tier": "browser",
+            "depth": 2,
+            "orphaned": false,
+            "lineage": {
+              "value": "async-continuation",
+              "ambiguous": false,
+              "candidateSpanIds": []
+            },
+            "children": []
+          }
+        ]
+      },
+      {
+        "spanId": "0000000000000a08",
+        "eventId": "evt_ct00000000000008",
+        "kind": "commit",
+        "tier": "browser",
+        "depth": 1,
+        "orphaned": false,
+        "children": []
+      },
+      {
+        "spanId": "0000000000000a09",
+        "eventId": "evt_ct00000000000009",
+        "kind": "db.query",
+        "tier": "db",
+        "depth": 1,
+        "orphaned": true,
+        "orphanReason": "missing-parent",
+        "missingParentSpanId": "0000000000000aff",
+        "children": []
+      }
+    ]
+  },
+  "expectedOrphans": [
+    {
+      "spanId": "0000000000000a09",
+      "eventId": "evt_ct00000000000009",
+      "missingParentSpanId": "0000000000000aff",
+      "attachedTo": "root",
+      "attachedToSpanId": "0000000000000a01",
+      "childIndex": 2,
+      "depth": 1,
+      "orphanReason": "missing-parent",
+      "flagAttribute": "orphaned"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Product placeholder</title>
+  <!-- Fallback for products without artwork, with no error mark: a missing image reads as a
+       product. Every tile here shares this panel, shelf, view box and intrinsic size, so tiles
+       referenced by path swap without reflow. Colours are explicit hex, as an img inherits none.
+       Mist stays background and amber only fills outlines: neither reads on the panel alone. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M124 132 L144 112 H296 L276 132" stroke="#475569" stroke-width="6" />
+    <path d="M200 132 L220 112" stroke="#475569" stroke-width="6" />
+    <rect x="116" y="132" width="168" height="92" rx="8" stroke="#0F172A" stroke-width="8" />
+    <path d="M200 140 V216" stroke="#475569" stroke-width="6" />
+    <rect x="140" y="176" width="48" height="30" rx="6" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>

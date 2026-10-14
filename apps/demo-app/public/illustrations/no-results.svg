@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" width="240" height="180" role="img">
+  <title>No results found</title>
+  <!-- Shares its view box and intrinsic size with the other two illustrations here. It serves a
+       search with no matches and a healthy, empty low-stock list, so it stays neutral: no warning
+       marks, no alarm colour. The lower margin stays clear for the page's caption; all copy and
+       alt text belong to the page. -->
+  <defs>
+    <linearGradient id="lens-face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8FAFC" />
+      <stop offset="1" stop-color="#CBD5E1" />
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 147 H160" stroke="#CBD5E1" stroke-width="3.5" />
+    <path d="M64 138 V147 M140 138 V147" stroke="#CBD5E1" stroke-width="3.5" />
+    <rect x="52" y="80" width="100" height="58" rx="6" fill="#F8FAFC" stroke="#475569" stroke-width="3.5" />
+    <path d="M55.5 109 H148.5 M102 83.5 V134.5" stroke="#CBD5E1" stroke-width="3.5" />
+    <path d="M176.3 80.3 L199 103" stroke="#F59E0B" stroke-width="4" />
+    <circle cx="160" cy="64" r="25" fill="url(#lens-face)" stroke="#475569" stroke-width="3.5" />
+  </g>
+</svg>

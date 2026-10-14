@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" width="240" height="180" role="img">
+  <title>No orders yet</title>
+  <!-- Shares its view box and intrinsic size with the other two illustrations here. It stays calm:
+      no warning marks, no alarm colour. The lower margin stays clear for the page's caption; all
+      copy and alt text belong to the page. -->
+  <defs>
+    <linearGradient id="slip-face" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" />
+      <stop offset="1" stop-color="#F8FAFC" />
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="78" y1="147" x2="162" y2="147" stroke="#CBD5E1" stroke-width="3.5" />
+    <rect x="69" y="40" width="82" height="94" rx="7" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="3" transform="rotate(-9 120 87)" />
+    <rect x="89" y="40" width="82" height="94" rx="7" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="3" transform="rotate(9 120 87)" />
+    <rect x="73" y="34" width="94" height="104" rx="9" fill="url(#slip-face)" stroke="#475569" stroke-width="3.5" />
+    <line x1="91" y1="64" x2="149" y2="64" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="84" x2="133" y2="84" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="104" x2="149" y2="104" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="122" x2="121" y2="122" stroke="#CBD5E1" stroke-width="3.5" />
+  </g>
+  <g fill="#0F766E">
+    <rect x="112" y="19" width="16" height="8" rx="3.5" />
+    <rect x="103" y="25" width="34" height="15" rx="4.5" />
+  </g>
+  <circle cx="120" cy="32.5" r="2.5" fill="#0F172A" />
+</svg>

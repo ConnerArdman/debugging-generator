@@ -1,0 +1,962 @@
+[
+  {
+    "id": "evt_rs00000000000001",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b01",
+    "kind": "interaction",
+    "name": "click TrailFilter chip",
+    "startTime": 1789819200000,
+    "duration": 620,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click",
+      "target.selector": "#trail-filter-difficulty",
+      "target.tagName": "button",
+      "target.text": "Strenuous",
+      "componentChain": ["TrailList", "TrailFilterProvider"],
+      "interactionId": 5108,
+      "inputDelay": 1.5,
+      "processingStart": 1789819200001.5,
+      "processingEnd": 1789819200009.25
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 1
+  },
+  {
+    "id": "evt_rs00000000000002",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b02",
+    "parentSpanId": "0000000000000b01",
+    "kind": "state",
+    "name": "state TrailFilterProvider.difficulty",
+    "startTime": 1789819200012,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "hookIndex": 0,
+      "hookLabel": "useState:difficulty",
+      "previousValue": {
+        "type": "string",
+        "preview": "any",
+        "truncated": false
+      },
+      "nextValue": {
+        "type": "string",
+        "preview": "strenuous",
+        "truncated": false
+      },
+      "triggerEventId": "evt_rs00000000000001"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 2,
+    "source": {
+      "file": "src/providers/TrailFilterProvider.tsx",
+      "line": 37,
+      "column": 39,
+      "symbol": "TrailFilterProvider",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000003",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b03",
+    "parentSpanId": "0000000000000b01",
+    "kind": "commit",
+    "name": "React commit (mount)",
+    "startTime": 1789819200040,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "phase": "mount",
+      "renderCount": 4,
+      "rootName": "TrailheadGuideLayout"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 3
+  },
+  {
+    "id": "evt_rs00000000000004",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b04",
+    "parentSpanId": "0000000000000b03",
+    "kind": "render",
+    "name": "render TrailFilterProvider",
+    "startTime": 1789819200041,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "phase": "mount",
+      "renderCount": 1,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 4.5,
+      "ownerChain": [],
+      "selfTime": 2.7
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 4,
+    "source": {
+      "file": "src/providers/TrailFilterProvider.tsx",
+      "line": 36,
+      "column": 17,
+      "symbol": "TrailFilterProvider",
+      "endLine": 57,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000005",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b05",
+    "parentSpanId": "0000000000000b03",
+    "kind": "render",
+    "name": "render TrailList",
+    "startTime": 1789819200045.5,
+    "duration": 6.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailList",
+      "phase": "mount",
+      "renderCount": 1,
+      "changedProps": [],
+      "trigger": "props",
+      "actualDuration": 6.25,
+      "ownerChain": ["TrailFilterProvider"],
+      "selfTime": 3.75
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 5,
+    "source": {
+      "file": "src/components/TrailList.tsx",
+      "line": 43,
+      "column": 17,
+      "symbol": "TrailList",
+      "endLine": 67,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000006",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b06",
+    "parentSpanId": "0000000000000b03",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200051,
+    "duration": 8.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "mount",
+      "renderCount": 1,
+      "changedProps": [],
+      "trigger": "props",
+      "actualDuration": 8.75,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 5.25
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 6,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 28,
+      "column": 17,
+      "symbol": "TrailCard",
+      "endLine": 79,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000007",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b07",
+    "parentSpanId": "0000000000000b03",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200056,
+    "duration": 3.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "mount",
+      "renderCount": 1,
+      "changedProps": [],
+      "trigger": "props",
+      "actualDuration": 3.5,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 2.1
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 7,
+    "source": {
+      "file": "src/components/ConditionsPanel.tsx",
+      "line": 35,
+      "column": 17,
+      "symbol": "ConditionsPanel",
+      "endLine": 56,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000008",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b08",
+    "parentSpanId": "0000000000000b01",
+    "kind": "state",
+    "name": "state TrailFilterProvider.region",
+    "startTime": 1789819200250,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "hookIndex": 2,
+      "hookLabel": "useState:region",
+      "previousValue": {
+        "type": "string",
+        "preview": "any",
+        "truncated": false
+      },
+      "nextValue": {
+        "type": "string",
+        "preview": "river-gorge",
+        "truncated": false
+      },
+      "triggerEventId": "evt_rs00000000000001"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 8,
+    "source": {
+      "file": "src/providers/TrailFilterProvider.tsx",
+      "line": 39,
+      "column": 31,
+      "symbol": "TrailFilterProvider",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000009",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b09",
+    "parentSpanId": "0000000000000b01",
+    "kind": "state",
+    "name": "state TrailFilterProvider.openTrailsOnly",
+    "startTime": 1789819200258,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "hookIndex": 3,
+      "hookLabel": "useState:openTrailsOnly",
+      "previousValue": {
+        "type": "boolean",
+        "preview": "true",
+        "truncated": false
+      },
+      "nextValue": {
+        "type": "boolean",
+        "preview": "false",
+        "truncated": false
+      },
+      "triggerEventId": "evt_rs00000000000001"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 9,
+    "source": {
+      "file": "src/providers/TrailFilterProvider.tsx",
+      "line": 40,
+      "column": 47,
+      "symbol": "TrailFilterProvider",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000010",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0a",
+    "parentSpanId": "0000000000000b01",
+    "kind": "commit",
+    "name": "React commit (update)",
+    "startTime": 1789819200260,
+    "duration": 96,
+    "tier": "browser",
+    "attributes": {
+      "phase": "update",
+      "renderCount": 16,
+      "rootName": "TrailheadGuideLayout"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 10
+  },
+  {
+    "id": "evt_rs00000000000011",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0b",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailFilterProvider",
+    "startTime": 1789819200261,
+    "duration": 2.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 2.25,
+      "ownerChain": [],
+      "selfTime": 1.35
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 11
+  },
+  {
+    "id": "evt_rs00000000000012",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0c",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailList",
+    "startTime": 1789819200263.5,
+    "duration": 9.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailList",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 9.5,
+      "ownerChain": ["TrailFilterProvider"],
+      "selfTime": 5.7
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 12
+  },
+  {
+    "id": "evt_rs00000000000013",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0d",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200273.5,
+    "duration": 5.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [
+        {
+          "key": "difficulty"
+        }
+      ],
+      "trigger": "props",
+      "actualDuration": 5.5,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 3.3
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 13
+  },
+  {
+    "id": "evt_rs00000000000014",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0e",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200279.5,
+    "duration": 4.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 3,
+      "changedProps": [
+        {
+          "key": "distanceKm"
+        },
+        {
+          "key": "trailName"
+        }
+      ],
+      "trigger": "props",
+      "actualDuration": 4.25,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 2.55
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 14
+  },
+  {
+    "id": "evt_rs00000000000015",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b0f",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200284,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 4,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 6,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 3.6
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 15
+  },
+  {
+    "id": "evt_rs00000000000016",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b10",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200290.5,
+    "duration": 3.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 5,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 3.75,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 2.25
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 16
+  },
+  {
+    "id": "evt_rs00000000000017",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b11",
+    "parentSpanId": "0000000000000b10",
+    "kind": "state",
+    "name": "state TrailCard.status",
+    "startTime": 1789819200294.5,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "hookIndex": 1,
+      "hookLabel": "useState:status",
+      "previousValue": {
+        "type": "string",
+        "preview": "idle",
+        "truncated": false
+      },
+      "nextValue": {
+        "type": "string",
+        "preview": "loading",
+        "truncated": false
+      },
+      "triggerEventId": "evt_rs00000000000016"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 17,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 35,
+      "column": 31,
+      "symbol": "TrailCard",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000018",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b12",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200295,
+    "duration": 7.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [
+        {
+          "key": "report"
+        }
+      ],
+      "trigger": "props",
+      "actualDuration": 7.25,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 4.35
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 18
+  },
+  {
+    "id": "evt_rs00000000000019",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b13",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200302.5,
+    "duration": 12.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 3,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 12.25,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 7.35
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 19
+  },
+  {
+    "id": "evt_rs00000000000020",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b14",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200315,
+    "duration": 2.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 6,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 2.5,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 1.5
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 20
+  },
+  {
+    "id": "evt_rs00000000000021",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b15",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200317.75,
+    "duration": 18.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 7,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 18.5,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 11.1
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 21
+  },
+  {
+    "id": "evt_rs00000000000022",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b16",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200336.5,
+    "duration": 2.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 4,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 2.75,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 1.65
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 22
+  },
+  {
+    "id": "evt_rs00000000000023",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b17",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailFilterProvider",
+    "startTime": 1789819200339.5,
+    "duration": 1.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "phase": "update",
+      "renderCount": 3,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 1.25,
+      "ownerChain": [],
+      "selfTime": 0.75
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 23
+  },
+  {
+    "id": "evt_rs00000000000024",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b18",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailList",
+    "startTime": 1789819200341,
+    "duration": 4.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailList",
+      "phase": "update",
+      "renderCount": 3,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 4.75,
+      "ownerChain": ["TrailFilterProvider"],
+      "selfTime": 2.85
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 24
+  },
+  {
+    "id": "evt_rs00000000000025",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b19",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200346,
+    "duration": 2.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 8,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 2.25,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 1.35
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 25
+  },
+  {
+    "id": "evt_rs00000000000026",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1a",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200348.5,
+    "duration": 1.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 9,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 1.75,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 1.05
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 26
+  },
+  {
+    "id": "evt_rs00000000000027",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1b",
+    "parentSpanId": "0000000000000b1a",
+    "kind": "state",
+    "name": "state TrailCard.report",
+    "startTime": 1789819200350.5,
+    "duration": 0,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "hookIndex": 0,
+      "hookLabel": "useState:report",
+      "previousValue": {
+        "type": "unknown",
+        "preview": "",
+        "truncated": false
+      },
+      "nextValue": {
+        "type": "unknown",
+        "preview": "",
+        "truncated": false
+      },
+      "triggerEventId": "evt_rs00000000000026"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 27,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 34,
+      "column": 31,
+      "symbol": "TrailCard",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_rs00000000000028",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1c",
+    "parentSpanId": "0000000000000b0a",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200351,
+    "duration": 2,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 5,
+      "changedProps": [],
+      "trigger": "context",
+      "actualDuration": 2,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 1.2
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 28
+  },
+  {
+    "id": "evt_rs00000000000029",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1d",
+    "parentSpanId": "0000000000000b01",
+    "kind": "commit",
+    "name": "React commit (update)",
+    "startTime": 1789819200600,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "phase": "update",
+      "renderCount": 5,
+      "rootName": "TrailheadGuideLayout",
+      "componentTree": [
+        {
+          "component": "TrailFilterProvider",
+          "renderCount": 4,
+          "children": [
+            {
+              "component": "TrailList",
+              "renderCount": 3,
+              "children": [
+                {
+                  "component": "TrailCard",
+                  "key": "cascade-ridge",
+                  "renderCount": 12,
+                  "children": [
+                    {
+                      "component": "ConditionsPanel",
+                      "renderCount": 6,
+                      "children": []
+                    }
+                  ]
+                },
+                {
+                  "component": "TrailCard",
+                  "key": "larch-meadow",
+                  "renderCount": 12,
+                  "children": []
+                },
+                {
+                  "component": "TrailCard",
+                  "key": "juniper-saddle",
+                  "renderCount": 12,
+                  "children": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 29
+  },
+  {
+    "id": "evt_rs00000000000030",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1e",
+    "parentSpanId": "0000000000000b1d",
+    "kind": "render",
+    "name": "render TrailFilterProvider",
+    "startTime": 1789819200601,
+    "duration": 0.875,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailFilterProvider",
+      "phase": "update",
+      "renderCount": 4,
+      "changedProps": [],
+      "trigger": "state",
+      "actualDuration": 0.875,
+      "ownerChain": [],
+      "selfTime": 0.525
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 30
+  },
+  {
+    "id": "evt_rs00000000000031",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b1f",
+    "parentSpanId": "0000000000000b1d",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200602.5,
+    "duration": 1.25,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 10,
+      "changedProps": [],
+      "trigger": "unchanged",
+      "actualDuration": 1.25,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 0.75
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 31
+  },
+  {
+    "id": "evt_rs00000000000032",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b20",
+    "parentSpanId": "0000000000000b1d",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200604.5,
+    "duration": 1,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 11,
+      "changedProps": [],
+      "trigger": "unchanged",
+      "actualDuration": 1,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 0.6
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 32
+  },
+  {
+    "id": "evt_rs00000000000033",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b21",
+    "parentSpanId": "0000000000000b1d",
+    "kind": "render",
+    "name": "render TrailCard",
+    "startTime": 1789819200606,
+    "duration": 0.75,
+    "tier": "browser",
+    "attributes": {
+      "component": "TrailCard",
+      "phase": "update",
+      "renderCount": 12,
+      "changedProps": [],
+      "trigger": "unknown",
+      "actualDuration": 0.75,
+      "ownerChain": ["TrailList", "TrailFilterProvider"],
+      "selfTime": 0.45
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 33
+  },
+  {
+    "id": "evt_rs00000000000034",
+    "traceId": "1c3e5a7092b4d6f81a3c5e709b2d4f68",
+    "spanId": "0000000000000b22",
+    "parentSpanId": "0000000000000b1d",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819200607.5,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 6,
+      "changedProps": [],
+      "trigger": "unchanged",
+      "actualDuration": 1.5,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 0.9
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000002",
+    "seq": 34
+  }
+]

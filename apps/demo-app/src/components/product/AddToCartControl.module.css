@@ -1,0 +1,130 @@
+/*
+ * AddToCartControl - the product page's purchase control: a labelled quantity field, the submit
+ * button, the dispatch estimate under them and the slot that holds an inline notice.
+ *
+ * What this module owns, and nothing more: where those four parts sit, and the type of the
+ * dispatch line. The controls themselves arrive fully dressed - `Button`, `Select`, `FormField`
+ * and `Alert` each declare their own padding, border, radius, focus ring and tone in their own
+ * module - so no rule here repeats or overrules any of that. A class below either places a part
+ * of this control or it is not in the file.
+ *
+ * Tokens: every value reads an `--ls-*` custom property from `app/globals.css` and states the
+ * literal that file documents as its fallback, so the control keeps the storefront's rhythm in
+ * the application and still renders sensibly if this stylesheet is ever loaded without it. The
+ * only bare values are the structural ones a token cannot express: the grid's track keywords and
+ * line numbers, the `rem` measure that holds the quantity field to the width of a short number
+ * list, the single breakpoint length, and the full line width the submit button takes below it.
+ *
+ * Class contract with `AddToCartControl.tsx`: `root`, `row`, `field`, `actions`, `eta` and
+ * `error`. Stacking the two parts on a narrow viewport and widening the submit button to the line
+ * it then has are both handled here, by the one media query at the end of the file, which reaches
+ * the button through `.actions > *`; the component therefore applies no further class for either
+ * and the two files cannot drift apart.
+ */
+
+/* The control as a whole: the field row, then the dispatch line, then the notice slot, evenly
+ * spaced. `min-width: 0` lets it shrink with whichever column holds it rather than forcing that
+ * column - and with it the page - wider than the viewport. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* The field and the button stand side by side on one grid of two rows - the label row and the
+ * control row - so the select and the button share a line by construction rather than by box
+ * alignment. The two parts are not the same height: `Button.module.css` sizes the `lg` button from
+ * its own padding and leading, `Select.module.css` sizes the `md` select from its own, and the two
+ * differ by a few pixels that change whenever either primitive's metrics do. Aligning the boxes'
+ * bottom edges, as a flex row does, would leave the button's top edge that many pixels above the
+ * select's.
+ * On the grid the control row is as tall as the taller of the two and both stretch to it, so their
+ * top and bottom edges coincide whatever height either primitive gives itself.
+ *
+ * The row gap is the gap `FormField.module.css` puts between a label and its control, and it has to
+ * equal it: the field adopts these two rows as a subgrid (see `.row > .field`), and a subgrid whose
+ * gap differs from its parent's is laid out with the difference applied as margins on its items,
+ * which would move the select off the line the button sits on. The column gap is the one spacing
+ * step between the field and the button. */
+.row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  column-gap: var(--ls-space-3, 12px);
+  row-gap: var(--ls-space-1, 4px);
+}
+
+/* The quantity field offers a short, stepped list of numbers, so it is held to a measure that
+ * suits one: wide enough for its label and its widest option, and never stretched across the row.
+ * Its frame, label and hint are `FormField`'s and `Select`'s.
+ *
+ * It spans both rows and adopts them (`grid-template-rows: subgrid`), which places its label in the
+ * label row and its select in the control row beside the button. Adopting the rows means changing
+ * the column's `display`, which `FormField.module.css` declares - together with `min-width` - on a
+ * single class on this same element; the rule is two classes deep so specificity, and not the order
+ * the bundler emits the two modules in, is what decides both. `justify-self: start` keeps the column
+ * at its measured width in the stacked layout at the end of the file, where the grid column is the
+ * full line. */
+.row > .field {
+  display: grid;
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  grid-template-rows: subgrid;
+  justify-self: start;
+  min-width: 7rem;
+  max-width: 10rem;
+}
+
+/* The submit button's cell: the control row of the second column, stretched to that row's height,
+ * with the button stretched to the cell's. The column takes the rest of the line, and its automatic
+ * minimum size is deliberately left alone, so the button keeps its whole label rather than being
+ * squeezed until the label is cut; the narrowest column this control is given above the breakpoint
+ * at the end of the file is 352px, against the 296px the field, the gap and the busy button need. */
+.actions {
+  display: flex;
+  grid-column: 2;
+  grid-row: 2;
+}
+
+/* The dispatch estimate. `tabular-nums` gives every digit the same advance width, so the line
+ * holds one width as the estimate is revised and nothing below it moves. */
+.eta {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Placement for the inline notice, and only placement: the `Alert` that fills this slot brings
+ * its own tone, border and padding, and the margin reset simply keeps it in the column's rhythm
+ * set by `.root`. */
+.error {
+  margin: 0;
+}
+
+/* Narrow viewports - a phone held upright, or a narrow side column. Here the two parts are stacked
+ * and the button takes a full line of its own, which is both easier to hit and the shape this
+ * width leads a reader to expect. The stack is stated rather than left to chance: the field and
+ * the button do still fit beside each other at this width, so the grid is reduced to one column
+ * and the button's cell is given a third row of its own, and the child then fills the line it has
+ * been given. The cell's top margin tops the row gap up to the one spacing step `.root` puts
+ * between its parts, so the button sits as far below the select as the dispatch line sits below
+ * the button. The breakpoint is written in `rem` so it moves with the reader's font size, and the
+ * rule reaches the button through `.actions`, which is why the component needs no second class of
+ * its own. */
+@media (max-width: 30rem) {
+  .row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .actions {
+    grid-column: 1;
+    grid-row: 3;
+    margin-block-start: calc(var(--ls-space-3, 12px) - var(--ls-space-1, 4px));
+  }
+
+  .actions > * {
+    width: 100%;
+  }
+}

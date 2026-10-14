@@ -1,0 +1,135 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/apps/vscode-extension",
+        "${workspaceFolder}/apps/demo-app"
+      ],
+      "env": {
+        "DEBUGGEN_PROVIDER": "deterministic"
+      },
+      "outFiles": ["${workspaceFolder}/apps/vscode-extension/dist/**/*.js", "!**/node_modules/**"],
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "build: vscode-extension",
+      "presentation": {
+        "group": "1-extension",
+        "order": 1
+      }
+    },
+    {
+      "name": "Run Extension (with Debug service)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/apps/vscode-extension",
+        "${workspaceFolder}/apps/demo-app"
+      ],
+      "env": {
+        "DEBUGGEN_PROVIDER": "deterministic"
+      },
+      "outFiles": ["${workspaceFolder}/apps/vscode-extension/dist/**/*.js", "!**/node_modules/**"],
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "wait: service healthy",
+      "presentation": {
+        "hidden": true,
+        "group": "1-extension",
+        "order": 2
+      }
+    },
+    {
+      "name": "Debug service",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/apps/local-service/src/main.ts",
+      "runtimeArgs": ["--import", "tsx"],
+      "cwd": "${workspaceFolder}/apps/local-service",
+      "env": {
+        "DEBUGGEN_PROVIDER": "deterministic",
+        "DEBUGGEN_LOG_LEVEL": "debug"
+      },
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "outFiles": ["${workspaceFolder}/packages/*/dist/**/*.js", "!**/node_modules/**"],
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": {
+        "group": "2-service",
+        "order": 1
+      }
+    },
+    {
+      "name": "Attach service (started with --inspect on port 9229)",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "restart": true,
+      "outFiles": [
+        "${workspaceFolder}/apps/local-service/dist/**/*.js",
+        "${workspaceFolder}/packages/*/dist/**/*.js",
+        "!**/node_modules/**"
+      ],
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": {
+        "group": "2-service",
+        "order": 2
+      }
+    },
+    {
+      "name": "Debug demo app (next dev)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "pnpm --filter @debuggen/demo-app run dev",
+      "cwd": "${workspaceFolder}",
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "- Local:\\s+(https?://\\S+)",
+        "uriFormat": "%s"
+      },
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": {
+        "group": "3-demo",
+        "order": 1
+      }
+    },
+    {
+      "name": "Debug demo app (instrumented; needs the service running and packages/telemetry built)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "pnpm run demo:instrumented",
+      "cwd": "${workspaceFolder}",
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": {
+        "group": "3-demo",
+        "order": 2
+      }
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Extension + Service",
+      "configurations": ["Debug service", "Run Extension (with Debug service)"],
+      "preLaunchTask": "prepare: Extension + Service",
+      "stopAll": true,
+      "presentation": {
+        "group": "0-compound",
+        "order": 1
+      }
+    },
+    {
+      "name": "Extension + attached service",
+      "configurations": ["Attach service (started with --inspect on port 9229)", "Run Extension"],
+      "stopAll": true,
+      "presentation": {
+        "group": "0-compound",
+        "order": 2
+      }
+    }
+  ]
+}

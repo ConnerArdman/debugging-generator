@@ -1,0 +1,21 @@
+{
+  "name": "sample-next-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Generic Next.js App Router fixture app used as the generalization target for the browser and end-to-end test suites.",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --port 3100",
+    "build": "next build",
+    "start": "next start --port 3100"
+  },
+  "dependencies": {
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Solution file for `tsc -b` (AAP 0.7.1 Group 0). It is the single entry point of the `pnpm typecheck` gate, which is `pnpm demo:generate && tsc -b` (AAP 0.8.5): every project listed under `references` below is type-checked by that one command, and a workspace missing from the list is never type-checked at all.",
+
+  "// format": "Written as strict JSON - like tsconfig.base.json and every per-workspace config in this repository - so that both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it, and no consumer has to know which one to reach for. Rationale lives in the `\"// …\"` string keys instead of in comments; TypeScript ignores unknown top-level keys, while such a key inside `compilerOptions` would be error TS5023.",
+
+  "// files": "Empty on purpose. A solution file owns no inputs of its own: `\"files\": []` is what keeps TypeScript from reporting TS18003 here and makes `references` the only thing this project contributes.",
+
+  "// compilerOptions": "Deliberately absent, and so is `extends`. Every option lives in tsconfig.base.json, which each referenced project extends and where the rationale for each one is recorded. Options here would apply to a program with no files while diverging from the settings the referenced projects actually build under.",
+
+  "// references": "One entry per project, ordered bottom-up along the acyclic package layering of AAP 0.2.2 (shared -> telemetry -> code-analysis -> instrumentation -> panel-schema -> panel-renderer -> model-provider -> protocol -> apps -> tests). The order is for readability only: `tsc -b` derives the real build order from each project's own `references`. Fourteen entries - every workspace, plus the second project in apps/vscode-extension.",
+
+  "// references.webview": "apps/vscode-extension declares two projects. Its tsconfig.json excludes src/webview/**, so tsconfig.webview.json has to be referenced explicitly or the React webview would belong to no project and ship unchecked. That project overrides both `outDir` and `tsBuildInfoFile` into .tsbuild/webview, so the two co-located projects never overwrite each other's declarations or share a stamp.",
+
+  "// references.tests": "tests/tsconfig.json covers tests/browser/** and tests/e2e/** (and playwright.config.ts), which sit outside every workspace project and would otherwise never reach this gate.",
+
+  "// outputs": "`tsc -b` emits declarations only, into each project's .tsbuild/ - anchored per project with `${configDir}` in tsconfig.base.json so siblings cannot overwrite one another. .tsbuild/ is ignored by .gitignore, .prettierignore and eslint.config.js, so `git status` stays clean after the gate runs. The shipping bundles under each dist/ belong to tsup, esbuild, Vite and Next; this build never writes them, and `tsc -b --clean` never removes them.",
+
+  "// no-aliases": "No `baseUrl` anywhere and no `paths` in any runtime workspace project: an alias would bypass the `exports` maps and the package layering. Each package's `types` condition is source-first: in the repository it resolves the src/ entry, which `tsc -b` replaces with the referenced project's .tsbuild declarations and the ESLint project service reads as source, so `pnpm typecheck` and `pnpm lint` depend neither on `pnpm build` nor on its freshness. The dist/ entry serves only a packed tarball; runtime and bundlers resolve `import`/`default` into dist/. `tsc -b` does not track package.json: after editing an `exports` map, run `tsc -b --force` once. tests/tsconfig.json and apps/demo-app (`@/*`) are the two deliberate `paths` users. Full account: docs/ARCHITECTURE.md §3 (Workspace layout and dependency layering).",
+
+  "// prerequisite": "apps/demo-app imports its generated Prisma client from src/generated/prisma, which `prisma generate` writes. The root `typecheck` script chains `pnpm demo:generate` ahead of `tsc -b`, so this gate never depends on `pnpm build` having run first (AAP 0.8.5).",
+
+  "files": [],
+
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/telemetry" },
+    { "path": "packages/code-analysis" },
+    { "path": "packages/instrumentation" },
+    { "path": "packages/panel-schema" },
+    { "path": "packages/panel-renderer" },
+    { "path": "packages/model-provider" },
+    { "path": "packages/protocol" },
+    { "path": "apps/local-service" },
+    { "path": "apps/chrome-extension" },
+    { "path": "apps/vscode-extension" },
+    { "path": "apps/vscode-extension/tsconfig.webview.json" },
+    { "path": "apps/demo-app" },
+    { "path": "tests" }
+  ]
+}

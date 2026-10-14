@@ -1,0 +1,225 @@
+/*
+ * Lumen Supply - site footer band.
+ *
+ * Imported by exactly one file, its sibling `SiteFooter.tsx`
+ * (`import styles from './SiteFooter.module.css';`), which renders the document's single
+ * `<footer>` landmark once from `app/layout.tsx`. Nothing else may import this module, and this
+ * module styles nothing else: the header, the page shell, the cart drawer and every page surface
+ * own their own stylesheets.
+ *
+ * The eleven classes below are the whole contract with that component - `root`, `inner`,
+ * `columns`, `brand`, `blurb`, `column`, `columnTitle`, `list`, `listItem`, `link`, `legal` -
+ * and there are no others: an orphan in either direction is a defect.
+ *
+ * TOKEN CONTRACT
+ * Every value resolves to a shared `--ls-*` design token declared in `app/globals.css`, and every
+ * reference is written `var(--ls-NAME, <literal fallback>)`. The fallback mirrors the value that
+ * stylesheet declares, which is what lets this footer render sensibly on its own - in a component
+ * harness, or before the global stylesheet has loaded - while the application still paints the
+ * one palette. Hex is lowercase throughout because Prettier normalises CSS colours to lowercase
+ * and `pnpm format:check` is a blocking gate.
+ *
+ * FILE-LOCAL VOCABULARY
+ * Four values this footer needs have no token to name them - a grid track minimum, a prose
+ * measure, heading tracking and a transition duration - and two more compose a token into a
+ * shorthand (the hairline and the focus ring). All six are declared once, on `.root`, in the
+ * `--footer-*` namespace, and every use site repeats the literal as a `var()` fallback so a rule
+ * still holds if the block above it is ever overridden away. That is the only place a literal
+ * length, colour or duration appears; unitless line-height ratios are values, not lengths, and
+ * are written plainly.
+ *
+ * ALIGNMENT CONTRACT
+ * `.inner` repeats the measure and gutters of `PageContainer.module.css` - `--ls-page-max` wide,
+ * centred, `--ls-space-4` of gutter that widens to `--ls-space-5` at the 960px breakpoint
+ * `app/globals.css` already uses for `.ls-split` - so the footer's first column starts on exactly
+ * the same left edge as the page content above it. The two files must change together: if the
+ * page shell's gutter tokens or breakpoint move, this block moves with them.
+ *
+ * WHAT THIS FILE DELIBERATELY DOES NOT DO
+ * It sets no positioning scheme and no stacking order: the footer sits in normal flow at the end
+ * of the body's flex column, and the stacking tiers belong to the sticky header, the cart drawer
+ * (`--ls-z-drawer`) and the toast viewport (`--ls-z-toast`). It pulls in no other stylesheet, it
+ * never escapes its own module scope, and the only shared tokens it reads are the `--ls-*` ones.
+ */
+
+.root {
+  /* The six file-local values described in the header. The first is redeclared in the media query
+   * at the end of the file; the rest are constant. */
+  --footer-gutter: var(--ls-space-4, 16px);
+  --footer-col-min: 200px;
+  --footer-measure: 40ch;
+  --footer-title-tracking: 0.04em;
+  --footer-transition-duration: 160ms;
+  --footer-hairline: 1px solid var(--ls-border, #cbd5e1);
+  /* `--ls-focus` is a colour, not an outline shorthand, so the ring restates the 2px width the
+   * baseline `:focus-visible` rule in `app/globals.css` draws. Keeping both halves here means the
+   * footer's ring cannot drift from the application's. */
+  --footer-focus-ring: 2px solid var(--ls-focus, #0f766e);
+  --footer-focus-offset: 2px;
+
+  /* `body` is a flex column and the page shell grows, so this is belt-and-braces: it also pins the
+   * band to the bottom of a route whose content is shorter than the viewport if the shell above it
+   * is ever swapped for one that does not grow. Logical form of `margin-top`, like the rest of the
+   * file. */
+  margin-block-start: auto;
+  border-block-start: var(--footer-hairline, 1px solid #cbd5e1);
+  background: var(--ls-surface-sunken, #f8fafc);
+  padding-block: var(--ls-space-6, 32px) var(--ls-space-5, 24px);
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.5;
+}
+
+/* The centred measure. `width: 100%` keeps the box full-bleed below the cap, and the gutters are
+ * the page shell's, not an approximation of them - see the alignment contract above. */
+.inner {
+  width: 100%;
+  max-width: var(--ls-page-max, 1200px);
+  margin-inline: auto;
+  padding-inline: var(--footer-gutter, 16px);
+}
+
+/* One fluid track set, no breakpoint of its own: `auto-fit` drops to two columns and then to one
+ * as the measure narrows. `min(..., 100%)` is what makes that safe - a bare `minmax(200px, 1fr)`
+ * track cannot shrink below its floor and would push a horizontal scrollbar onto a viewport
+ * narrower than the floor plus gutters. */
+.columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(var(--footer-col-min, 200px), 100%), 1fr));
+  align-items: start;
+  gap: var(--ls-space-5, 24px);
+}
+
+/* The brand column. `SiteFooter.tsx` renders the company name as a plain element inside this block
+ * with no class of its own, so the name's typography is declared here and inherited; `.blurb`
+ * restates its own size, weight and colour and is therefore unaffected. `min-width: 0` lets a long
+ * product word wrap instead of widening the track. */
+.brand {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+/* The company sentence, held to a comfortable reading measure. */
+.blurb {
+  max-width: var(--footer-measure, 40ch);
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 400;
+  line-height: 1.55;
+}
+
+/* A link column: heading above, list below, on the same vertical rhythm as the brand block. */
+.column {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The column heading. It is an `<h2>` in the markup, so this rule only has to say where it differs
+ * from the document's heading scale: a column label reads as a label, not as a section title. */
+.columnTitle {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  letter-spacing: var(--footer-title-tracking, 0.04em);
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+/* The `<ul>` reset, with the row rhythm carried by `gap` so no `:last-child` margin has to be
+ * undone and a column of one item is spaced exactly like a column of five. */
+.list {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.listItem {
+  min-width: 0;
+}
+
+/* A footer link. `inline-block` keeps the hit area and the focus ring around the label rather than
+ * across the whole track, and the padding sits on the block axis only so every label's left edge
+ * stays flush with its column heading. */
+.link {
+  display: inline-block;
+  border-radius: var(--ls-radius-sm, 4px);
+  padding-block: var(--ls-space-1, 4px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.4;
+  text-decoration: none;
+  transition: color var(--footer-transition-duration, 160ms) ease-out;
+}
+
+/* A link's box is about 26px tall - 13px of label on a 1.4 ratio plus the block padding above -
+ * which clears the 24px minimum of WCAG 2.5.8 on that axis. The same destinations are also
+ * reachable from the primary navigation. */
+
+/* Hover is gated so a tap on a touch device does not leave a link stuck in its hover appearance
+ * after the finger lifts. */
+@media (hover: hover) {
+  .link:hover {
+    color: var(--ls-text, #0f172a);
+    text-decoration: underline;
+  }
+}
+
+/* Keyboard focus, not mouse focus: `:focus-visible` only. The label also darkens, so focus is
+ * carried by more than the ring alone. */
+.link:focus-visible {
+  outline: var(--footer-focus-ring, 2px solid #0f766e);
+  outline-offset: var(--footer-focus-offset, 2px);
+  color: var(--ls-text, #0f172a);
+}
+
+/* The closing line. `wrap` plus `space-between` means a second inline item - a short note beside
+ * the store line - sits at the far end on a wide viewport and drops onto its own row instead of
+ * overflowing on a narrow one. */
+.legal {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ls-space-2, 8px);
+  margin-block-start: var(--ls-space-5, 24px);
+  border-block-start: var(--footer-hairline, 1px solid #cbd5e1);
+  padding-block-start: var(--ls-space-4, 16px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.5;
+}
+
+/* The one breakpoint in this file, and it exists only to keep the footer's left edge on the page
+ * shell's: `PageContainer.module.css` widens its gutter at the same width, which is the width
+ * `app/globals.css` already uses for `.ls-split`. A media-query length cannot be a `var()`, so the
+ * literal here is unavoidable. */
+@media (min-width: 960px) {
+  .root {
+    --footer-gutter: var(--ls-space-5, 24px);
+  }
+}
+
+/* The single transition this module introduces, paired with its own reduced-motion rule at its own
+ * specificity - the house pattern in this application, because the universal collapse in
+ * `app/globals.css` is a baseline for motion no module has claimed rather than an override. */
+@media (prefers-reduced-motion: reduce) {
+  .link {
+    transition: none;
+  }
+}

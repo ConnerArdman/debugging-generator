@@ -1,0 +1,58 @@
+/*
+ * VisuallyHidden - the storefront's one screen-reader-only utility.
+ *
+ * Consumed by `VisuallyHidden.tsx` in this folder and, through it, by every UI primitive that
+ * needs a name a sighted reader does not (the `Spinner` and `Skeleton` busy labels, an icon-only
+ * control's accessible text, a table caption, the "(current page)" marker in a pagination list).
+ * Nothing else imports this module, and no page or route stylesheet re-implements the pattern:
+ * app/globals.css deliberately owns no visually-hidden utility, so this rule is the single
+ * definition of it in the application.
+ *
+ * The class keeps its content in the accessibility tree while removing it from the visual
+ * rendering *and* from layout. Every declaration below is load-bearing:
+ *
+ *   position: absolute   takes the box out of flow, so a parent's height, a flex row's gap and a
+ *                        grid track are all computed as though the text were not there.
+ *   width / height: 1px  a zero-sized box is treated as empty by some assistive technologies and
+ *                        can be dropped from the accessibility tree; 1x1 keeps it announced.
+ *   margin: -1px         pulls that last pixel back out of an ancestor's scrollable overflow
+ *                        area, so no scrollbar appears and no scroll anchor lands here.
+ *   padding: 0           app/globals.css sets `box-sizing: border-box` globally, so padding would
+ *                        eat into the 1px box rather than widen it - reset for clarity either way.
+ *   overflow: hidden     clips the text itself, which is far larger than its 1x1 container.
+ *   clip-path: inset(50%) collapses the painted area to nothing, which is what stops the 1px dot
+ *                        `overflow: hidden` alone would leak; it replaces the deprecated `clip`
+ *                        rectangle that older versions of this pattern used.
+ *   white-space: nowrap  keeps the clipped text on one line. body sets
+ *                        `overflow-wrap: break-word`, which would otherwise wrap it one character
+ *                        per line and grow the scroll area before the clip applies.
+ *   border: 0            a border is painted outside the 1px content box and would survive as a
+ *                        hairline artifact.
+ *
+ * Four shortcuts are deliberately absent, because each either removes the node from the
+ * accessibility tree or trades one artifact for another: a `display` of `none` and a `visibility`
+ * of `hidden` both un-announce the text; a zeroed `font-size` leaves an announced but unreliably
+ * measured box; a large negative `text-indent` still occupies its line box and pushes the
+ * inline-start scroll extent of an ancestor that scrolls.
+ *
+ * This is also the one module in the workspace that reads none of the shared design tokens
+ * app/globals.css declares, and that is intentional rather than an oversight: the pattern is
+ * purely geometric, and none of the literals it uses encodes a colour, spacing step, radius, type
+ * size, shadow or stacking tier, which is all the token set models. Adding a colour or spacing
+ * declaration here would give hidden text a visual treatment it can never show.
+ *
+ * `.root` is the only export. The folder's convention is `styles.root` plus data attributes for
+ * variants, never a class-name lookup map, and this utility has no variants at all.
+ */
+
+.root {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}

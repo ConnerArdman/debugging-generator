@@ -1,0 +1,101 @@
+/*
+ * Lumen Supply - product specification list.
+ *
+ * The stylesheet for `./ProductSpecList.tsx`: the definition list on a product page, which
+ * prints an identifier row (SKU) followed by one term/value pair per published specification.
+ * Nothing else imports this file - a CSS Module belongs to the one component beside it.
+ *
+ * Markup contract, decided here and mirrored by the component. `.root` is the `<dl>` and owns
+ * the two columns, and a pair may reach them either way:
+ *
+ *   1. as bare `<dt>` and `<dd>` children of the list, which auto-place into the term column
+ *      and the value column in source order, or
+ *   2. wrapped in a `<div class="row">` - the one grouping element a `<dl>` allows - which
+ *      `.row` turns into a full-width `subgrid` item, so its `<dt>` and `<dd>` land in exactly
+ *      the same two columns as every unwrapped row.
+ *
+ * Both forms render identically at both widths, which is the point: a row that needs an element
+ * of its own can have one without the rest of the list reflowing around it. `subgrid` is relied
+ * on deliberately - this application targets current Chrome, which has supported it since
+ * Chrome 117 - and the fallback is not a collapse but the unwrapped form above.
+ *
+ * Every value reads an `--ls-*` custom property from `app/globals.css` with the literal fallback
+ * that matches the declaration there, so the list still renders sensibly if the module is loaded
+ * without the global stylesheet. Hex fallbacks are written lowercase because Prettier normalises
+ * CSS colours and `prettier --check` is a blocking gate; do not restore the uppercase spelling.
+ */
+
+.root {
+  display: grid;
+  /* A capped measure for the term column keeps values aligned down the list, and `minmax(0, …)`
+   * on both tracks is what lets a long value wrap inside its track instead of widening the
+   * grid and pushing the page into a horizontal scroll. */
+  grid-template-columns: minmax(0, 12rem) minmax(0, 1fr);
+  column-gap: var(--ls-space-4, 16px);
+  row-gap: var(--ls-space-2, 8px);
+  /* A term is one step smaller than its value, so the two read as one line when they are
+   * aligned on their first baseline rather than on their box tops. */
+  align-items: baseline;
+  margin: 0;
+}
+
+.row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  /* Gutters in the subgridded axis come from the parent, so only the row axis is declared here.
+   * It is the space between a term and its value once they stack below the breakpoint, and it
+   * matches the gap the list itself uses there, so wrapped and unwrapped rows space alike. */
+  row-gap: var(--ls-space-1, 4px);
+  align-items: baseline;
+}
+
+.term {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+.detail {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 15px);
+  /* Specification values include unbroken part numbers and compound units with no space to
+   * break at, so breaking mid-word is preferred to overflowing the track. `anywhere` also lets
+   * the value shrink the track it sits in, which `break-word` would not. */
+  overflow-wrap: anywhere;
+}
+
+/* Identifier values - a SKU, a catalogue code - where digit alignment and an unambiguous 0/O
+ * matter more than matching the surrounding prose.
+ *
+ * This is the whole identifier treatment and not a family swap on top of `.detail`, because a
+ * product code reads the same everywhere this storefront prints it: the catalog tile
+ * (`catalog/ProductCard.module.css .sku`), the cart row (`cart/CartLineRow.module.css .sku`) and
+ * this list all set it monospaced, at the smallest type step, in the muted foreground, with
+ * figures on a fixed pitch and a 1.4 leading. So each of those five properties is set here, at the
+ * same tokens those two modules read, and `.detail`'s size and colour are deliberately overridden
+ * rather than inherited. `.mono` is composed after `.detail` by the component and both are
+ * single-class selectors, so source order in this file is what settles the conflict: `.mono` is
+ * declared last and wins.
+ *
+ * `letter-spacing: 0` neutralises any tracking a parent has set, which a code read character by
+ * character should not carry. */
+.mono {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+
+/* One breakpoint, and the only literal length outside a `var()` fallback in this file: a media
+ * query cannot read a custom property. Below it the two columns collapse into one, so each term
+ * stacks above its value, and the row gap tightens to keep a pair reading as a pair. */
+@media (max-width: 48rem) {
+  .root {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--ls-space-1, 4px);
+  }
+}

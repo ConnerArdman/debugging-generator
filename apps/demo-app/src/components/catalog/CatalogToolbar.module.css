@@ -1,0 +1,197 @@
+/*
+ * CatalogToolbar - the catalog's search field, sort dropdown, submit button and result count.
+ *
+ * This module owns the row and nothing else: how the search field, the sort dropdown, the submit
+ * button and the count share the available width, which line each of them sits on, and how the
+ * four stack once the viewport is too narrow for one row.
+ *
+ * What it deliberately does not own: the fields' own appearance. `CatalogToolbar.tsx` renders
+ * `@/components/ui/Input` and `@/components/ui/Select` inside `@/components/ui/FormField`, and
+ * their border, background, radius, padding, focus ring and invalid state belong to
+ * `Input.module.css`, `Select.module.css` and `FormField.module.css` - the same primitives the
+ * checkout form uses, so a field that looked different here would look wrong there. The select's
+ * caret matters in particular: `Select.module.css` draws it from background gradients rather than
+ * an asset, so any `background` declaration reaching that element from this file would erase it.
+ * No rule below targets a field or changes how one looks, and the only thing this file paints is
+ * the toolbar's own hairline.
+ *
+ * Why the wrappers exist at all: `Input` and `Select` are width-filling native elements
+ * (`width: 100%` in their own modules) and their props are the native attributes, so the width
+ * decision has to be made by the element around them. `.search` and `.sortField` are those
+ * elements, and they carry the grid placement.
+ *
+ * THE ONE-ROW LAYOUT: A SHARED CONTROL LINE
+ * Above the stacking breakpoint the toolbar is one grid with three rows - the labels, the
+ * controls, and the line under the controls - and every part is placed on the row it belongs to
+ * rather than aligned by the height of its box. The two `FormField` columns are not the same
+ * height (the search field carries a hint under its input, the sort field does not), so any
+ * alignment by box edge puts something off the line: bottom edges put the submit button level
+ * with the hint instead of the input, and top edges leave it floating above the input by the
+ * height of the label. Row subgrids avoid the question. Each wrapper, and the `FormField` column
+ * inside it, adopts the toolbar's three rows (`grid-template-rows: subgrid`), so both labels land
+ * in the first row, the input and the select in the second and the hint in the third; the submit
+ * button is placed in the second row itself. A row is as tall as its tallest member and every
+ * member stretches to it, so the input, the select and the button share one top edge and one
+ * bottom edge whatever height `Button.module.css` or `Input.module.css` gives each of them.
+ *
+ * The toolbar's row gap is the `FormField` column's own gap (`--ls-space-1`), and that equality
+ * matters: a subgrid whose gap differs from its parent's is laid out with the difference applied
+ * as margins on its items, which would move the adopted label and hint off the lines the count and
+ * the button sit on.
+ *
+ * Nothing in the row moves when the result count changes. The count's column is the flexible
+ * one, and it sits after the controls; the search column's share is a fraction of the toolbar's
+ * own width rather than of the space the other parts leave. So a count that gets longer or
+ * shorter - "Showing 48 of 390 products", "Updating results...", "Showing 32 of 32 products" -
+ * changes the width of the trailing column only, and the count is aligned to its end edge so
+ * its own text does not travel either. The same trailing column is where the submit button's
+ * busy state grows into: the input and the dropdown keep their position and width while a search
+ * is in flight.
+ *
+ * Token contract, as in every module of this workspace: each value is read as
+ * `var(--ls-NAME, <literal fallback>)`, so the module renders sensibly on its own and renders the
+ * `app/globals.css` palette in the application. The four geometry values that the shared scale
+ * does not model - the hairline's width, the search field's minimum, the share of the row the
+ * search field may take and the gap between a label, its control and its hint - are declared once
+ * as file-local custom properties on `.root`, in the same `var()` form, and inherited by the
+ * children that read them. Beyond those properties, the column and row templates use only the
+ * structural keywords `auto`, `subgrid`, `minmax(0, 1fr)` and line numbers.
+ *
+ * Hex fallbacks are lowercase on purpose: Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  /* File-local geometry. Each reads a shared token, should one ever be added to globals.css, and
+   * otherwise resolves to the literal this storefront ships with today. */
+  --catalog-toolbar-hairline: var(--ls-hairline-width, 1px);
+  --catalog-toolbar-search-min: var(--ls-field-min-width, 16rem);
+  /* The most of the row the search field may take: half of it. A fraction of the toolbar's own
+   * width, so the field's size never depends on what the count or the button beside it measure,
+   * and small enough that the trailing column keeps room for the button's busy state even at the
+   * narrowest one-row width (about 47px of it at 641px, where the busy state needs 21px). */
+  --catalog-toolbar-search-share: var(--ls-toolbar-search-share, 50%);
+  /* The gap `FormField.module.css` puts between a label, its control and its hint. The one-row
+   * layout adopts those rows into the toolbar's grid, and the two gaps have to be equal - see the
+   * header. */
+  --catalog-toolbar-field-gap: var(--ls-space-1, 4px);
+
+  /* The stacked layout is the base; the one-row grid below replaces it above 40rem. One column,
+   * every child at the full width, one spacing step between the parts. */
+  display: flex;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+  /* Vertical breathing room only: the horizontal measure belongs to the page shell that holds the
+   * toolbar and the product grid, and both must share one left edge. */
+  padding: var(--ls-space-3, 12px) 0;
+  border-bottom: var(--catalog-toolbar-hairline) solid var(--ls-border, #cbd5e1);
+}
+
+/* The search wrapper never falls below the measure at which a product name or an order code stops
+ * being readable while it is being typed. The minimum is inherited from `.root`, which is always
+ * this element's parent. */
+.search {
+  min-width: var(--catalog-toolbar-search-min);
+}
+
+/* The empty, `aria-hidden` element `CatalogToolbar.tsx` renders between the fields and the count.
+ * No layout here gives it a job: in the one-row grid the trailing column already holds the count
+ * against the end edge, and in the stacked column an element with no content would still claim a
+ * row and the gap in front of it. It is not displayed at any width, which also keeps it from being
+ * auto-placed into a cell of the grid. */
+.spacer {
+  display: none;
+}
+
+/* The result count. Tabular figures give every digit the same advance width, so the line keeps its
+ * measure as the number inside it changes. */
+.count {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The one-row layout, above 40rem - 640px at the default root size - the width below which the
+ * search field's minimum, the dropdown, the button and their gaps stop fitting side by side. The
+ * stacked base applies up to and including 40rem, and the range form starts this block just past
+ * it, so exactly one of the two layouts applies at every width. The length is a literal because a
+ * media query cannot read a custom property. */
+@media (width > 40rem) {
+  /* Four columns - the search field, the dropdown, the button, and the flexible trailing column
+   * the count sits in - and three rows: labels, controls, and the line under the controls. The
+   * search column grows to its share of the row and no further, so the trailing column takes
+   * everything else. `gap` from the stacked layout is replaced axis by axis. */
+  .root {
+    display: grid;
+    grid-template-columns:
+      minmax(var(--catalog-toolbar-search-min), var(--catalog-toolbar-search-share))
+      auto auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto;
+    column-gap: var(--ls-space-3, 12px);
+    row-gap: var(--catalog-toolbar-field-gap);
+  }
+
+  /* Both wrappers adopt all three rows, in their own column. The sort wrapper's column is `auto`,
+   * so it takes the dropdown's natural width - the widest option label plus the lane the select
+   * reserves for its caret - and holds it whatever the count beside it says. */
+  .search,
+  .sortField {
+    display: grid;
+    grid-row: 1 / span 3;
+    grid-template-rows: subgrid;
+    min-width: 0;
+  }
+
+  .search {
+    grid-column: 1;
+  }
+
+  .sortField {
+    grid-column: 2;
+  }
+
+  /* The `FormField` column inside each wrapper - its only child - adopts the same three rows, so
+   * its label, control and hint are placed on the toolbar's lines in source order. This changes
+   * that column's `display`, which `FormField.module.css` declares on a single class; the rule is
+   * two classes deep so specificity, and not the order the bundler emits the two modules in, is
+   * what decides it. The column's own gap is left alone and equals the toolbar's row gap. */
+  .root .search > *,
+  .root .sortField > * {
+    display: grid;
+    grid-row: 1 / span 3;
+    grid-template-rows: subgrid;
+  }
+
+  /* The submit button, the toolbar's only direct `<button>` child: placed on the control row, in
+   * its own content-sized column, and stretched to that row's height like the input and the select
+   * beside it. Placement only - `Button.module.css` owns how it looks. */
+  .root > button {
+    grid-column: 3;
+    grid-row: 2;
+    align-self: stretch;
+  }
+
+  /* The count, on the line under the controls, across every column but the search field's and
+   * aligned to the row's end edge. `min-width: 0` keeps its text out of the column sizing, so no
+   * count ever widens a column; spanning the flexible trailing column, it is always given room
+   * for its longest message. */
+  .count {
+    grid-column: 2 / -1;
+    grid-row: 3;
+    min-width: 0;
+    text-align: end;
+  }
+}
+
+/* Wide rows: from 60rem the trailing column is wide enough for the longest count beside the
+ * controls - about 198px at 960px, against the 170px "Showing 48 of 390 products" needs - so the
+ * count moves up onto the control line and is centred on it, still against the end edge. */
+@media (min-width: 60rem) {
+  .count {
+    grid-column: -2 / -1;
+    grid-row: 2;
+    align-self: center;
+  }
+}

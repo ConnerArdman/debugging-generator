@@ -1,0 +1,111 @@
+/*
+ * CatalogGrid.module.css - the catalog surface's layout, and nothing else.
+ *
+ * Five classes, one per element `CatalogGrid.tsx` names:
+ *
+ *   .root      the labelled <section> that stacks the toolbar, the chip row, an optional notice,
+ *              the product list and the pager
+ *   .filters   the wrapper around the category chip row
+ *   .grid      the product <ul>: the track definition a full page of cards reflows into
+ *   .cell      one product's <li>, sized so the card inside it fills the track
+ *   .notice    the full-measure slot the error alert and the blank-slate notice occupy
+ *
+ * Scope: placement only. A card's surface, border, shadow, radius and type belong to
+ * ProductCard.module.css; the toolbar, the chips, the pager and the notices are styled by their own
+ * modules over `src/components/ui/**`. No rule here reaches into a child component, and none of
+ * them declares a colour, a border or a font, so a child's own module is never in a cascade fight
+ * with this file.
+ *
+ * Token discipline: every length is read as `var(--ls-NAME, <literal>)` from the shared token set
+ * declared once in `app/globals.css`, and each fallback repeats the value declared there, so the
+ * module lays out correctly even when read on its own. Geometry the shared set does not name - the
+ * grid's column minimum at each of the three widths - is a file-local custom property written in
+ * the same `var()` form, so adding an `--ls-catalog-card-min*` token later takes effect without
+ * editing a rule below.
+ *
+ * Widths in the two media queries at the end are plain `rem` literals, as the sibling modules in
+ * this folder write them: a media feature is evaluated before the cascade resolves `var()`, so a
+ * custom property is not valid there. Each query states which minimum it narrows.
+ */
+
+/* The catalog's vertical rhythm: one centred column, evenly spaced, capped at the page measure the
+ * header, main region and footer share. `minmax(0, 1fr)` lets a child narrower than its content -
+ * the chip row, which scrolls sideways on a phone - shrink with the column instead of stretching
+ * it, which is what keeps the section itself from ever becoming the source of a sideways scroll. */
+.root {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--ls-space-4, 16px);
+  width: 100%;
+  max-width: var(--ls-page-max, 1200px);
+  margin-inline: auto;
+}
+
+/* The chip row's slot. Tighter than the section's rhythm because the row belongs with the toolbar
+ * above it; `min-width: 0` is what lets the row scroll rather than widen the page. */
+.filters {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The product list. `auto-fill` decides the column count from the available measure, so the page
+ * needs no breakpoint to choose one, and the `<ul>` list semantics stay intact with its marker and
+ * padding reset here rather than in the card.
+ *
+ * `min(var(--catalog-card-min), 100%)` is the part that guarantees a full page of cards reflows
+ * instead of overflowing: once the container is narrower than one card minimum, the track follows
+ * the container's width rather than forcing it wider. The two queries at the end then lower the
+ * minimum so narrow viewports keep a sensible number of columns instead of one very wide card. */
+.grid {
+  /* Narrowest a product card may be before the grid drops a column. */
+  --catalog-card-min: var(--ls-catalog-card-min, 14rem);
+
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fill, minmax(min(var(--catalog-card-min), 100%), 1fr));
+  gap: var(--ls-space-4, 16px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One product's list item. A single stretched column means the card fills the track's width, and
+ * the stretched row gives the card the definite height its own module resolves `height: 100%`
+ * against - which is how neighbours in a row end up the same height whatever their titles do. */
+.cell {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: stretch;
+  align-items: stretch;
+}
+
+/* The slot a notice takes when it stands in for the list - a load error above the grid, or the
+ * blank slate that replaces it. Spanning every column of its parent means the message keeps the
+ * full measure in the section's single column and, if it is ever placed among the cards, across
+ * the card columns too. */
+.notice {
+  min-width: 0;
+  grid-column: 1 / -1;
+}
+
+/* Tablet measures: across this band a 14rem minimum starts collapsing to two very wide columns, so
+ * the minimum narrows to 11rem and the band keeps three of them, with a media box that is still a
+ * comfortable size. */
+@media (max-width: 48rem) {
+  .grid {
+    --catalog-card-min: var(--ls-catalog-card-min-md, 11rem);
+  }
+}
+
+/* Phone measures: 9.5rem keeps two cards per row on a typical phone, where 11rem would already have
+ * dropped to one, so browsing a long page stays a scroll rather than a marathon. On the narrowest
+ * screens the `min()` clause above still collapses the row to a single full-measure card, which is
+ * the outcome that keeps the page inside the viewport. */
+@media (max-width: 30rem) {
+  .grid {
+    --catalog-card-min: var(--ls-catalog-card-min-sm, 9.5rem);
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@debuggen/model-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model boundary for Debug Generator: the ModelProvider interface, Anthropic and deterministic implementations, schema-validated structured output, versioned prompt loading and the outbound redaction guard",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": [
+        "./src/index.ts",
+        "./dist/index.d.ts"
+      ],
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project model-provider"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.127.0",
+    "@debuggen/shared": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

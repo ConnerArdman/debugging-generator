@@ -1,0 +1,5860 @@
+/**
+ * `components/Waterfall` — the colocated suite of the node catalog's
+ * `waterfall` type.
+ *
+ * ## What this suite is protecting
+ *
+ * A waterfall is one of the three views the slow-interaction acceptance panel
+ * is assembled from, and it is the one that has to answer *what was waiting on
+ * what*. Two properties carry that answer, and a regression in either turns
+ * the view into a list of unrelated bars that still renders perfectly:
+ *
+ *   - **Offsets are relative to the first *included* call.** The case below
+ *     deliberately puts an earlier record of a kind this view does not draw in
+ *     the same page: the window must still start at the earliest drawn call, so
+ *     the leftmost bar sits at zero and every printed offset is a wait rather
+ *     than a wall-clock reading.
+ *   - **Children nest under the call that was blocked by them.** A collapsed
+ *     row discloses its nested calls, the disclosure is reported to the host,
+ *     and a record whose immediate parent is of an undrawn kind still lands
+ *     beneath its nearest drawn ancestor.
+ *
+ * Alongside those, every component suite here covers the three states of a
+ * query-backed view — loading, empty and error — and the click-to-source
+ * payload (`docs/ARCHITECTURE.md`, "The renderer contract"), and this one holds
+ * the view to honest paging: what a footer claims about coverage, and that
+ * "load more" advances the offset the *service* reported on the query the
+ * provider actually receives.
+ *
+ * Paging far must stay bounded, so three blocks hold the bounds the component
+ * documents. "Pages folded as they arrive" proves a page folded into what is
+ * held nests exactly as a rebuild would — a call moves under the parent a
+ * later page supplies, directly or through an undrawn span. "The held-record
+ * budget" proves the oldest pages are released past the budget, the footer
+ * states which positions are held and how many were released, and a released
+ * call is never reported as not captured. "The mounted row window" proves the
+ * tree never mounts more than its row budget however many rows are expanded,
+ * that Previous/Next rows and the keyboard move the window, and that expansion
+ * and the single tab stop survive every move.
+ *
+ * "Durations that are not measurements" holds the display apart from the
+ * geometry: a negative, `null` or `NaN` duration in a malformed record is drawn
+ * at zero so its bar still marks where the call began, but it is printed and
+ * described as {@link NOT_AVAILABLE_LABEL}, never as the measured `0.00 ms` —
+ * the fastest call of the capture — that the drawn value would read as.
+ *
+ * "Direction controls in captured text" holds the one change display makes to
+ * a captured value: a Unicode direction control in a route, a lineage
+ * candidate or an unresolved parent's id is printed as its visible escape
+ * (`\u202E`) in the label, the row's accessible name and its description —
+ * never raw, never as markup — while the selection a row raises still carries
+ * the raw event id. Text without a control is untouched, so the byte
+ * comparisons below still hold.
+ *
+ * ## The privacy cases, and why they are byte-comparisons
+ *
+ * A redacted URL and a parameterized statement arrive in their final display
+ * form: query-parameter values are already replaced per key, and statement
+ * literals are already replaced. This view's whole obligation is to render them
+ * unchanged, so the two cases below compare the rendered text *byte for byte*
+ * against the fixture rather than asserting that it "contains" a path — a
+ * component that re-assembled a URL from parts, unescaped a mask, pretty-printed
+ * a statement or substituted a placeholder back would satisfy a containment
+ * check and fail these.
+ *
+ * Three further assertions hold the rest of that boundary. Bodies and row
+ * contents are never captured, so the fixtures carry attribute keys that would
+ * be exactly that if a producer smuggled them in, and no case may find their
+ * values on screen; a database row shows a *count*; and no control anywhere
+ * offers to reveal a raw value, a body or a result set. A transferred-byte
+ * figure the runtime genuinely could not observe renders as
+ * {@link NOT_AVAILABLE_LABEL} and never as a zero that would read as "nothing
+ * was transferred". The boundary itself is stated in `docs/SECURITY.md`
+ * ("Redaction", "Never captured").
+ *
+ * ## Harness conventions (shared with `./SpanTable.test.tsx`)
+ *
+ *   - **Test API imported explicitly** from `vitest`, and `afterEach(cleanup)`
+ *     registered explicitly, even though the `panel-renderer` project enables
+ *     globals for `@testing-library/react`'s automatic cleanup.
+ *   - **Stub providers built with the library's own `createDataProvider`**, so
+ *     these cases drive the very seam both host surfaces implement. Every query
+ *     the component issues is recorded: what it *asked for* is as much of its
+ *     contract as what it drew.
+ *   - **In-file synthetic builders, no fixture files.** {@link makeEvent} and
+ *     {@link makeNode} take overrides, and nothing here calls a telemetry
+ *     runtime helper to build a record. The one telemetry runtime value read is
+ *     `KIND_ALLOWED_TIERS`, the event schema's own kind-to-tier rule, so the
+ *     case that draws every catalogued kind gives each record a tier the schema
+ *     permits instead of a table retyped here; the node catalog's entry is read
+ *     the same way, through `catalogEntryFor`. Nothing but the component
+ *     stylesheet is read from disk.
+ *   - **Layout is never stubbed.** The time scale's range is a percentage
+ *     interval and the axis fits its tick labels to a fixed logical strip, so
+ *     bars, rows, tick positions and the tick set itself must be correct from
+ *     data alone under happy-dom, where every measurement answers zero — and
+ *     every case runs exactly there. No case spies on, replaces or stubs a
+ *     layout API: "The time axis, from the data alone" asserts the exact tick
+ *     set a window draws, and reads its fit back independently. That the real
+ *     strip is never narrower than the design strip is the stylesheet's
+ *     guarantee, which happy-dom does not apply, so "The axis floor and the
+ *     scroll viewport" asserts it as a contract: the track floor the
+ *     stylesheet declares, resolved through the token table, and the elements
+ *     the one scroll viewport holds.
+ *   - **Budgets are exercised at their documented size.** The held-record
+ *     budget is restated from the node catalog's `DATA_QUERY_MAX_LIMIT` and
+ *     filled mostly with records of a kind this view does not draw, and the
+ *     row budget with the rows of one expanded call, so each bound is crossed
+ *     for real without mounting more than the bound itself.
+ *   - **Generic fixture vocabulary only**: a loopback URL, an `/example/…`
+ *     path, an `example_…` table and a `src/example/…` file, none of which
+ *     belongs to any inspected application.
+ *   - **Queries by role and accessible name**, with a class read only off an
+ *     element already obtained semantically (no `jest-dom` matchers exist in
+ *     this repository), and no timers — post-resolution assertions go through
+ *     `await screen.findBy…`.
+ *
+ * @see ./Waterfall for the component, its four states and its row contract.
+ * @see ../host/DataProvider for the seam the stubs below implement.
+ * @see ../host/useQuery for the loading/empty/error machine they drive.
+ */
+
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  catalogEntryFor,
+} from '@debuggen/panel-schema';
+import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
+import { DebuggenError } from '@debuggen/shared';
+import type { SourceLocation } from '@debuggen/shared';
+import { KIND_ALLOWED_TIERS } from '@debuggen/telemetry';
+import type { RequestGroup, RequestOccurrence, TelemetryEvent } from '@debuggen/telemetry';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { RenderResult } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
+
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
+import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { DESIGN_TOKENS, cssVarName } from '../tokens/tokens';
+import type { DesignTokens, TokenKey } from '../tokens/tokens';
+import { httpStatusColorVar, kindColorVar } from '../utils/color';
+import {
+  NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
+  containsDirectionControl,
+  formatBytes,
+  formatCount,
+  formatDuration,
+  formatDurationCompact,
+  formatKindLabel,
+  formatShare,
+  formatTierLabel,
+  oneLinePreview,
+} from '../utils/format';
+import { Waterfall } from './Waterfall';
+
+/*
+ * ---------------------------------------------------------------------------
+ * Fixture vocabulary
+ *
+ * Every string below is application-neutral: no component, route, service,
+ * table or symbol of any inspected project appears here, in the fixtures or in
+ * the comments. The identifiers are shaped as a capture shapes them — a 32-hex
+ * trace id, 16-hex span ids, epoch-millisecond start times, millisecond
+ * durations — because the component reads those fields and formats them.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The fixture trace every record below belongs to: 32 lower-case hex digits. */
+const TRACE_ID = 'b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2';
+
+/** The fixture session and capture the persisted records are attributed to. */
+const SESSION_ID = 'session-example-0001';
+const CAPTURE_ID = 'capture-example-0001';
+
+/** The producer that reported them. */
+const PRODUCER_ID = 'producer-example-0001';
+
+/**
+ * The reference start time, in Unix epoch milliseconds: 2026-01-01T00:00:00Z.
+ *
+ * Far enough from zero that a relative performance timestamp could not be
+ * mistaken for one, which is what makes "no row prints a wall-clock time" a
+ * meaningful assertion.
+ */
+const BASE_START_MS = 1_767_225_600_000;
+
+/**
+ * The request URL as it arrives: every query-parameter *value* already replaced
+ * per key with the redaction mask, the path retained.
+ *
+ * This exact string is what the row must render — it is already the correct
+ * display form, and re-deriving any part of it is the defect the verbatim case
+ * below exists to catch.
+ */
+const REQUEST_URL = 'http://127.0.0.1:3000/example/resource?tenant=?&page=?';
+
+/** The request method, as the producer reported it. */
+const REQUEST_METHOD = 'POST';
+
+/** The matched server route, which labels a server request better than its name. */
+const SERVER_ROUTE = '/example/resource';
+
+/**
+ * The statement as it arrives: parameterized, with the driver's own `$1`
+ * placeholder kept and the inline literals already replaced by the redaction
+ * mask. Rendered verbatim, never re-assembled with values put back.
+ */
+const SQL_STATEMENT =
+  'SELECT id, total FROM example_ledger WHERE tenant_id = $1 AND recorded_at > ? LIMIT ?';
+
+/** How many rows that statement touched. Row *contents* are never captured. */
+const SQL_ROW_COUNT = 1240;
+
+/** Bytes transferred for the request that carried a resource-timing figure. */
+const TRANSFERRED_BYTES = 2048;
+
+/*
+ * Values a producer must never report and this view must never render. They sit
+ * in the fixtures' attribute bags under body- and row-shaped keys so that the
+ * privacy cases are a statement about the RENDERER: bodies and row contents are
+ * not captured, and a bag that carried them anyway — a producer from a future
+ * build, a hand-built fixture — must still draw nothing.
+ */
+const UNRENDERABLE_REQUEST_BODY = 'unrendered-request-payload';
+const UNRENDERABLE_RESPONSE_BODY = 'unrendered-response-payload';
+const UNRENDERABLE_ROW_CONTENTS = 'unrendered-row-contents';
+
+/** A project-relative, POSIX path for the one record that resolved to source. */
+const SOURCE_FILE = 'src/example/service.ts';
+
+/** The symbol at that location. */
+const SOURCE_SYMBOL = 'runExample';
+
+/** Its 1-based coordinates. */
+const SOURCE_LINE = 84;
+const SOURCE_COLUMN = 9;
+
+/** A complete, resolved location for the source-chip case. */
+const BASE_SOURCE: SourceLocation = {
+  file: SOURCE_FILE,
+  line: SOURCE_LINE,
+  column: SOURCE_COLUMN,
+  symbol: SOURCE_SYMBOL,
+  resolvedBy: 'code-graph',
+  confidence: 0.9,
+};
+
+/** The accessible name the source chip announces (`SourceLink`'s own shape). */
+const SOURCE_CHIP_NAME = `Open ${SOURCE_FILE}:${String(SOURCE_LINE)}:${String(SOURCE_COLUMN)}`;
+
+/** The identity of the node under test, as a normaliser would assign it. */
+const NODE_ID = 'layout.0.waterfall';
+
+/*
+ * The accessible names of the controls and containers the cases reach for.
+ * Spelled out rather than derived, so this suite pins what a reader hears
+ * instead of restating whatever the component currently passes.
+ */
+const TREE_NAME = 'Captured calls, nested under the call that was waiting on them';
+
+/*
+ * A disclosure button names what it opens: the count and the call it belongs
+ * to, with the call's kind ("Expand the 1 nested call inside … (Fetch)",
+ * "Expand the 2 calls grouped under … (Fetch)"). Cases that only need *a
+ * row's* disclosure reach it by this shape; the
+ * disclosure-name cases below pin the exact sentence for each form.
+ */
+const EXPAND_NAME = /^Expand the \d[\d,]* (?:nested )?calls? (?:inside|grouped under) \S/;
+const COLLAPSE_NAME = /^Collapse the \d[\d,]* (?:nested )?calls? (?:inside|grouped under) \S/;
+const LOAD_MORE_NAME = 'Load more';
+const RETRY_NAME = 'Retry';
+const FAILING_QUERY_NAME = 'Failing query';
+
+/*
+ * The shared error-state contract, spelled out rather than imported: these are
+ * the words every query-backed node shows a reader — one title and lead for a
+ * view whose own data could not be loaded, another for a failed next page below
+ * rows that stay on screen — so a change to any of them fails this suite
+ * instead of being followed silently through an import.
+ */
+
+/** The title of a view whose own data could not be loaded. */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+
+/** The sentence every view failure's message opens with, before the provider's cause. */
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+
+/** The title of a failed next page below rows that stay on screen. */
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+
+/** The sentence a failed next page's message opens with. */
+const PAGE_FAILURE_LEAD =
+  'The next page of this view could not be loaded. The rows already shown are unaffected.';
+
+/** The title of a node whose query names a source this view cannot draw. */
+const UNSUPPORTED_TITLE = 'This view cannot draw the requested data';
+
+/** The key the retry control carries so the host can hand focus back to it after a remount. */
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** The visible summary of the closed technical-details disclosure. */
+const TECHNICAL_DETAILS_LABEL = 'Technical details';
+
+/** The provider's own cause in the failure cases below. */
+const CHANNEL_CLOSED = 'The channel to the service is closed.';
+
+/**
+ * The loading announcement, ending in the ellipsis every other loading label in
+ * the package carries.
+ */
+const LOADING_LABEL = 'Loading captured calls…';
+
+/** A generic substring of the component's own empty copy. */
+const EMPTY_MESSAGE = /no network or database calls were captured/i;
+
+/**
+ * The headings of the two empty states that are not an empty capture: an
+ * explicit count-only request, and a page that is empty while its query is not.
+ */
+const COUNT_ONLY_TITLE = 'Count only';
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The heading of the empty capture, the one empty state carrying the view's glyph. */
+const EMPTY_CAPTURE_TITLE = 'No calls';
+
+/**
+ * Anything that would offer to reveal a captured body, a raw value or a result
+ * set. No control in this view may match it: the data behind such a control was
+ * never captured, so the control could only ever mislead.
+ */
+const BODY_CONTROL = /\braw\b|\bbody\b|payload|result set|row data|contents/i;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Synthetic builders
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The optional fields of a record admit `undefined` explicitly, which `Partial`
+ * does not under this repository's `exactOptionalPropertyTypes`: passing
+ * `{ source: undefined }` is how a case asks for a row *without* a location,
+ * and {@link makeEvent} drops the key rather than storing the value.
+ */
+type EventOverrides = Partial<
+  Pick<
+    TelemetryEvent,
+    | 'id'
+    | 'traceId'
+    | 'spanId'
+    | 'kind'
+    | 'name'
+    | 'startTime'
+    | 'duration'
+    | 'tier'
+    | 'status'
+    | 'attributes'
+    | 'seq'
+    | 'ingestSeq'
+  >
+> & {
+  readonly parentSpanId?: string | undefined;
+  readonly source?: SourceLocation | undefined;
+};
+
+/** A 16-hex span id derived from a small ordinal, so ids stay readable. */
+function spanIdFor(ordinal: number): string {
+  return `00000000000000${ordinal.toString(16).padStart(2, '0')}`;
+}
+
+/** An event id derived from the same ordinal, for the same reason. */
+function eventIdFor(ordinal: number): string {
+  return `event-example-${ordinal.toString().padStart(4, '0')}`;
+}
+
+/**
+ * One persisted record for a row to draw.
+ *
+ * Complete and schema-shaped by construction: a 32-hex `traceId`, a 16-hex
+ * `spanId`, an epoch-millisecond `startTime`, a millisecond `duration`, and a
+ * `kind`/`tier` pair the event schema's cross-field rule permits (`fetch` and
+ * `xhr` on `browser`, `http.server` and `http.client` on `server`, `db.query`
+ * only on `db`).
+ *
+ * @param overrides Fields to replace, or `undefined` to omit an optional one.
+ * @returns A fresh record; nothing is shared between calls.
+ */
+function makeEvent(overrides: EventOverrides = {}): TelemetryEvent {
+  const {
+    id = eventIdFor(1),
+    traceId = TRACE_ID,
+    spanId = spanIdFor(1),
+    parentSpanId,
+    kind = 'fetch',
+    name = 'example.call',
+    startTime = BASE_START_MS,
+    duration = 12,
+    tier = 'browser',
+    status = 'ok',
+    attributes = {},
+    seq = 0,
+    ingestSeq = 1,
+    source,
+  } = overrides;
+
+  return {
+    id,
+    traceId,
+    spanId,
+    kind,
+    name,
+    startTime,
+    duration,
+    tier,
+    attributes,
+    status,
+    producerId: PRODUCER_ID,
+    seq,
+    sessionId: SESSION_ID,
+    captureId: CAPTURE_ID,
+    ingestSeq,
+    ...(parentSpanId === undefined ? {} : { parentSpanId }),
+    ...(source === undefined ? {} : { source }),
+  };
+}
+
+/** Overrides accepted by {@link makeNode}, with the same `undefined` policy. */
+type NodeOverrides = Partial<Pick<WaterfallNode, 'id' | 'query'>> & {
+  readonly title?: string | undefined;
+  readonly description?: string | undefined;
+};
+
+/**
+ * A normalised `waterfall` node, as the panel normaliser produces one: an id, no
+ * heading (the host's section owns that) and the flat-record query its catalog
+ * entry permits.
+ *
+ * @param overrides Fields to replace.
+ * @returns A fresh node.
+ */
+function makeNode(overrides: NodeOverrides = {}): WaterfallNode {
+  const { id = NODE_ID, query = { source: 'spans' }, title, description } = overrides;
+
+  return {
+    type: 'waterfall',
+    id,
+    query,
+    ...(title === undefined ? {} : { title }),
+    ...(description === undefined ? {} : { description }),
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Stub providers
+ *
+ * Built through `createDataProvider`, the factory the library publishes for
+ * exactly this shape: one resolver answering every query. Two things come with
+ * it — the single type assertion the generic `DataProvider.query` signature
+ * would otherwise force into this file, and the factory's own check that a
+ * response answers for the source it was asked about.
+ * ---------------------------------------------------------------------------
+ */
+
+/** One page a stub provider can answer with. */
+interface SpanPage {
+  /** The records of the page, in the order the service returned them. */
+  readonly data: readonly TelemetryEvent[];
+
+  /** The total the service reports for the whole query, when it reports one. */
+  readonly total?: number | undefined;
+
+  /** The offset of the next page, when one exists. */
+  readonly nextOffset?: number | undefined;
+}
+
+/** A stub provider, the queries it has received and the resolver behind it. */
+interface StubProvider {
+  /** The provider to hand to {@link renderComponent}. */
+  readonly provider: DataProvider;
+
+  /**
+   * Every query the component has asked for, in call order.
+   *
+   * The assertion surface for the paging and retry cases: the offset a view
+   * advances to is only correct if the provider actually received it.
+   */
+  readonly queries: readonly DataQuery[];
+
+  /** The recorded resolver, for call counts. */
+  readonly resolve: Mock<DataQueryResolver>;
+}
+
+/**
+ * A provider whose answers are computed per call.
+ *
+ * @param respond Called with each query and the 1-based number of the call.
+ * @returns The stub, its recorded queries and its resolver.
+ */
+function recordingProvider(
+  respond: (query: DataQuery, call: number) => Promise<DataQueryResponse>,
+): StubProvider {
+  const queries: DataQuery[] = [];
+  const resolve = vi.fn<DataQueryResolver>((query) => {
+    queries.push(query);
+
+    return respond(query, queries.length);
+  });
+
+  return { provider: createDataProvider(resolve), queries, resolve };
+}
+
+/**
+ * A provider that answers each successive call with the next page, repeating the
+ * last one once the list is exhausted.
+ *
+ * The builder the paging case uses: a second call has to be able to answer
+ * differently from the first, or "the page was appended" could not be told from
+ * "the same page was drawn twice".
+ *
+ * @param pages The pages, in call order. At least one.
+ * @returns The stub provider.
+ */
+function pagingProvider(pages: readonly SpanPage[]): StubProvider {
+  return recordingProvider((_query, call) => {
+    const page = pages[Math.min(call, pages.length) - 1];
+
+    if (page === undefined) {
+      throw new Error('the stub provider was built with no pages');
+    }
+
+    return Promise.resolve<DataQueryResponse>({
+      source: 'spans',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    });
+  });
+}
+
+/**
+ * A provider that resolves one page for every query.
+ *
+ * @param data The records of the page, in the order the service returned them.
+ * @param extra The paging counters to report, if any.
+ * @returns The stub provider.
+ */
+function resolvingProvider(
+  data: readonly TelemetryEvent[],
+  extra: Omit<SpanPage, 'data'> = {},
+): StubProvider {
+  return pagingProvider([{ data, ...extra }]);
+}
+
+/**
+ * A provider that answers each query with the page its SESSION and OFFSET
+ * select, and rejects any query no page was built for.
+ *
+ * The builder the page-identity cases use: what they prove is which slice of
+ * which session's result the component asked for after its node or its session
+ * changed, so the answer has to depend on exactly those two coordinates rather
+ * than on how many calls came before.
+ *
+ * @param pageFor The page for a session and a requested offset, or `undefined`
+ * when the case built none for them.
+ * @returns The stub provider.
+ */
+function slicingProvider(
+  pageFor: (sessionId: string, offset: number) => SpanPage | undefined,
+): StubProvider {
+  const queries: DataQuery[] = [];
+  const resolve = vi.fn<DataQueryResolver>((query, context) => {
+    queries.push(query);
+
+    const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+    const page = pageFor(context.sessionId, offset);
+
+    if (page === undefined) {
+      return Promise.reject(
+        new Error(`no page was built for ${context.sessionId} at offset ${String(offset)}`),
+      );
+    }
+
+    return Promise.resolve<DataQueryResponse>({
+      source: 'spans',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    });
+  });
+
+  return { provider: createDataProvider(resolve), queries, resolve };
+}
+
+/**
+ * A provider whose promise never settles — the loading state, with no timer.
+ *
+ * @returns The stub provider.
+ */
+function pendingProvider(): StubProvider {
+  return recordingProvider(() => new Promise<DataQueryResponse>(() => undefined));
+}
+
+/**
+ * A provider that rejects every query.
+ *
+ * Rejects with a `DebuggenError` because that is what the interface asks an
+ * implementation for: the code and hint it carries are what the error state
+ * renders.
+ *
+ * @param error The failure to reject with.
+ * @returns The stub provider.
+ */
+function rejectingProvider(error: DebuggenError): StubProvider {
+  return recordingProvider(() => Promise.reject(error));
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Actions, rendering and DOM readers
+ * ---------------------------------------------------------------------------
+ */
+
+/** A host's `PanelActions`, with every member this component can raise spied on. */
+interface ActionSpies {
+  /** The object to provide through {@link PanelActionsContext}. */
+  readonly actions: PanelActions;
+
+  /** The event-selection spy. */
+  readonly onSelectEvent: Mock<(ref: PanelEventRef) => void>;
+
+  /** The open-source spy. */
+  readonly onOpenSource: Mock<(location: SourceLocation) => void>;
+
+  /** The optional disclosure spy, supplied so cases can assert on it. */
+  readonly onExpand: Mock<(nodeId: string, itemId: string, expanded: boolean) => void>;
+}
+
+/**
+ * Fresh action spies.
+ *
+ * Both required members are supplied — a host missing either is not a host —
+ * and the optional disclosure report is supplied too, so every case can assert
+ * not only that the intent it exercised was raised but also that the others
+ * were not: activating a source chip must not also select a row, and expanding
+ * a row must not select it either.
+ *
+ * @returns The actions object and its three spies.
+ */
+function makeActions(): ActionSpies {
+  const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+  const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+  const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
+
+  return {
+    actions: { onSelectEvent, onOpenSource, onExpand },
+    onSelectEvent,
+    onOpenSource,
+    onExpand,
+  };
+}
+
+/** What the component is rendered inside: the host's provider, actions and session. */
+interface HostContext {
+  /** The provider that resolves the node's query. */
+  readonly provider: DataProvider;
+
+  /** The actions the component reports to. */
+  readonly actions: PanelActions;
+
+  /** The session `PanelSessionContext` carries; the fixture session when omitted. */
+  readonly sessionId?: string | undefined;
+}
+
+/**
+ * The component inside all three host contexts, as `PanelHost` nests them.
+ *
+ * @param node The node to draw.
+ * @param context The provider, actions and session to render it inside.
+ * @returns The element tree.
+ */
+function hostTree(node: WaterfallNode, context: HostContext): ReactElement {
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={context.sessionId ?? SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <Waterfall node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
+/**
+ * Renders the component inside both host contexts.
+ *
+ * @param node The node to draw.
+ * @param context The provider to resolve its query and the actions to report to.
+ * @returns The render result, for a case that re-renders the same mounted view.
+ */
+function renderComponent(node: WaterfallNode, context: HostContext): RenderResult {
+  return render(hostTree(node, context));
+}
+
+/**
+ * Re-renders an already mounted view with a new node or a new host context —
+ * the same component instance, so its paging state survives unless the
+ * component itself decides it no longer applies.
+ *
+ * @param view What {@link renderComponent} returned.
+ * @param node The node to draw now.
+ * @param context The provider, actions and session to render it inside now.
+ */
+function rerenderComponent(view: RenderResult, node: WaterfallNode, context: HostContext): void {
+  view.rerender(hostTree(node, context));
+}
+
+/**
+ * Every drawn row, in document order — a collapsed subtree contributes none,
+ * because it is not in the document at all.
+ *
+ * @returns The rows currently on screen.
+ */
+function drawnRows(): HTMLElement[] {
+  return screen.queryAllByRole('treeitem');
+}
+
+/**
+ * What each drawn row announces itself as, in document order.
+ *
+ * The row's `aria-label` is the component's own one-line description of the
+ * call — label, kind, tier, offset, duration and the figures that do not fit on
+ * it — so this is where the offset and transfer assertions read from.
+ *
+ * @returns One description per row.
+ */
+function rowDescriptions(): string[] {
+  return drawnRows().map((row) => row.getAttribute('aria-label') ?? '');
+}
+
+/**
+ * The accessible name of every control on screen.
+ *
+ * Read from `aria-label` first and from the control's text second, which is the
+ * order the platform computes a name in for the two shapes this view renders —
+ * an icon-only disclosure button and a labelled footer button.
+ *
+ * @returns One name per control.
+ */
+function controlNames(): string[] {
+  return screen
+    .queryAllByRole('button')
+    .map((control) => control.getAttribute('aria-label') ?? control.textContent ?? '');
+}
+
+/** The single query a stub provider received, failing on any other count. */
+function soleQuery(stub: StubProvider): DataQuery {
+  expect(stub.queries).toHaveLength(1);
+
+  const [query] = stub.queries;
+
+  if (query === undefined) {
+    throw new Error('the stub provider recorded no query');
+  }
+
+  return query;
+}
+
+/**
+ * The query a stub provider received on the given 1-based call.
+ *
+ * @param stub The stub provider.
+ * @param call The 1-based call number.
+ * @returns That query.
+ */
+function queryOfCall(stub: StubProvider, call: number): DataQuery {
+  const query = stub.queries[call - 1];
+
+  if (query === undefined) {
+    throw new Error(`the stub provider recorded no query for call ${String(call)}`);
+  }
+
+  return query;
+}
+
+/**
+ * The description of the row at `index`, in document order.
+ *
+ * @param index Zero-based row index.
+ * @returns That row's accessible description.
+ */
+function descriptionAt(index: number): string {
+  const description = rowDescriptions()[index];
+
+  if (description === undefined) {
+    throw new Error(`no row was drawn at index ${String(index)}`);
+  }
+
+  return description;
+}
+
+/**
+ * The row whose visible label is exactly `label`.
+ *
+ * Obtained from the label element and then widened to the row that holds it,
+ * which is how a case names a row by the call it stands for — a redacted URL, a
+ * matched route, a parameterized statement — rather than by a position.
+ *
+ * @param label The row's visible label, in full.
+ * @returns That row.
+ */
+function rowLabelled(label: string): HTMLElement {
+  const row = screen.getByText(label).closest<HTMLElement>('[role="treeitem"]');
+
+  if (row === null) {
+    throw new Error(`the element labelled "${label}" is not inside a row`);
+  }
+
+  return row;
+}
+
+// Explicit, per the harness note above: automatic cleanup belongs to the
+// runner's configuration, this guarantee belongs to the suite. Restoring spies
+// in the same place keeps one case's mock out of the next.
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The correlated chain most cases draw
+ *
+ * A browser request, the server request it reached, and the statement that
+ * server request ran — the shape of the interaction the slow-button panel is
+ * built for. The records are linked by `parentSpanId`, so a page holding all
+ * three draws one row with two levels nested inside it, while a page holding
+ * any one of them alone draws it as a top-level row: a parent link that points
+ * outside the page is an unresolved ancestry, which this view is honest about
+ * rather than inventing.
+ *
+ * The attribute bags are named constants so that a case needing a record on its
+ * own builds one with the same attributes rather than restating them.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The browser request's attributes, including two keys a producer must never
+ * report: bodies are not captured, and no row may render one.
+ */
+const REQUEST_ATTRIBUTES: TelemetryEvent['attributes'] = {
+  'http.method': REQUEST_METHOD,
+  url: REQUEST_URL,
+  'http.status_code': 200,
+  transferSize: TRANSFERRED_BYTES,
+  initiator: 'fetch',
+  requestBody: UNRENDERABLE_REQUEST_BODY,
+  responseBody: UNRENDERABLE_RESPONSE_BODY,
+};
+
+/** The server request's attributes: method, matched route and status. */
+const SERVER_ATTRIBUTES: TelemetryEvent['attributes'] = {
+  'http.method': REQUEST_METHOD,
+  'http.route': SERVER_ROUTE,
+  'http.status_code': 200,
+};
+
+/**
+ * The statement's attributes: the parameterized text, the count of rows it
+ * touched, and — again as a key that must draw nothing — something shaped like
+ * the rows themselves.
+ */
+const STATEMENT_ATTRIBUTES: TelemetryEvent['attributes'] = {
+  'db.system': 'postgresql',
+  'db.statement': SQL_STATEMENT,
+  'db.rowCount': SQL_ROW_COUNT,
+  resultRows: UNRENDERABLE_ROW_CONTENTS,
+};
+
+/** The browser request: the outermost call, and the one that resolved to source. */
+const REQUEST_EVENT = makeEvent({
+  id: eventIdFor(1),
+  spanId: spanIdFor(1),
+  kind: 'fetch',
+  tier: 'browser',
+  name: 'example.call',
+  startTime: BASE_START_MS,
+  duration: 1175,
+  attributes: REQUEST_ATTRIBUTES,
+  seq: 0,
+  ingestSeq: 1,
+  source: BASE_SOURCE,
+});
+
+/** The server request the browser call was waiting on. */
+const SERVER_EVENT = makeEvent({
+  id: eventIdFor(2),
+  spanId: spanIdFor(2),
+  parentSpanId: spanIdFor(1),
+  kind: 'http.server',
+  tier: 'server',
+  name: 'example.server-request',
+  startTime: BASE_START_MS + 8,
+  duration: 1120,
+  attributes: SERVER_ATTRIBUTES,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/** The statement the server request ran, and where most of the time went. */
+const QUERY_EVENT = makeEvent({
+  id: eventIdFor(3),
+  spanId: spanIdFor(3),
+  parentSpanId: spanIdFor(2),
+  kind: 'db.query',
+  tier: 'db',
+  name: 'example.statement',
+  startTime: BASE_START_MS + 18,
+  duration: 640,
+  attributes: STATEMENT_ATTRIBUTES,
+  seq: 2,
+  ingestSeq: 3,
+});
+
+/** The three of them, as one page. */
+const CHAIN: readonly TelemetryEvent[] = [REQUEST_EVENT, SERVER_EVENT, QUERY_EVENT];
+
+/**
+ * A React commit: captured evidence, and a record this view does not draw.
+ *
+ * Present in several pages below as the thing that must produce no row — a
+ * waterfall is about calls, and a page of commits holds nothing for it.
+ */
+const RENDER_EVENT = makeEvent({
+  id: eventIdFor(9),
+  spanId: spanIdFor(9),
+  kind: 'render',
+  tier: 'browser',
+  name: 'example.render',
+  startTime: BASE_START_MS,
+  duration: 47,
+  seq: 9,
+  ingestSeq: 9,
+});
+
+describe('Waterfall states', () => {
+  it('renders the loading state, and no rows, while the query has not settled', () => {
+    const stub = pendingProvider();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // `LoadingState` owns the announcement; this component contributes only the
+    // element class that places it.
+    const busy = screen.getByRole('status');
+    expect(busy.getAttribute('aria-busy')).toBe('true');
+    expect(busy.getAttribute('aria-live')).toBe('polite');
+    expect(busy.closest('.dg-waterfall__loading')).not.toBeNull();
+    expect(within(busy).getByText(LOADING_LABEL)).toBeTruthy();
+
+    // Nothing is drawn yet: no tree, therefore no rows, and above all no empty
+    // state — an unsettled query is not an answer.
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(drawnRows()).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    // One query, and it was issued without waiting to be asked twice.
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders its own empty message for a page holding only kinds it does not draw', async () => {
+    const stub = resolvingProvider([RENDER_EVENT]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // The page is a success and it is not empty — it simply holds no call — so
+    // the kind filter is what has to produce the absence. A view that drew a
+    // record of any kind would render an axis and one bar here instead. The
+    // record it filtered out is captured evidence, so the state counts it
+    // rather than claiming the capture held nothing.
+    const message = await screen.findByText(
+      `${formatCount(1)} span is loaded, and it is not a network or database call; no total was reported for this query.`,
+    );
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.closest('.dg-waterfall__empty')).not.toBeNull();
+    expect(screen.getByText(EMPTY_PAGE_TITLE).classList.contains('dg-empty-state__title')).toBe(
+      true,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(drawnRows()).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
+    expect(document.body.textContent ?? '').not.toContain(RENDER_EVENT.name);
+  });
+
+  it('renders an alert carrying the failed query, and retries it on request', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+
+    // The shared lead opens the message and the provider's own cause follows
+    // it, with its code beside them, which is what makes the failure
+    // actionable.
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
+    expect(alert.textContent).toContain(CHANNEL_CLOSED);
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+
+    // The query that failed is shown in full, including the offset it was made
+    // at. Compared as a value rather than as a spelling.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'spans',
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    });
+
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+    // The retry an error state offers is only useful if it really re-queries.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual(queryOfCall(stub, 1));
+
+    // No rows, and no axis, were invented behind the failure.
+    expect(drawnRows()).toHaveLength(0);
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('img')).toBeNull();
+  });
+
+  it('renders a provider rejection through the shared error-state contract, naming the query it asked', async () => {
+    const hint = 'Start the local service, then retry.';
+    const details = { attempts: 3, endpoint: 'panel-data' };
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', CHANNEL_CLOSED, { hint, details }),
+    );
+    const user = userEvent.setup();
+
+    // A grouped network node authoring a filter and a page size but no
+    // offset: the query the view asks is the authored one at its first
+    // offset, and that is what failed and what the reader must be shown.
+    renderComponent(
+      makeNode({ query: { source: 'requests', filter: { tier: 'browser' }, limit: 25 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // A lone failure is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+
+    // The one title, and the one message: the generic lead, then the
+    // provider's own cause as a sentence of its own.
+    const title = within(alert).getByText(VIEW_FAILURE_TITLE);
+    expect(title.classList.contains('dg-error-state__title')).toBe(true);
+    const message = within(alert).getByText((text) => text.startsWith(VIEW_FAILURE_LEAD));
+    expect(message.classList.contains('dg-error-state__message')).toBe(true);
+    expect(message.textContent).toContain(CHANNEL_CLOSED);
+
+    // What the reader can do, on its own line, and the machine code as a chip.
+    expect(within(alert).getByText(hint).classList.contains('dg-error-state__message')).toBe(true);
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
+      true,
+    );
+
+    // The query block holds exactly the query the provider received, in the
+    // one pretty-printed form every node prints: JSON indented by two spaces.
+    // The expected text is built from a literal written in the formatter's
+    // member order (source, filter, sort, limit, offset), so the spelling is
+    // pinned independently of how the query was assembled. Looked up by name:
+    // the closed details disclosure below it is a group too.
+    const expected = {
+      source: 'requests',
+      filter: { tier: 'browser' },
+      limit: 25,
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    };
+    const asked = soleQuery(stub);
+    expect(asked).toEqual(expected);
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(asked);
+    expect(shown.textContent).toBe(JSON.stringify(expected, null, 2));
+
+    // Developer detail stays behind the closed disclosure, never on the lines
+    // a panel reader meets first.
+    const disclosure = within(alert).getByText(TECHNICAL_DETAILS_LABEL).closest('details');
+    expect(disclosure).not.toBeNull();
+    expect(disclosure?.open).toBe(false);
+    expect(JSON.parse(disclosure?.querySelector('pre')?.textContent ?? '')).toEqual(details);
+
+    // The retry carries the key the host restores focus by, and re-asks the
+    // very query that failed.
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retry.getAttribute('data-dg-focus-key')).toBe(RETRY_FOCUS_KEY);
+
+    await user.click(retry);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual(asked);
+  });
+
+  // The catalog entry for this node type lists `spans` and `requests` only, and
+  // says `trace` is deliberately absent. A node naming either of these — which
+  // validation rejects, so only an unvalidated host can mount one — must be
+  // reported as unsupported and must not reach the provider at all: a branch
+  // that queried them would be one no valid specification could ever select.
+  it.each(['events', 'trace'] as const)(
+    'reports a node whose query names the uncatalogued %s source, and asks for nothing',
+    async (source) => {
+      const stub = resolvingProvider(CHAIN);
+
+      renderComponent(makeNode({ query: { source } }), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      const alert = await screen.findByRole('alert');
+      expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+
+      // The shared wording for a panel defect: what this view reads, from the
+      // catalog, beside what it was asked for, under the panel-defect code.
+      expect(within(alert).getByText(UNSUPPORTED_TITLE)).toBeTruthy();
+      expect(alert.textContent).toContain('"spans" or "requests"');
+      expect(alert.textContent).toContain(`"${source}"`);
+      expect(within(alert).getByText('PANEL_INVALID').classList.contains('dg-badge')).toBe(true);
+
+      // The node's own query, exactly as authored, is what the reader is shown
+      // — nothing was asked, so no offset was added to it — and no retry is
+      // offered: re-issuing it cannot change the answer.
+      const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+      expect(JSON.parse(shown.textContent ?? '')).toEqual({ source });
+      expect(within(alert).queryByRole('button', { name: RETRY_NAME })).toBeNull();
+
+      // Nothing was asked of the provider, and nothing drawn as if it had been.
+      expect(stub.resolve).not.toHaveBeenCalled();
+      expect(stub.queries).toHaveLength(0);
+      expect(screen.queryByRole('tree')).toBeNull();
+      expect(drawnRows()).toHaveLength(0);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Empty pages are not empty captures
+ *
+ * A successful result that draws no row says which situation it is in, from
+ * the counters the service reported: an explicit `limit: 0` asks for a total
+ * without rows, an authored offset past the end is an empty page rather than
+ * an error, and a page whose records are all of kinds this view does not draw
+ * still holds captured evidence. Only a total of zero — or no total at all, at
+ * the first offset, with nothing loaded — is the empty capture.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A browser interaction: captured evidence, of a kind this view does not draw. */
+const INTERACTION_EVENT = makeEvent({
+  id: eventIdFor(10),
+  spanId: spanIdFor(10),
+  kind: 'interaction',
+  tier: 'browser',
+  name: 'example.interaction',
+  startTime: BASE_START_MS + 4,
+  duration: 9,
+  seq: 10,
+  ingestSeq: 10,
+});
+
+/**
+ * Waits for the empty state and asserts what it says — its heading, or the
+ * absence of one, and its message — that it is the settled status carrying the
+ * view's glyph exactly when it is the empty capture, and that no chart, row,
+ * failure or next page is offered beside it.
+ *
+ * @param title The heading the state carries, or `undefined` for none.
+ * @param message The state's message, in full.
+ */
+async function expectEmptyState(title: string | undefined, message: string): Promise<void> {
+  const shown = await screen.findByText(message);
+  expect(shown.classList.contains('dg-empty-state__message')).toBe(true);
+  expect(shown.closest('.dg-waterfall__empty')).not.toBeNull();
+
+  for (const heading of [COUNT_ONLY_TITLE, EMPTY_PAGE_TITLE, EMPTY_CAPTURE_TITLE]) {
+    const found = screen.queryByText(heading);
+    if (heading === title) {
+      expect(found?.classList.contains('dg-empty-state__title')).toBe(true);
+    } else {
+      expect(found).toBeNull();
+    }
+  }
+
+  const state = shown.closest('.dg-empty-state');
+  expect(screen.getByRole('status')).toBe(state);
+  expect(screen.queryByRole('status', { busy: true })).toBeNull();
+  expect(state?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden') ?? null).toBe(
+    title === EMPTY_CAPTURE_TITLE ? 'true' : null,
+  );
+
+  expect(screen.queryByRole('tree')).toBeNull();
+  expect(drawnRows()).toHaveLength(0);
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+}
+
+describe('Waterfall empty pages', () => {
+  it('states a count-only request as one, naming the total the service reported', async () => {
+    const stub = resolvingProvider([], { total: 42 });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    // The explicit zero reached the provider exactly as the node asked for it.
+    expect(soleQuery(stub).limit).toBe(0);
+  });
+
+  it('states a count-only request as one even when the answer echoes its own offset', async () => {
+    // A count-only answer names no next page; one that echoes its own offset
+    // would only re-request the page already searched, so it is not a next page.
+    const stub = resolvingProvider([], { total: 42, nextOffset: 0 });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no Load more for an undrawn page whose next offset does not advance', async () => {
+    const stub = resolvingProvider([RENDER_EVENT], { total: 42, nextOffset: 0 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(1)} of the ${formatCount(42)} spans that matched this query is loaded, and it is not a network or database call.`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('states a count-only request with no reported total as unreported, not as empty', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      'This view requests a count without rows, and no total was reported for its query.',
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('says where a page past the end starts, and how many spans matched', async () => {
+    const stub = resolvingProvider([], { total: 150 });
+
+    renderComponent(makeNode({ query: { source: 'spans', offset: 200 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(201)}, past the end of the ${formatCount(150)} spans that matched this query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(soleQuery(stub).offset).toBe(200);
+  });
+
+  it.each([
+    [
+      'several records',
+      [RENDER_EVENT, INTERACTION_EVENT],
+      `${formatCount(2)} of the ${formatCount(42)} spans that matched this query are loaded, and none of them is a network or database call.`,
+    ],
+    [
+      'one record',
+      [RENDER_EVENT],
+      `${formatCount(1)} of the ${formatCount(42)} spans that matched this query is loaded, and it is not a network or database call.`,
+    ],
+  ])(
+    'counts %s the kind filter removed against the reported total',
+    async (_description: string, page: readonly TelemetryEvent[], message: string) => {
+      const stub = resolvingProvider(page, { total: 42 });
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      await expectEmptyState(EMPTY_PAGE_TITLE, message);
+      expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+      // Counted, never drawn: the records themselves stay off screen.
+      const text = document.body.textContent ?? '';
+      for (const event of page) {
+        expect(text).not.toContain(event.name);
+      }
+    },
+  );
+
+  it('says how many spans matched when a page inside the result arrives empty', async () => {
+    const stub = resolvingProvider([], { total: 42 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(42)} spans matched this query, but none are shown on this page.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('says where a later page starts when no total was reported', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode({ query: { source: 'spans', offset: 200 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(201)} and holds no spans; no total was reported for this query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('counts request groups, not spans, for a grouped network result', async () => {
+    const stub = recordingProvider(() =>
+      Promise.resolve<DataQueryResponse>({ source: 'requests', data: [], total: 3 }),
+    );
+
+    renderComponent(makeNode({ query: { source: 'requests', offset: 10 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(11)}, past the end of the ${formatCount(3)} request groups that matched this query.`,
+    );
+    expect(soleQuery(stub).source).toBe('requests');
+  });
+
+  it('keeps the empty-capture message for a total of zero', async () => {
+    const stub = resolvingProvider([], { total: 0 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_MESSAGE);
+    await expectEmptyState(EMPTY_CAPTURE_TITLE, message.textContent ?? '');
+  });
+
+  it('keeps the empty-capture message for a first page with no total and nothing on it', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_MESSAGE);
+    await expectEmptyState(EMPTY_CAPTURE_TITLE, message.textContent ?? '');
+  });
+});
+
+describe('Waterfall rows', () => {
+  it('draws a row for each call kind its catalog entry lists, and none for any other record', async () => {
+    // One top-level record of EVERY kind the node catalog says a waterfall
+    // draws, read from the catalog entry itself rather than retyped here, so a
+    // kind the catalog adds later is covered by this case the moment it lands —
+    // and a component that kept a narrower list of its own fails it. Each
+    // record takes the first tier the event schema's cross-field rule permits
+    // for its kind, and they are mixed with two records the view does not draw.
+    const kinds = catalogEntryFor('waterfall').telemetryKinds;
+    expect(kinds.length).toBeGreaterThan(0);
+    const drawn: readonly TelemetryEvent[] = kinds.map((kind, index) => {
+      const [tier] = KIND_ALLOWED_TIERS[kind];
+      if (tier === undefined) {
+        throw new Error(`the event schema permits no tier for the ${kind} kind`);
+      }
+      return makeEvent({
+        id: eventIdFor(21 + index),
+        spanId: spanIdFor(21 + index),
+        kind,
+        tier,
+        name: `example.${kind}-call`,
+        startTime: BASE_START_MS + index * 10,
+        // Distinct per record, so a per-row duration assertion cannot pass by
+        // matching another row's figure.
+        duration: 60 + (kinds.length - index) * 40,
+        seq: index,
+        ingestSeq: index + 1,
+      });
+    });
+    // Ids below the drawn range, so a catalog that grows cannot collide with
+    // them.
+    const undrawn: readonly TelemetryEvent[] = [
+      RENDER_EVENT,
+      makeEvent({
+        id: eventIdFor(20),
+        spanId: spanIdFor(20),
+        kind: 'interaction',
+        tier: 'browser',
+        name: 'example.interaction',
+        startTime: BASE_START_MS,
+        duration: 1200,
+        seq: kinds.length,
+        ingestSeq: kinds.length + 1,
+      }),
+    ];
+    // The absence asserted below is only a statement about the view while
+    // these kinds are genuinely outside the catalog's list.
+    for (const event of undrawn) {
+      expect(kinds).not.toContain(event.kind);
+    }
+    const stub = resolvingProvider([...undrawn, ...drawn]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(drawn.length);
+
+    for (const event of drawn) {
+      // Each of these records carries neither a URL nor a route, so its own
+      // name is the label — which is what lets one assertion loop name every
+      // kind without a label rule per kind.
+      const row = rowLabelled(event.name);
+      expect(row.getAttribute('aria-label') ?? '').toContain(
+        `${formatKindLabel(event.kind)} · ${formatTierLabel(event.tier)}`,
+      );
+      expect(within(row).getByText(formatDuration(event.duration))).toBeTruthy();
+    }
+
+    // The two records of other kinds are absent from the rows AND from what the
+    // rows announce: a filter that hid a bar but kept its name in a description
+    // would still be reporting evidence this view cannot place.
+    for (const event of undrawn) {
+      expect(screen.queryByText(event.name)).toBeNull();
+      expect(rowDescriptions().some((description) => description.includes(event.name))).toBe(false);
+    }
+
+    // The count states the calls it drew, not the records it received.
+    expect(screen.getByText(`${formatCount(drawn.length)} calls`)).toBeTruthy();
+  });
+
+  it('measures every offset from the first call it drew, not from the earliest record', async () => {
+    const first = makeEvent({
+      id: eventIdFor(11),
+      spanId: spanIdFor(11),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.first-call',
+      startTime: BASE_START_MS,
+      duration: 40,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const second = makeEvent({
+      id: eventIdFor(12),
+      spanId: spanIdFor(12),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.second-call',
+      startTime: BASE_START_MS + 120,
+      duration: 60,
+      seq: 1,
+      ingestSeq: 2,
+    });
+
+    // The page also holds a record that starts HALF A SECOND EARLIER and is of
+    // a kind this view does not draw. The window must still begin at the first
+    // drawn call, or every offset on screen would be inflated by that lead —
+    // which is exactly the staircase reading a waterfall exists to give.
+    const earlier = makeEvent({
+      id: eventIdFor(13),
+      spanId: spanIdFor(13),
+      kind: 'render',
+      tier: 'browser',
+      name: 'example.earlier-render',
+      startTime: BASE_START_MS - 500,
+      duration: 4,
+      seq: 2,
+      ingestSeq: 3,
+    });
+
+    // Handed over out of order, so the time ordering of the rows is the view's
+    // own rather than the page's.
+    const stub = resolvingProvider([earlier, second, first]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(2);
+
+    expect(descriptionAt(0)).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(descriptionAt(0)).toContain(`took ${formatDuration(40)}`);
+    expect(descriptionAt(1)).toContain(`starts ${formatDuration(120)} into the window`);
+    expect(descriptionAt(1)).toContain(`took ${formatDuration(60)}`);
+
+    // The 120 ms gap is the whole point, so it is also asserted as a
+    // difference rather than only as two independent strings.
+    expect(descriptionAt(1)).not.toContain(`starts ${formatDuration(620)} into the window`);
+
+    // The axis spans the drawn calls: first start to last end, 180 ms.
+    expect(axisGraphic().getAttribute('aria-label')).toBe(
+      `Time axis spanning ${formatDurationCompact(180)} from the first call`,
+    );
+
+    // An offset is a wait, never a wall-clock reading: the epoch value the
+    // capture carried appears nowhere, in text or in a description.
+    for (const description of rowDescriptions()) {
+      expect(description).not.toContain(String(BASE_START_MS));
+    }
+    expect(document.body.textContent ?? '').not.toContain(String(BASE_START_MS));
+  });
+
+  it('renders the method, the status code and the duration, and marks a failure', async () => {
+    const failedUrl = 'http://127.0.0.1:3000/example/resource?attempt=?';
+    const okUrl = 'http://127.0.0.1:3000/example/collection?page=?';
+    const failed = makeEvent({
+      id: eventIdFor(31),
+      spanId: spanIdFor(31),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.failed-call',
+      startTime: BASE_START_MS,
+      duration: 420,
+      status: 'error',
+      attributes: { 'http.method': REQUEST_METHOD, url: failedUrl, 'http.status_code': 503 },
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const succeeded = makeEvent({
+      id: eventIdFor(32),
+      spanId: spanIdFor(32),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.call',
+      startTime: BASE_START_MS + 500,
+      duration: 60,
+      attributes: { 'http.method': 'GET', url: okUrl, 'http.status_code': 200 },
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const stub = resolvingProvider([failed, succeeded]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const failedRow = rowLabelled(failedUrl);
+
+    const method = within(failedRow).getByText(REQUEST_METHOD);
+    expect(method.classList.contains('dg-badge')).toBe(true);
+    expect(method.classList.contains('dg-badge--outline')).toBe(true);
+
+    // A server failure is marked as one through the chip's TONE, which resolves
+    // to a token inside `Badge`; no colour is chosen by this component.
+    const failedStatus = within(failedRow).getByText('503');
+    expect(failedStatus.classList.contains('dg-waterfall__status')).toBe(true);
+    expect(failedStatus.classList.contains('dg-badge--danger')).toBe(true);
+    expect(failedRow.classList.contains('dg-is-error')).toBe(true);
+    expect(failedRow.getAttribute('aria-label') ?? '').toContain('status 503');
+
+    const duration = within(failedRow).getByText(formatDuration(420));
+    expect(duration.classList.contains('dg-duration-cell')).toBe(true);
+    expect(duration.classList.contains('dg-waterfall__duration')).toBe(true);
+
+    // And a success is not marked as a failure, which is what makes the tone
+    // above a statement about the status rather than a constant.
+    const okRow = rowLabelled(okUrl);
+    const okStatus = within(okRow).getByText('200');
+    expect(okStatus.classList.contains('dg-badge--success')).toBe(true);
+    expect(okStatus.classList.contains('dg-badge--danger')).toBe(false);
+    expect(okRow.classList.contains('dg-is-error')).toBe(false);
+    expect(within(okRow).getByText(formatDuration(60))).toBeTruthy();
+  });
+});
+
+describe('Waterfall nesting', () => {
+  it('discloses the calls that ran inside a row, and reports the disclosure', async () => {
+    const stub = resolvingProvider(CHAIN);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // One row on screen, and two calls nested inside it: a collapsed subtree is
+    // not in the document at all.
+    expect(drawnRows()).toHaveLength(1);
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-level')).toBe('1');
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('false');
+
+    const disclosure = within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME });
+    expect(disclosure.getAttribute('aria-expanded')).toBe('false');
+
+    await user.click(disclosure);
+
+    // Both the row and its control report the state after the gesture.
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('true');
+    expect(
+      within(rowLabelled(REQUEST_URL))
+        .getByRole('button', { name: COLLAPSE_NAME })
+        .getAttribute('aria-expanded'),
+    ).toBe('true');
+
+    // The call the browser request was waiting on is now visible, one level in,
+    // inside the group its parent owns.
+    expect(drawnRows()).toHaveLength(2);
+    const server = rowLabelled(SERVER_ROUTE);
+    expect(server.getAttribute('aria-level')).toBe('2');
+    const group = server.parentElement;
+    expect(group?.getAttribute('role')).toBe('group');
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-owns')).toBe(group?.getAttribute('id'));
+
+    // The host is told which view, which row and which state — not asked to
+    // work out a parity.
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, REQUEST_EVENT.id, true);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // The statement two levels down keeps its place under the server request
+    // that issued it, which is the reading the whole view exists for.
+    await user.click(within(server).getByRole('button', { name: EXPAND_NAME }));
+
+    expect(drawnRows()).toHaveLength(3);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('3');
+    expect(spies.onExpand).toHaveBeenCalledTimes(2);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, SERVER_EVENT.id, true);
+
+    // Collapsing the outermost row takes its whole subtree with it, and reports
+    // the state after that gesture too.
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: COLLAPSE_NAME }));
+
+    expect(drawnRows()).toHaveLength(1);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, REQUEST_EVENT.id, false);
+
+    // Disclosure is not selection, at any point.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+
+  it('nests a call under its nearest drawn ancestor when the span between is another kind', async () => {
+    // The service correlated a function span between the server request and the
+    // statement it ran. A waterfall does not draw function spans, and dropping
+    // the statement to the top level because of that would break the one
+    // reading the view is for: the row that held the time must stay visibly
+    // INSIDE the row that was blocked by it.
+    const bridging = makeEvent({
+      id: eventIdFor(4),
+      spanId: spanIdFor(4),
+      parentSpanId: spanIdFor(2),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.step',
+      startTime: BASE_START_MS + 12,
+      duration: 900,
+      seq: 3,
+      ingestSeq: 4,
+    });
+    const nested = makeEvent({
+      id: eventIdFor(5),
+      spanId: spanIdFor(5),
+      parentSpanId: spanIdFor(4),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.statement',
+      startTime: BASE_START_MS + 18,
+      duration: 640,
+      attributes: STATEMENT_ATTRIBUTES,
+      seq: 4,
+      ingestSeq: 5,
+    });
+    const stub = resolvingProvider([REQUEST_EVENT, SERVER_EVENT, bridging, nested]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(within(rowLabelled(SERVER_ROUTE)).getByRole('button', { name: EXPAND_NAME }));
+
+    // Three rows, not four: the bridging span is collapsed through rather than
+    // drawn, and the statement sits directly under the server request.
+    expect(drawnRows()).toHaveLength(3);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('3');
+    expect(screen.queryByText(bridging.name)).toBeNull();
+    expect(rowDescriptions().some((description) => description.includes(bridging.name))).toBe(
+      false,
+    );
+  });
+});
+
+describe('Waterfall privacy', () => {
+  it('renders the redacted URL and the parameterized statement exactly as they arrived', async () => {
+    const stub = resolvingProvider(CHAIN);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(within(rowLabelled(SERVER_ROUTE)).getByRole('button', { name: EXPAND_NAME }));
+
+    // Byte comparisons rather than containment checks: both strings arrive in
+    // their final display form, and re-assembling a URL from parts,
+    // unescaping a mask, pretty-printing a statement or putting a placeholder's
+    // value back would each satisfy a looser assertion.
+    const url = screen.getByText(REQUEST_URL);
+    expect(url.textContent).toBe(REQUEST_URL);
+    expect(url.textContent).toContain('tenant=?');
+
+    const statement = screen.getByText(SQL_STATEMENT);
+    expect(statement.textContent).toBe(SQL_STATEMENT);
+    expect(statement.textContent).toContain('$1');
+    // A statement keeps its monospaced type role, so a reader can tell a
+    // statement from a URL without reading either.
+    expect(statement.tagName.toLowerCase()).toBe('code');
+
+    // No control anywhere offers a raw value, a body or a result set: none of
+    // that was captured, so such a control could only mislead. The list is
+    // checked for being non-empty first, or the loop would pass vacuously.
+    const names = controlNames();
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      expect(name).not.toMatch(BODY_CONTROL);
+    }
+
+    // The body- and row-shaped attribute values a producer must never report
+    // reach neither the screen nor a description.
+    const smuggled = [
+      UNRENDERABLE_REQUEST_BODY,
+      UNRENDERABLE_RESPONSE_BODY,
+      UNRENDERABLE_ROW_CONTENTS,
+    ];
+    const rendered = document.body.textContent ?? '';
+    for (const value of smuggled) {
+      expect(rendered).not.toContain(value);
+      expect(rowDescriptions().some((description) => description.includes(value))).toBe(false);
+    }
+  });
+
+  it('states how many rows a statement touched, and never what was in them', async () => {
+    // The statement on its own: its parent link points outside the page, so it
+    // is drawn as a top-level row.
+    const stub = resolvingProvider([QUERY_EVENT]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const row = rowLabelled(SQL_STATEMENT);
+    const count = within(row).getByText(`${formatCount(SQL_ROW_COUNT)} rows`);
+    expect(count.classList.contains('dg-badge')).toBe(true);
+    expect(row.getAttribute('aria-label') ?? '').toContain(
+      `${formatCount(SQL_ROW_COUNT)} rows touched`,
+    );
+
+    // A count, and nothing that resembles the rows themselves.
+    expect(row.textContent ?? '').not.toContain(UNRENDERABLE_ROW_CONTENTS);
+    expect(row.getAttribute('aria-label') ?? '').not.toContain(UNRENDERABLE_ROW_CONTENTS);
+  });
+
+  it('states an unobserved transfer size as unavailable rather than as zero', async () => {
+    const unmeasuredUrl = 'http://127.0.0.1:3000/example/collection?page=?';
+    const unmeasured = makeEvent({
+      id: eventIdFor(34),
+      spanId: spanIdFor(34),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.call',
+      startTime: BASE_START_MS + 20,
+      duration: 90,
+      attributes: { 'http.method': 'GET', url: unmeasuredUrl, 'http.status_code': 200 },
+      seq: 3,
+      ingestSeq: 4,
+    });
+    const stub = resolvingProvider([REQUEST_EVENT, unmeasured, SERVER_EVENT]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // Observed: the figure, formatted as a quantity.
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-label') ?? '').toContain(
+      `transferred ${formatBytes(TRANSFERRED_BYTES)}`,
+    );
+
+    // Not observed, though this kind of call would normally carry it: stated as
+    // unavailable, never as a zero that would read as "nothing was
+    // transferred".
+    const unmeasuredRow = rowLabelled(unmeasuredUrl);
+    const unmeasuredDescription = unmeasuredRow.getAttribute('aria-label') ?? '';
+    expect(unmeasuredDescription).toContain(`transferred ${NOT_AVAILABLE_LABEL}`);
+    expect(unmeasuredDescription).not.toContain(`transferred ${formatBytes(0)}`);
+    // Reachable by pointer as well as by assistive technology: hovering the
+    // label opens the tooltip — `hidden`, and so found by no role query, until
+    // it is shown — and it carries the same sentence.
+    const label = unmeasuredRow.querySelector<HTMLElement>(
+      '.dg-waterfall__tooltip .dg-tooltip__trigger',
+    );
+    if (label === null) {
+      throw new Error('the row has no described label');
+    }
+    await user.hover(label);
+    expect((await within(unmeasuredRow).findByRole('tooltip')).textContent ?? '').toContain(
+      `transferred ${NOT_AVAILABLE_LABEL}`,
+    );
+    await user.unhover(label);
+
+    // A server span has no resource timing behind it, so the figure is not
+    // expected there and is not claimed to be missing either.
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-label') ?? '').not.toContain('transferred');
+  });
+});
+
+describe('Waterfall interactions', () => {
+  it('hands the host the very location a row resolved to, and selects nothing', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    // Taken BEFORE the render and compared afterwards: comparing the emitted
+    // object's keys against the live fixture alone would be satisfied by a
+    // component that added a field to it in place.
+    const expectedKeys = Object.keys({ ...BASE_SOURCE }).sort();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const chip = await screen.findByRole('button', { name: SOURCE_CHIP_NAME });
+
+    // Rendering a chip is not activating it: nothing opens an editor until the
+    // developer asks.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+
+    await user.click(chip);
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+
+    const received = call[0];
+
+    // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
+    // `confidence` and an invented extra field both fail here. Every hop after
+    // this one acts blind on the object it is handed.
+    expect(received).toEqual(BASE_SOURCE);
+    expect(Object.keys(received).sort()).toEqual(expectedKeys);
+    expect(received.file).toBe(SOURCE_FILE);
+    expect(received.file.startsWith('/')).toBe(false);
+    expect(received.line).toBe(SOURCE_LINE);
+    expect(received.column).toBe(SOURCE_COLUMN);
+    expect(received.symbol).toBe(SOURCE_SYMBOL);
+
+    // Opening source is not selecting the row the chip sits in: the chip's
+    // activation stops at the chip.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('reports an activated row as the record it stands for', async () => {
+    // The server request alone: nothing nested under it and no resolved
+    // location, so the row holds no control of its own and the click can only
+    // be the row's own activation.
+    const stub = resolvingProvider([SERVER_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const row = rowLabelled(SERVER_ROUTE);
+    expect(row.getAttribute('aria-selected')).toBe('false');
+    expect(within(row).queryAllByRole('button')).toHaveLength(0);
+
+    await user.click(row);
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+
+    const [call] = spies.onSelectEvent.mock.calls;
+    if (call === undefined) {
+      throw new Error('the selection handler recorded no call');
+    }
+
+    const ref = call[0];
+
+    // The three identifiers the host needs to resolve the record, taken from
+    // that row's own record and nothing else.
+    expect(ref).toEqual({
+      eventId: SERVER_EVENT.id,
+      spanId: SERVER_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(Object.keys(ref).sort()).toEqual(['eventId', 'spanId', 'traceId']);
+
+    // The row shows that the click landed where the reader aimed.
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-selected')).toBe('true');
+    expect(rowLabelled(SERVER_ROUTE).classList.contains('dg-is-selected')).toBe(true);
+
+    // Selecting a record is not opening its source, and it is not a disclosure.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('activates a focused row from the keyboard as well as the pointer', async () => {
+    const stub = resolvingProvider([SERVER_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The tree is one tab stop, and with a single row on screen that row holds
+    // it; reaching it and pressing Enter is the keyboard route to the same
+    // intent a click raises.
+    const row = rowLabelled(SERVER_ROUTE);
+    expect(row.getAttribute('tabindex')).toBe('0');
+    row.focus();
+    expect(document.activeElement).toBe(row);
+
+    await user.keyboard('{Enter}');
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: SERVER_EVENT.id,
+      spanId: SERVER_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
+describe('Waterfall paging', () => {
+  it('says how much of the result is on screen and appends the next page', async () => {
+    // `nextOffset` is deliberately not the length of the page: the contract is
+    // that a view copies the offset the SERVICE reported, never one it derived
+    // from what arrived, which drifts the moment a limit is clamped.
+    const firstCall = makeEvent({
+      id: eventIdFor(41),
+      spanId: spanIdFor(41),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.first-call',
+      startTime: BASE_START_MS,
+      duration: 120,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const secondCall = makeEvent({
+      id: eventIdFor(42),
+      spanId: spanIdFor(42),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.second-call',
+      startTime: BASE_START_MS + 200,
+      duration: 80,
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const stub = pagingProvider([
+      { data: [firstCall], total: 30, nextOffset: 1 },
+      { data: [secondCall], total: 30, nextOffset: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // One call of thirty, said plainly rather than implied by a bare count.
+    await screen.findByText(
+      `${formatCount(1)} call · loaded ${formatCount(1)} of ${formatCount(30)} spans`,
+    );
+    expect(drawnRows()).toHaveLength(1);
+
+    const first = soleQuery(stub);
+    expect(first.source).toBe('spans');
+    expect(first.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The next page is requested at the offset the service reported.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    const second = queryOfCall(stub, 2);
+    expect(second.offset).toBe(1);
+    expect(second.offset ?? DATA_QUERY_DEFAULT_OFFSET).toBeGreaterThan(
+      first.offset ?? DATA_QUERY_DEFAULT_OFFSET,
+    );
+    expect(second.source).toBe('spans');
+
+    // Appended, not replaced: the call the reader was already looking at stays,
+    // and the footer counts both.
+    await waitFor(() => {
+      expect(drawnRows()).toHaveLength(2);
+    });
+    expect(
+      screen.getByText(
+        `${formatCount(2)} calls · loaded ${formatCount(2)} of ${formatCount(30)} spans`,
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText(firstCall.name)).toBeTruthy();
+    expect(screen.getByText(secondCall.name)).toBeTruthy();
+
+    // And the appended page joins the same window rather than restarting it:
+    // the second call began 200 ms after the first.
+    expect(descriptionAt(0)).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(descriptionAt(1)).toContain(`starts ${formatDuration(200)} into the window`);
+  });
+
+  it('offers no next page, and states only what it drew, when the service reported neither', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, SERVER_EVENT, QUERY_EVENT]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // Three calls arrived and three rows exist, two of them nested; with no
+    // total reported, claiming coverage would be an invention, so the footer
+    // says what it drew and nothing about a remainder.
+    await screen.findByText(`${formatCount(CHAIN.length)} calls`);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(soleQuery(stub).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Pages that hold nothing this view draws
+ *
+ * The node's query goes to the service as authored, and the kind filter is
+ * applied to each page here — the flat path needs the undrawn records to nest
+ * a statement under its request. So a page can hold only records of other
+ * kinds while a later page holds the calls, and that page is NOT an empty
+ * capture: the view must say what it searched, that more remains, and keep the
+ * way to the next page in reach.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The title of the state for pages searched with nothing drawable yet. */
+const UNDRAWN_PAGES_TITLE = 'No network or database calls loaded yet';
+
+/** The accessible name of the "Load more" control while its page is in flight. */
+const LOADING_MORE_NAME = 'Loading…';
+
+/** The title of the state for a kind filter that selects nothing drawable. */
+const DISJOINT_FILTER_TITLE = 'No call kind selected';
+
+/** A browser request on the first page of the in-flight footer case. */
+const LONE_PAGE_CALL = makeEvent({
+  id: eventIdFor(120),
+  spanId: spanIdFor(120),
+  name: 'example.first-page-call',
+  startTime: BASE_START_MS,
+  duration: 40,
+});
+
+/** A browser request on the second page of the paged-filter cases. */
+const SECOND_PAGE_CALL = makeEvent({
+  id: eventIdFor(121),
+  spanId: spanIdFor(121),
+  name: 'example.second-page-call',
+  startTime: BASE_START_MS + 60,
+  duration: 90,
+});
+
+describe('Waterfall pages with nothing to draw yet', () => {
+  it('keeps "Load more" when a page holds only undrawn kinds, and draws the call a later page holds', async () => {
+    // The second page is settled by hand, so the in-flight state between the
+    // two pages is observable rather than raced.
+    let settleSecondPage: (response: DataQueryResponse) => void = () => undefined;
+    const secondPage = new Promise<DataQueryResponse>((resolve) => {
+      settleSecondPage = resolve;
+    });
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [RENDER_EVENT],
+            total: 2,
+            nextOffset: 1,
+          })
+        : secondPage,
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // What was searched, against the total, and that more remains — and not
+    // the verdict that nothing was captured.
+    const title = await screen.findByText(UNDRAWN_PAGES_TITLE);
+    const state = title.closest<HTMLElement>('.dg-waterfall__empty');
+    expect(state).not.toBeNull();
+    expect(state?.textContent ?? '').toContain(
+      `Loaded ${formatCount(1)} of ${formatCount(2)} captured records so far`,
+    );
+    expect(state?.textContent ?? '').toContain('More records remain to be searched.');
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(document.body.textContent ?? '').not.toContain(RENDER_EVENT.name);
+
+    // The way to the next page is right there, inside the state.
+    const loadMore = within(state ?? document.body).getByRole('button', { name: LOAD_MORE_NAME });
+    expect(loadMore.hasAttribute('disabled')).toBe(false);
+
+    await user.click(loadMore);
+
+    // Asked at the offset the service reported, the query otherwise as authored.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual({ source: 'spans', offset: 1 });
+
+    // While it is in flight, the searched pages are still stated — not replaced
+    // by the full-view loading skeleton — and the control says it is busy.
+    const busy = await screen.findByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText(UNDRAWN_PAGES_TITLE)).toBeTruthy();
+    expect(screen.queryByText(LOADING_LABEL)).toBeNull();
+
+    await act(async () => {
+      settleSecondPage({ source: 'spans', data: [SECOND_PAGE_CALL], total: 2 });
+      await Promise.resolve();
+    });
+
+    // The call the second page held is drawn, and the footer counts both pages.
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(1);
+    expect(rowLabelled(SECOND_PAGE_CALL.name)).toBeTruthy();
+    expect(
+      screen.getByText(
+        `${formatCount(1)} call · loaded ${formatCount(2)} of ${formatCount(2)} spans`,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(UNDRAWN_PAGES_TITLE)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('reports a failed next page behind pages with nothing drawable as that page, with a retry', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [RENDER_EVENT],
+            total: 2,
+            nextOffset: 1,
+          })
+        : Promise.reject(
+            new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+          ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The NEXT page failed, beside the statement of what was already searched,
+    // which stays. No row is drawn above the failure, so it is reported in the
+    // view scope — the page scope's "the rows already shown are unaffected"
+    // would describe rows that are not there — and the query it names is the
+    // page that failed, at the offset it was requested at.
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+    expect(within(alert).getByText(VIEW_FAILURE_TITLE)).toBeTruthy();
+    expect(within(alert).queryByText(PAGE_FAILURE_TITLE)).toBeNull();
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
+    expect(alert.textContent).not.toContain(PAGE_FAILURE_LEAD);
+    expect(alert.textContent).toContain(CHANNEL_CLOSED);
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({ source: 'spans', offset: 1 });
+    expect(screen.getByText(UNDRAWN_PAGES_TITLE)).toBeTruthy();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    // The retry re-asks for the page that failed, at the offset it failed at.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+    expect(queryOfCall(stub, 3).offset).toBe(1);
+  });
+
+  it('asks for nothing, and offers no next page, when the kind filter selects no kind it draws', () => {
+    const stub = resolvingProvider([RENDER_EVENT], { total: 1, nextOffset: 1 });
+
+    renderComponent(
+      makeNode({ query: { source: 'spans', filter: { kinds: ['render', 'interaction'] } } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // Why nothing is drawn, and which kinds this view would draw.
+    const title = screen.getByText(DISJOINT_FILTER_TITLE);
+    const state = title.closest<HTMLElement>('.dg-waterfall__empty');
+    expect(state).not.toBeNull();
+    expect(state?.textContent ?? '').toContain(
+      "This node's kind filter selects no kind this view draws",
+    );
+    for (const kind of catalogEntryFor('waterfall').telemetryKinds) {
+      expect(state?.textContent ?? '').toContain(formatKindLabel(kind));
+    }
+
+    // No page could ever hold a row, so none was requested and none is offered.
+    expect(stub.resolve).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('keeps "Load more" on screen, disabled and busy, while the next page behind drawn rows is in flight', async () => {
+    // The counterpart of the first case, with rows already drawn: `useQuery`
+    // reports no `nextOffset` while a page loads, and a footer that keyed the
+    // control on `nextOffset` alone would withdraw it mid-request.
+    let settleSecondPage: (response: DataQueryResponse) => void = () => undefined;
+    const secondPage = new Promise<DataQueryResponse>((resolve) => {
+      settleSecondPage = resolve;
+    });
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [LONE_PAGE_CALL],
+            total: 2,
+            nextOffset: 1,
+          })
+        : secondPage,
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+    expect(queryOfCall(stub, 2)).toEqual({ source: 'spans', offset: 1 });
+
+    // The page in flight is the NEXT one: the drawn call stays, and the control
+    // stays too — disabled, and saying why.
+    const busy = await screen.findByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(busy.closest('.dg-waterfall__footer')).not.toBeNull();
+    expect(rowLabelled(LONE_PAGE_CALL.name)).toBeTruthy();
+    expect(screen.queryByText(LOADING_LABEL)).toBeNull();
+
+    await act(async () => {
+      settleSecondPage({ source: 'spans', data: [SECOND_PAGE_CALL], total: 2 });
+      await Promise.resolve();
+    });
+
+    // Both pages drawn, the result searched to its end, and no control left.
+    await waitFor(() => {
+      expect(drawnRows()).toHaveLength(2);
+    });
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('reports a failed next page below drawn rows in the page scope, and retries that page', async () => {
+    // The counterpart of the failed-next-page case above, with a row already
+    // drawn: the row stays, and the failure below it says the next page failed
+    // and that what is shown is unaffected.
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [LONE_PAGE_CALL],
+            total: 2,
+            nextOffset: 1,
+          })
+        : call === 2
+          ? Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', CHANNEL_CLOSED))
+          : Promise.resolve<DataQueryResponse>({
+              source: 'spans',
+              data: [SECOND_PAGE_CALL],
+              total: 2,
+            }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+    expect(within(alert).getByText(PAGE_FAILURE_TITLE)).toBeTruthy();
+    expect(within(alert).queryByText(VIEW_FAILURE_TITLE)).toBeNull();
+    const message = within(alert).getByText((text) => text.startsWith(PAGE_FAILURE_LEAD));
+    expect(message.textContent).toContain(CHANNEL_CLOSED);
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+
+    // The query shown is the page that failed, in the one pretty-printed form.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(shown.textContent).toBe(JSON.stringify({ source: 'spans', offset: 1 }, null, 2));
+
+    // The drawn row is still on screen above the failure.
+    expect(drawnRows()).toHaveLength(1);
+    expect(rowLabelled(LONE_PAGE_CALL.name)).toBeTruthy();
+
+    // The retry re-asks for that page, and its rows join the one already drawn.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+    await waitFor(() => {
+      expect(drawnRows()).toHaveLength(2);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Which page sequence the accumulated pages belong to
+ *
+ * "Load more" keeps earlier pages in state and advances the offset. Those
+ * pages belong to ONE sequence — this session, this query as authored, the
+ * offset it starts from included — and the cases below re-render the SAME
+ * mounted view with that sequence changed, which is how a host swaps a
+ * regenerated panel in or reopens another session in the same view. The pages
+ * carried from the old sequence must be dropped and the request must return to
+ * the authored base offset; the advanced offset is where the OLD sequence had
+ * got to, and means nothing in the new one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A second fixture session, for the case that switches the panel to it. */
+const OTHER_SESSION_ID = 'session-example-0002';
+
+describe('Waterfall page identity', () => {
+  it('starts over at a newly authored offset and draws nothing the previous slice accumulated', async () => {
+    const firstSliceCall = makeEvent({
+      id: eventIdFor(101),
+      spanId: spanIdFor(101),
+      name: 'example.first-slice-call',
+      startTime: BASE_START_MS,
+      duration: 50,
+    });
+    const firstSliceNextCall = makeEvent({
+      id: eventIdFor(102),
+      spanId: spanIdFor(102),
+      name: 'example.first-slice-next-call',
+      startTime: BASE_START_MS + 100,
+      duration: 40,
+    });
+    const laterSliceCall = makeEvent({
+      id: eventIdFor(103),
+      spanId: spanIdFor(103),
+      name: 'example.later-slice-call',
+      startTime: BASE_START_MS + 300,
+      duration: 30,
+    });
+    const stub = slicingProvider((_sessionId, offset) => {
+      switch (offset) {
+        case 0:
+          return { data: [firstSliceCall], total: 60, nextOffset: 1 };
+        case 1:
+          return { data: [firstSliceNextCall], total: 60, nextOffset: 2 };
+        case 40:
+          return { data: [laterSliceCall], total: 60, nextOffset: 41 };
+        default:
+          return undefined;
+      }
+    });
+    const context: HostContext = { provider: stub.provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+
+    const view = renderComponent(makeNode({ query: { source: 'spans', offset: 0 } }), context);
+
+    await screen.findByText(firstSliceCall.name);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(firstSliceNextCall.name);
+    expect(drawnRows()).toHaveLength(2);
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+
+    // The same node, with a query identical in every respect but the offset it
+    // was authored to start from: another slice of the result.
+    rerenderComponent(view, makeNode({ query: { source: 'spans', offset: 40 } }), context);
+
+    await screen.findByText(laterSliceCall.name);
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual({ source: 'spans', offset: 40 });
+
+    // Nothing the first slice accumulated is drawn or counted.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByText(firstSliceCall.name)).toBeNull();
+    expect(screen.queryByText(firstSliceNextCall.name)).toBeNull();
+    expect(
+      screen.getByText(
+        `${formatCount(1)} call · loaded ${formatCount(1)} of ${formatCount(60)} spans`,
+      ),
+    ).toBeTruthy();
+  });
+
+  it('starts over at the authored offset in a new session and draws nothing the earlier session answered', async () => {
+    const earlierSessionCall = makeEvent({
+      id: eventIdFor(111),
+      spanId: spanIdFor(111),
+      name: 'example.earlier-session-call',
+      startTime: BASE_START_MS,
+      duration: 50,
+    });
+    const earlierSessionNextCall = makeEvent({
+      id: eventIdFor(112),
+      spanId: spanIdFor(112),
+      name: 'example.earlier-session-next-call',
+      startTime: BASE_START_MS + 100,
+      duration: 40,
+    });
+    const laterSessionCall = makeEvent({
+      id: eventIdFor(113),
+      spanId: spanIdFor(113),
+      name: 'example.later-session-call',
+      startTime: BASE_START_MS + 300,
+      duration: 30,
+    });
+    const stub = slicingProvider((sessionId, offset) => {
+      if (sessionId === SESSION_ID && offset === 0) {
+        return { data: [earlierSessionCall], total: 20, nextOffset: 1 };
+      }
+      if (sessionId === SESSION_ID && offset === 1) {
+        return { data: [earlierSessionNextCall], total: 20, nextOffset: 2 };
+      }
+      if (sessionId === OTHER_SESSION_ID && offset === 0) {
+        return { data: [laterSessionCall], total: 5, nextOffset: 1 };
+      }
+      return undefined;
+    });
+    const actions = makeActions().actions;
+    const node = makeNode();
+    const user = userEvent.setup();
+
+    const view = renderComponent(node, { provider: stub.provider, actions });
+
+    await screen.findByText(earlierSessionCall.name);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(earlierSessionNextCall.name);
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+
+    // The very same node, drawn for another session.
+    rerenderComponent(view, node, {
+      provider: stub.provider,
+      actions,
+      sessionId: OTHER_SESSION_ID,
+    });
+
+    await screen.findByText(laterSessionCall.name);
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(stub.resolve.mock.calls[2]?.[1].sessionId).toBe(OTHER_SESSION_ID);
+    expect(queryOfCall(stub, 3).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    // The earlier session's evidence is gone from the rows and the count.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByText(earlierSessionCall.name)).toBeNull();
+    expect(screen.queryByText(earlierSessionNextCall.name)).toBeNull();
+    expect(
+      screen.getByText(
+        `${formatCount(1)} call · loaded ${formatCount(1)} of ${formatCount(5)} spans`,
+      ),
+    ).toBeTruthy();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The tree as one composite widget
+ *
+ * A `role="tree"` is ONE stop in the page's Tab order (a roving tab index):
+ * exactly one visible row is tabbable, the arrow keys move between rows, and
+ * the controls nested inside a row are out of the Tab order so that a row is
+ * never two or three stops. The cases below read `tabindex` straight off the
+ * elements the roles resolved to, because the attribute IS the contract.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A top-level call with no source and nothing nested, labelled by its name. */
+const LONE_CALL = makeEvent({
+  id: eventIdFor(51),
+  spanId: spanIdFor(51),
+  kind: 'fetch',
+  tier: 'browser',
+  name: 'example.lone-call',
+  startTime: BASE_START_MS + 1300,
+  duration: 30,
+  seq: 5,
+  ingestSeq: 6,
+});
+
+/** A second one, drawn after it. */
+const LATER_CALL = makeEvent({
+  id: eventIdFor(52),
+  spanId: spanIdFor(52),
+  kind: 'fetch',
+  tier: 'browser',
+  name: 'example.later-call',
+  startTime: BASE_START_MS + 1400,
+  duration: 20,
+  seq: 6,
+  ingestSeq: 7,
+});
+
+/** The rows currently in the page's Tab order. */
+function tabbableRows(): HTMLElement[] {
+  return drawnRows().filter((row) => row.getAttribute('tabindex') === '0');
+}
+
+/** The single row in the Tab order, failing when there is not exactly one. */
+function soleTabStop(): HTMLElement {
+  const rows = tabbableRows();
+  expect(rows).toHaveLength(1);
+  const [row] = rows;
+  if (row === undefined) {
+    throw new Error('no row holds the tab stop');
+  }
+  return row;
+}
+
+describe('Waterfall keyboard composite', () => {
+  it('keeps exactly one row in the Tab order, and moves it with the arrow keys', async () => {
+    const stub = resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(3);
+
+    // The stop starts on the first top-level row, and every other row is
+    // reachable only through the tree's own keys.
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+    for (const row of drawnRows().slice(1)) {
+      expect(row.getAttribute('tabindex')).toBe('-1');
+    }
+
+    rowLabelled(REQUEST_URL).focus();
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    expect(soleTabStop()).toBe(rowLabelled(LONE_CALL.name));
+
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(rowLabelled(LATER_CALL.name));
+    expect(soleTabStop()).toBe(rowLabelled(LATER_CALL.name));
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    // Opening a row and stepping into it moves the stop one level in, and the
+    // nested rows join the tree without adding a stop.
+    await user.keyboard('{ArrowRight}');
+    expect(drawnRows()).toHaveLength(4);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(rowLabelled(SERVER_ROUTE));
+    expect(soleTabStop()).toBe(rowLabelled(SERVER_ROUTE));
+
+    // A collapse that hides the row holding the stop hands it to the nearest
+    // row still on screen — its parent — rather than leaving the tree with no
+    // stop at all. Dispatched without focus, so it is the fallback and not a
+    // focus event that moves the stop.
+    fireEvent.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: COLLAPSE_NAME }));
+    expect(drawnRows()).toHaveLength(3);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+  });
+
+  it('leaves the tree on Tab and returns to the row it left, never stopping inside a row', async () => {
+    // A next page exists, so the footer's "Load more" is the control after the
+    // tree in the Tab order — which is what makes "Tab left the tree" provable.
+    const stub = resolvingProvider([...CHAIN, LONE_CALL], { total: 30, nextOffset: 4 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+
+    // Into the tree: the first row, which holds a disclosure button and a
+    // source chip — and the next Tab passes over both.
+    await user.tab();
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    await user.tab();
+    expect(document.activeElement).toBe(loadMore);
+
+    // Back in, to the row that was left; then the stop follows the arrow keys,
+    // and leaving and returning comes back to where the reader was.
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    await user.tab();
+    expect(document.activeElement).toBe(loadMore);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+  });
+
+  it('keeps the disclosure and the source chip out of the Tab order, and both still work by pointer', async () => {
+    const stub = resolvingProvider(CHAIN);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const row = rowLabelled(REQUEST_URL);
+    const disclosure = within(row).getByRole('button', { name: EXPAND_NAME });
+    const chip = within(row).getByRole('button', { name: SOURCE_CHIP_NAME });
+
+    expect(disclosure.getAttribute('tabindex')).toBe('-1');
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    await user.click(disclosure);
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('true');
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, REQUEST_EVENT.id, true);
+
+    await user.click(
+      within(rowLabelled(REQUEST_URL)).getByRole('button', { name: SOURCE_CHIP_NAME }),
+    );
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Neither control became a stop by being used: the row still is the one.
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+  });
+
+  it('opens the source of the focused row on Shift+Enter, with the very location, and selects nothing', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const sourceRow = rowLabelled(REQUEST_URL);
+    const plainRow = rowLabelled(LONE_CALL.name);
+
+    // Advertised exactly where it does something.
+    expect(sourceRow.getAttribute('aria-keyshortcuts')).toBe('Shift+Enter');
+    expect(plainRow.getAttribute('aria-keyshortcuts')).toBeNull();
+
+    sourceRow.focus();
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+    // The object the record carried, by reference — the same guarantee the
+    // chip keeps — and opening a file is not choosing a record.
+    expect(call[0]).toBe(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-selected')).toBe('false');
+
+    // On a row with nowhere to go, the chord is not consumed and does nothing.
+    const notPrevented = fireEvent.keyDown(plainRow, { key: 'Enter', shiftKey: true });
+    expect(notPrevented).toBe(true);
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Plain Enter still selects.
+    rowLabelled(REQUEST_URL).focus();
+    await user.keyboard('{Enter}');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: REQUEST_EVENT.id,
+      spanId: REQUEST_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps navigating from a nested control a pointer focused, and leaves its Enter to it', async () => {
+    const stub = resolvingProvider([...CHAIN, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // A pointer press leaves focus on the disclosure button, which is out of
+    // the Tab order but still focusable — and the arrow keys must still work
+    // from there, or a click would strand the keyboard inside the row.
+    const disclosure = within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME });
+    await user.click(disclosure);
+    expect(document.activeElement).toBe(disclosure);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(SERVER_ROUTE));
+    expect(soleTabStop()).toBe(rowLabelled(SERVER_ROUTE));
+
+    // Enter on a pointer-focused chip is the chip's own activation: it opens
+    // the source again, and the row it sits in is not selected.
+    const chip = within(rowLabelled(REQUEST_URL)).getByRole('button', { name: SOURCE_CHIP_NAME });
+    await user.click(chip);
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Enter}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+    for (const [location] of spies.onOpenSource.mock.calls) {
+      expect(location).toBe(BASE_SOURCE);
+    }
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The bubble that carries a row's description: the one `role="tooltip"` in the
+ * row whose text begins with the sentence the row is named by, or `undefined`
+ * when the row holds none. The `Tooltip` primitive keeps its bubble mounted —
+ * `hidden` while closed, hence the `hidden` query — in both the hover form and
+ * the keyboard form the row holds open. A row with a source chip can hold a
+ * second tooltip — the chip's own — which this excludes, and finding more than
+ * one fails the case.
+ *
+ * @param row The row.
+ * @returns Its description bubble, when one is mounted.
+ */
+function descriptionBubble(row: HTMLElement): HTMLElement | undefined {
+  const name = row.getAttribute('aria-label') ?? '';
+  const bubbles = within(row)
+    .queryAllByRole('tooltip', { hidden: true })
+    .filter((bubble) => (bubble.textContent ?? '').startsWith(name));
+  expect(bubbles.length).toBeLessThanOrEqual(1);
+  return bubbles[0];
+}
+
+/** Whether a bubble is on screen: mounted, in the open state, and not hidden. */
+function isShown(bubble: HTMLElement | undefined): boolean {
+  return (
+    bubble !== undefined &&
+    bubble.classList.contains('dg-is-open') &&
+    !bubble.classList.contains('dg-visually-hidden')
+  );
+}
+
+describe('Waterfall description for the keyboard', () => {
+  it('reveals the full description on keyboard focus of a row, with the source hint where it applies', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(isShown(descriptionBubble(rowLabelled(REQUEST_URL)))).toBe(false);
+
+    // Tab into the tree: the row that receives focus shows its description in
+    // the tooltip's open form, and hides it from assistive technology, which
+    // already hears the same sentence as the row's name.
+    await user.tab();
+    const sourceRow = rowLabelled(REQUEST_URL);
+    expect(document.activeElement).toBe(sourceRow);
+    const revealed = descriptionBubble(sourceRow);
+    expect(isShown(revealed)).toBe(true);
+    if (revealed === undefined) {
+      throw new Error('the focused row revealed no description');
+    }
+    expect(revealed.getAttribute('aria-hidden')).toBe('true');
+    // Placed by the primitive's own measurement, as a hovered bubble is: an open
+    // bubble is fixed to the viewport, and one nothing placed paints at its corner.
+    expect(revealed.style.getPropertyValue('--dgc-tooltip-block')).not.toBe('');
+    expect(revealed.style.getPropertyValue('--dgc-tooltip-inline')).not.toBe('');
+    expect(revealed.textContent ?? '').toContain(`transferred ${formatBytes(TRANSFERRED_BYTES)}`);
+    // The row's source is one chord away, and the bubble says which.
+    expect(revealed.textContent ?? '').toContain('opens the source');
+    expect(within(revealed).getByText('Shift').tagName.toLowerCase()).toBe('kbd');
+    expect(within(revealed).getByText('Enter').tagName.toLowerCase()).toBe('kbd');
+
+    // The arrow keys carry the reveal with the focus; a row with no source
+    // offers no hint it could not honour.
+    await user.keyboard('{ArrowDown}');
+    const plainRow = rowLabelled(LONE_CALL.name);
+    expect(isShown(descriptionBubble(plainRow))).toBe(true);
+    expect(descriptionBubble(plainRow)?.textContent ?? '').not.toContain('opens the source');
+    expect(isShown(descriptionBubble(rowLabelled(REQUEST_URL)))).toBe(false);
+  });
+
+  it('dismisses the revealed description on Escape until focus leaves the row', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.tab();
+    await user.keyboard('{ArrowDown}');
+    const row = rowLabelled(LONE_CALL.name);
+    expect(isShown(descriptionBubble(row))).toBe(true);
+
+    // Consumed when there was something to dismiss, and only then: a second
+    // Escape belongs to whatever sits above the tree.
+    expect(fireEvent.keyDown(row, { key: 'Escape' })).toBe(false);
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(false);
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    expect(fireEvent.keyDown(rowLabelled(LONE_CALL.name), { key: 'Escape' })).toBe(true);
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(false);
+
+    // Leaving and returning is a new visit, and the description comes back.
+    await user.keyboard('{ArrowUp}');
+    await user.keyboard('{ArrowDown}');
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(true);
+  });
+
+  it('does not pop the description when a click focuses the row', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(rowLabelled(LONE_CALL.name));
+
+    // The click focused and selected the row — and moved the tab stop to it —
+    // but a pointer already has the hover tooltip, so nothing popped.
+    const row = rowLabelled(LONE_CALL.name);
+    expect(document.activeElement).toBe(row);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(soleTabStop()).toBe(row);
+    expect(isShown(descriptionBubble(row))).toBe(false);
+
+    // The same row reached from the keyboard afterwards does reveal it.
+    await user.keyboard('{ArrowUp}');
+    await user.keyboard('{ArrowDown}');
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Re-attached calls (orphans)
+ *
+ * A call the correlator re-attached to the top level because the parent it
+ * named could not be resolved is evidence, drawn and FLAGGED — never dropped and
+ * never disguised as an ordinary top-level row (`docs/ARCHITECTURE.md`,
+ * "Attribution, joining and orphans"). The verdict is the flag the service
+ * persisted on the flat record, which a parent present in the page proves
+ * stale. The correlated `trace` tree is not a source this node type reads (its
+ * catalog entry excludes it), so no case here draws one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The badge word a re-attached row shows — the one Timeline uses too. */
+const REATTACHED_BADGE = 'Re-attached';
+
+/** The phrase every re-attached row's description starts its sentence with. */
+const REATTACHED_PHRASE = 're-attached to the top level';
+
+/** Whether a row carries the re-attached flag in all three of its forms. */
+function isFlaggedReattached(row: HTMLElement): boolean {
+  const badge = within(row).queryByText(REATTACHED_BADGE);
+  const flagged = row.classList.contains('dg-is-orphan');
+  const described = (row.getAttribute('aria-label') ?? '').includes(REATTACHED_PHRASE);
+  // All three or none: a class with no word, or a word with no state, is the
+  // half-signal this view must never emit.
+  expect([badge !== null, described]).toEqual([flagged, flagged]);
+  if (badge !== null) {
+    expect(badge.classList.contains('dg-badge--warning')).toBe(true);
+    expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+  }
+  return flagged;
+}
+
+describe('Waterfall re-attached calls', () => {
+  it('flags a flat record from its persisted flag, and ignores a flag its loaded parent proves stale', async () => {
+    const ownFlag = makeEvent({
+      id: eventIdFor(71),
+      spanId: spanIdFor(71),
+      parentSpanId: spanIdFor(70),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.persisted-orphan',
+      startTime: BASE_START_MS,
+      duration: 80,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(70) },
+    });
+    // Flagged, but with no recorded parent id: the sentence says so rather than
+    // naming one.
+    const bareFlag = makeEvent({
+      id: eventIdFor(80),
+      spanId: spanIdFor(80),
+      parentSpanId: spanIdFor(81),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.bare-flag',
+      startTime: BASE_START_MS + 50,
+      duration: 30,
+      attributes: { orphaned: true },
+    });
+    // An undrawn step flagged as re-attached (the string form of the flag), and
+    // the drawn call it lifts to the top level.
+    const flaggedStep = makeEvent({
+      id: eventIdFor(77),
+      spanId: spanIdFor(77),
+      parentSpanId: spanIdFor(78),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.flagged-step',
+      startTime: BASE_START_MS + 100,
+      duration: 200,
+      attributes: { orphaned: 'true', orphanedParentSpanId: spanIdFor(78) },
+    });
+    const liftedCall = makeEvent({
+      id: eventIdFor(79),
+      spanId: spanIdFor(79),
+      parentSpanId: spanIdFor(77),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.lifted-call',
+      startTime: BASE_START_MS + 110,
+      duration: 90,
+    });
+    // Stale at the top level: the flagged call's parent is an unflagged,
+    // undrawn step that IS in the page, so an earlier pass's verdict no longer
+    // holds even though the call still sits at the top level.
+    const placedStep = makeEvent({
+      id: eventIdFor(75),
+      spanId: spanIdFor(75),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.placed-step',
+      startTime: BASE_START_MS + 400,
+      duration: 100,
+    });
+    const staleTop = makeEvent({
+      id: eventIdFor(76),
+      spanId: spanIdFor(76),
+      parentSpanId: spanIdFor(75),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.stale-top',
+      startTime: BASE_START_MS + 410,
+      duration: 60,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(75) },
+    });
+    // Stale and nested: the parent arrived and is drawn.
+    const server = makeEvent({
+      id: eventIdFor(73),
+      spanId: spanIdFor(73),
+      kind: 'http.server',
+      tier: 'server',
+      name: 'example.late-parent',
+      startTime: BASE_START_MS + 600,
+      duration: 150,
+    });
+    const staleNested = makeEvent({
+      id: eventIdFor(74),
+      spanId: spanIdFor(74),
+      parentSpanId: spanIdFor(73),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.stale-nested',
+      startTime: BASE_START_MS + 610,
+      duration: 70,
+      attributes: { orphaned: 'true', orphanedParentSpanId: spanIdFor(73) },
+    });
+    const stub = resolvingProvider([
+      ownFlag,
+      bareFlag,
+      flaggedStep,
+      liftedCall,
+      placedStep,
+      staleTop,
+      server,
+      staleNested,
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(5);
+
+    // A persisted flag records THAT the parent was unresolvable, not which of
+    // the correlator's cases applied, so no reason is claimed.
+    const ownRow = rowLabelled(ownFlag.name);
+    expect(isFlaggedReattached(ownRow)).toBe(true);
+    expect(ownRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent ${spanIdFor(70)} of this call never arrived`,
+    );
+    expect(ownRow.getAttribute('aria-label') ?? '').not.toContain('(missing-parent)');
+
+    expect(isFlaggedReattached(rowLabelled(bareFlag.name))).toBe(true);
+    expect(rowLabelled(bareFlag.name).getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent this call names never arrived`,
+    );
+
+    const liftedRow = rowLabelled(liftedCall.name);
+    expect(isFlaggedReattached(liftedRow)).toBe(true);
+    expect(liftedRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE} with an enclosing call not drawn here: the parent ${spanIdFor(78)} of that call never arrived`,
+    );
+
+    // Stale flags draw nothing, at the top level and nested.
+    expect(isFlaggedReattached(rowLabelled(staleTop.name))).toBe(false);
+    expect(isFlaggedReattached(rowLabelled(server.name))).toBe(false);
+    await user.click(within(rowLabelled(server.name)).getByRole('button', { name: EXPAND_NAME }));
+    expect(isFlaggedReattached(rowLabelled(staleNested.name))).toBe(false);
+
+    // The undrawn steps are not drawn for carrying a flag.
+    expect(screen.queryByText(flaggedStep.name)).toBeNull();
+    expect(screen.queryByText(placedStep.name)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Failure in words, and the two row states the stylesheet paints
+ * ---------------------------------------------------------------------------
+ */
+
+/** The word a failed call without a failing status code shows. */
+const ERROR_BADGE = 'Error';
+
+/**
+ * The component stylesheet, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents, so the working directory is
+ * irrelevant. The path is joined with `node:path` rather than resolved with
+ * `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/**
+ * The declaration block of one selector in {@link COMPONENT_STYLESHEET}, and
+ * the offset its rule starts at, failing when the rule is absent.
+ *
+ * @param selector The selector exactly as written at the start of its rule.
+ * @returns The rule's start offset and the text between its braces.
+ */
+function ruleOf(selector: string): { readonly start: number; readonly body: string } {
+  const start = COMPONENT_STYLESHEET.indexOf(`\n${selector} {`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const open = COMPONENT_STYLESHEET.indexOf('{', start);
+  const close = COMPONENT_STYLESHEET.indexOf('}', open);
+  return { start, body: COMPONENT_STYLESHEET.slice(open + 1, close) };
+}
+
+describe('Waterfall failure and state styling', () => {
+  it('says "Error" on a failed call no status code conveys, and never beside one that does', async () => {
+    const failedQuery = makeEvent({
+      id: eventIdFor(91),
+      spanId: spanIdFor(91),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.failed-statement',
+      startTime: BASE_START_MS,
+      duration: 120,
+      status: 'error',
+    });
+    // A failed outgoing call whose response code does not read as a failure:
+    // the code alone would say "fine", so the word is added.
+    const failedDespiteCode = makeEvent({
+      id: eventIdFor(92),
+      spanId: spanIdFor(92),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.failed-outgoing',
+      startTime: BASE_START_MS + 150,
+      duration: 60,
+      status: 'error',
+      attributes: { 'http.status_code': 200 },
+    });
+    const unavailable = makeEvent({
+      id: eventIdFor(93),
+      spanId: spanIdFor(93),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.unavailable',
+      startTime: BASE_START_MS + 250,
+      duration: 40,
+      status: 'error',
+      attributes: { 'http.status_code': 503 },
+    });
+    const succeeded = makeEvent({
+      id: eventIdFor(94),
+      spanId: spanIdFor(94),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.fine-statement',
+      startTime: BASE_START_MS + 320,
+      duration: 20,
+      status: 'ok',
+    });
+    const stub = resolvingProvider([failedQuery, failedDespiteCode, unavailable, succeeded]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const event of [failedQuery, failedDespiteCode]) {
+      const row = rowLabelled(event.name);
+      const badge = within(row).getByText(ERROR_BADGE);
+      expect(badge.classList.contains('dg-badge')).toBe(true);
+      expect(badge.classList.contains('dg-badge--danger')).toBe(true);
+      expect(badge.classList.contains('dg-waterfall__status')).toBe(true);
+      expect(row.classList.contains('dg-is-error')).toBe(true);
+    }
+    expect(rowLabelled(failedQuery.name).getAttribute('aria-label') ?? '').toContain(
+      'status Error',
+    );
+
+    // A failing code already says it, in the danger tone; a second word beside
+    // it would say the same thing twice.
+    const unavailableRow = rowLabelled(unavailable.name);
+    expect(within(unavailableRow).getByText('503').classList.contains('dg-badge--danger')).toBe(
+      true,
+    );
+    expect(within(unavailableRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(unavailableRow.classList.contains('dg-is-error')).toBe(true);
+
+    // And a success is not marked at all.
+    const fineRow = rowLabelled(succeeded.name);
+    expect(within(fineRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(fineRow.classList.contains('dg-is-error')).toBe(false);
+  });
+
+  it('colours each response class as the request table does, and draws a failed bar in its outcome colour', async () => {
+    // One call per response class the product distinguishes, including a 500
+    // an older browser producer reported as `ok`: the code wins, so it still
+    // reads as the server failure it was.
+    const cases = [
+      { ordinal: 95, name: 'example.moved', code: 301, status: 'ok', tone: 'info', failed: false },
+      {
+        ordinal: 96,
+        name: 'example.missing',
+        code: 404,
+        status: 'error',
+        tone: 'warning',
+        failed: true,
+      },
+      {
+        ordinal: 97,
+        name: 'example.broken',
+        code: 500,
+        status: 'ok',
+        tone: 'danger',
+        failed: true,
+      },
+      {
+        ordinal: 98,
+        name: 'example.found',
+        code: 200,
+        status: 'ok',
+        tone: 'success',
+        failed: false,
+      },
+    ] as const;
+    const events = cases.map((entry, index) =>
+      makeEvent({
+        id: eventIdFor(entry.ordinal),
+        spanId: spanIdFor(entry.ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: entry.name,
+        startTime: BASE_START_MS + index * 50,
+        duration: 30,
+        status: entry.status,
+        attributes: { 'http.method': REQUEST_METHOD, 'http.status_code': entry.code },
+      }),
+    );
+    const stub = resolvingProvider(events);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const entry of cases) {
+      const row = rowLabelled(entry.name);
+      const chip = within(row).getByText(String(entry.code));
+      // The shared tone table: a redirect is informational, a client error a
+      // warning, a server error a danger — the request table's own reading.
+      expect(chip.classList.contains(`dg-badge--${entry.tone}`), `${entry.name} chip`).toBe(true);
+      expect(row.classList.contains('dg-is-error'), `${entry.name} edge`).toBe(entry.failed);
+
+      // The row carries its colour, so the bar (which inherits it) and the
+      // failed edge cannot disagree: a failure in its outcome token, anything
+      // else in its kind's.
+      const expected = entry.failed ? httpStatusColorVar(entry.code) : kindColorVar('fetch');
+      expect(row.style.getPropertyValue('--dgc-bar-color'), `${entry.name} colour`).toBe(expected);
+      const bar = row.querySelector<HTMLElement>('.dg-waterfall__bar');
+      expect(bar?.style.getPropertyValue('--dgc-bar-color')).toBe('');
+      // No response code in the "Error" word when the code already says it.
+      expect(within(row).queryByText(ERROR_BADGE)).toBeNull();
+    }
+    expect(httpStatusColorVar(404)).not.toBe(httpStatusColorVar(500));
+  });
+
+  it('paints the failed and re-attached row states from tokens, beneath the selected state', () => {
+    const orphan = ruleOf('.dg-waterfall__row.dg-is-orphan');
+    const failed = ruleOf('.dg-waterfall__row.dg-is-error');
+    const selected = ruleOf('.dg-waterfall__row.dg-is-selected');
+
+    expect(orphan.body).toContain('border-inline-start-color: var(--dg-warning);');
+    expect(orphan.body).toContain('border-inline-start-style: dashed;');
+    // The failed edge is the row's outcome colour — the value its bar is drawn
+    // in — with the danger token as the fallback.
+    expect(failed.body).toContain(
+      'border-inline-start-color: var(--dgc-bar-color, var(--dg-danger));',
+    );
+
+    // Equal specificity, so source order decides: selection's accent edge must
+    // come last to win over both.
+    expect(orphan.start).toBeLessThan(selected.start);
+    expect(failed.start).toBeLessThan(selected.start);
+    expect(selected.body).toContain('border-inline-start-color: var(--dg-accent);');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Calls still in flight when the capture ended
+ *
+ * A request that had started and not settled when the capture ended arrives as
+ * an in-flight snapshot: a `requests` occurrence marked `pending` (counted by
+ * its group's `pendingCount`), or a flat `fetch`/`xhr` record carrying the
+ * boolean `inFlight` marker. Its duration is how long it had been outstanding —
+ * a LOWER BOUND — and no response had arrived. Drawing it as a request that
+ * "took" that long, with a status or a transfer figure, would present an
+ * unfinished call as a completed one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The badge word a pending row shows — the one the request table uses too. */
+const PENDING_BADGE = 'Pending';
+
+/** The whole text of a Pending badge: the word, and a count on a group row. */
+const PENDING_BADGE_TEXT = /^Pending(?: \d+)?$/;
+
+/** The words a pending row prints before its duration. */
+const LOWER_BOUND_WORDS = 'at least';
+
+/** What a pending single call's description says about the missing response. */
+const IN_FLIGHT_SENTENCE = 'still in flight when the capture ended; no response had arrived';
+
+/** The redacted URL of the grouped request the pending cases draw. */
+const PENDING_URL = 'http://127.0.0.1:3000/example/outstanding?cursor=?';
+
+/** Its path, as the request aggregate derives it. */
+const PENDING_PATH = '/example/outstanding';
+
+/**
+ * One settled occurrence of a grouped request, typed against the aggregate's
+ * own `RequestOccurrence`: a status code, an `ok` status and a transfer figure.
+ *
+ * @param ordinal The ordinal its ids derive from.
+ * @param startOffsetMs Its start, relative to the fixture base time.
+ * @param durationMs How long it took.
+ * @returns A fresh occurrence.
+ */
+function settledOccurrence(
+  ordinal: number,
+  startOffsetMs: number,
+  durationMs: number,
+): RequestOccurrence {
+  const startTime = BASE_START_MS + startOffsetMs;
+  return {
+    id: eventIdFor(ordinal),
+    eventId: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    traceId: TRACE_ID,
+    startTime,
+    durationMs,
+    endTime: startTime + durationMs,
+    statusCode: 200,
+    status: 'ok',
+    transferredBytes: TRANSFERRED_BYTES,
+    transferSource: 'request',
+    tier: 'browser',
+    kind: 'fetch',
+  };
+}
+
+/**
+ * One pending occurrence, exactly as the aggregate publishes an in-flight
+ * snapshot: `pending: true`, span status `unset`, and neither a status code nor
+ * a transfer figure, because no response had arrived.
+ *
+ * @param ordinal The ordinal its ids derive from.
+ * @param startOffsetMs Its start, relative to the fixture base time.
+ * @param durationMs How long it had been outstanding when observed.
+ * @returns A fresh occurrence.
+ */
+function pendingOccurrence(
+  ordinal: number,
+  startOffsetMs: number,
+  durationMs: number,
+): RequestOccurrence {
+  const startTime = BASE_START_MS + startOffsetMs;
+  return {
+    id: eventIdFor(ordinal),
+    eventId: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    traceId: TRACE_ID,
+    startTime,
+    durationMs,
+    endTime: startTime + durationMs,
+    status: 'unset',
+    pending: true,
+    tier: 'browser',
+    kind: 'fetch',
+  };
+}
+
+/**
+ * A `method-path` group over `occurrences`, with the figures the aggregate
+ * derives from them: durations over every occurrence, status codes and the
+ * transfer sum over the settled ones only, and `pendingCount` present only
+ * when at least one occurrence is pending.
+ *
+ * @param occurrences The group's occurrences, in canonical order.
+ * @returns A fresh group.
+ */
+function makeRequestGroup(occurrences: readonly RequestOccurrence[]): RequestGroup {
+  const durations = occurrences.map((occurrence) => occurrence.durationMs);
+  const starts = occurrences.map((occurrence) => occurrence.startTime);
+  const settled = occurrences.filter((occurrence) => occurrence.pending !== true);
+  const pendingCount = occurrences.length - settled.length;
+  const statusCodes = [
+    ...new Set(settled.flatMap((occurrence) => occurrence.statusCode ?? [])),
+  ].sort((left, right) => left - right);
+  const transfers = settled.flatMap((occurrence) => occurrence.transferredBytes ?? []);
+  const totalDurationMs = durations.reduce((sum, duration) => sum + duration, 0);
+  return {
+    id: 'request-group-example-0101',
+    groupedBy: 'method-path',
+    method: 'GET',
+    url: PENDING_URL,
+    path: PENDING_PATH,
+    count: occurrences.length,
+    duplicateCount: 0,
+    hasDuplicates: false,
+    duplicateWindows: [],
+    firstStartTime: Math.min(...starts),
+    lastStartTime: Math.max(...starts),
+    totalDurationMs,
+    averageDurationMs: Math.round(totalDurationMs / occurrences.length),
+    maxDurationMs: Math.max(...durations),
+    minDurationMs: Math.min(...durations),
+    statusCodes,
+    errorCount: 0,
+    ...(pendingCount > 0 ? { pendingCount } : {}),
+    initiators: [],
+    ...(transfers.length === 0
+      ? {}
+      : { transferredBytes: transfers.reduce((sum, bytes) => sum + bytes, 0) }),
+    occurrences,
+    occurrencesTruncated: false,
+  };
+}
+
+/**
+ * A provider answering every query with one page of grouped requests, for a
+ * node whose query names the `requests` source.
+ *
+ * @param groups The groups of the page.
+ * @returns The stub provider.
+ */
+function groupsProvider(groups: readonly RequestGroup[]): StubProvider {
+  return recordingProvider(() =>
+    Promise.resolve<DataQueryResponse>({ source: 'requests', data: groups, total: groups.length }),
+  );
+}
+
+/** A `waterfall` node reading the grouped request result. */
+const REQUESTS_NODE = makeNode({ query: { source: 'requests' } });
+
+/**
+ * Whether a row states itself as pending in every form it must: the badge
+ * word, the lower-bound words beside the duration it prints, and "took at
+ * least" in its description — or in none of them.
+ *
+ * @param row The row.
+ * @param durationMs The duration the row prints.
+ * @returns Whether the row is drawn as pending.
+ */
+function isDrawnPending(row: HTMLElement, durationMs: number): boolean {
+  const badge = within(row).queryByText(PENDING_BADGE_TEXT);
+  const lowerBound = within(row).queryByText(LOWER_BOUND_WORDS);
+  const description = row.getAttribute('aria-label') ?? '';
+  const described = description.includes(`took ${LOWER_BOUND_WORDS} ${formatDuration(durationMs)}`);
+  // All three or none: a badge over a duration read as complete, or the words
+  // with no state, is the half-signal this view must never emit.
+  expect([lowerBound !== null, described]).toEqual([badge !== null, badge !== null]);
+  if (badge !== null) {
+    expect(badge.classList.contains('dg-badge--info')).toBe(true);
+    expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+    expect(badge.classList.contains('dg-waterfall__status')).toBe(true);
+    // The lower-bound words and the figure share the row's duration cell.
+    const cell = lowerBound?.closest<HTMLElement>('.dg-waterfall__duration');
+    expect(cell?.textContent ?? '').toContain(formatDuration(durationMs));
+    expect(description).not.toContain(`took ${formatDuration(durationMs)}`);
+  } else {
+    expect(description).toContain(`took ${formatDuration(durationMs)}`);
+  }
+  return badge !== null;
+}
+
+describe('Waterfall calls still in flight', () => {
+  it('draws a grouped request still in flight as pending, with no response and a lower-bound duration', async () => {
+    const group = makeRequestGroup([pendingOccurrence(131, 0, 180)]);
+    const stub = groupsProvider([group]);
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(soleQuery(stub).source).toBe('requests');
+    expect(drawnRows()).toHaveLength(1);
+
+    const row = rowLabelled(PENDING_URL);
+    expect(isDrawnPending(row, 180)).toBe(true);
+    expect(within(row).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+
+    const description = row.getAttribute('aria-label') ?? '';
+    expect(description).toContain(IN_FLIGHT_SENTENCE);
+
+    // No response arrived, so nothing a response would have carried is claimed:
+    // no status code or "Error" chip, no failure state, no status sentence, and
+    // not even an "unavailable" transfer figure.
+    expect(row.querySelectorAll('.dg-waterfall__status')).toHaveLength(1);
+    expect(within(row).queryByText(ERROR_BADGE)).toBeNull();
+    expect(row.classList.contains('dg-is-error')).toBe(false);
+    expect(description).not.toContain('status ');
+    expect(description).not.toContain('transferred');
+  });
+
+  it('flags a group holding a call still in flight, and each of its calls as what it was', async () => {
+    const settled = settledOccurrence(132, 0, 120);
+    const pending = pendingOccurrence(133, 200, 300);
+    const group = makeRequestGroup([settled, pending]);
+    expect(group.pendingCount).toBe(1);
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(1);
+
+    // The group row spans both calls — 0 to 500 ms — and since one of them had
+    // not finished, that extent is a lower bound too. One call pending: the
+    // word alone, and the count in the description.
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    expect(isDrawnPending(groupRow, 500)).toBe(true);
+    expect(within(groupRow).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+    const groupDescription = groupRow.getAttribute('aria-label') ?? '';
+    expect(groupDescription).toContain('1 call still in flight when the capture ended');
+    expect(groupDescription).toContain(`${formatCount(2)} calls in this group`);
+    // Its outcome is the settled call's, and the settled call's bytes are real.
+    expect(groupRow.classList.contains('dg-is-error')).toBe(false);
+    expect(groupDescription).toContain(`transferred ${formatBytes(TRANSFERRED_BYTES)}`);
+
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+    expect(drawnRows()).toHaveLength(3);
+    const [, settledRow, pendingRow] = drawnRows();
+    if (settledRow === undefined || pendingRow === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+
+    // The settled call completed: its status, and a duration it really took.
+    expect(isDrawnPending(settledRow, 120)).toBe(false);
+    expect(within(settledRow).getByText('200').classList.contains('dg-waterfall__status')).toBe(
+      true,
+    );
+
+    // The pending one did not: no status, a lower bound, and why.
+    expect(isDrawnPending(pendingRow, 300)).toBe(true);
+    expect(within(pendingRow).queryByText('200')).toBeNull();
+    expect(pendingRow.getAttribute('aria-label') ?? '').toContain(IN_FLIGHT_SENTENCE);
+    expect(pendingRow.getAttribute('aria-label') ?? '').not.toContain('transferred');
+  });
+
+  it('reads the in-flight marker on a flat request record, strictly as the boolean', async () => {
+    const inFlightUrl = 'http://127.0.0.1:3000/example/in-flight?page=?';
+    const settledUrl = 'http://127.0.0.1:3000/example/settled?page=?';
+    // A snapshot carrying the marker — and, as a producer must not but a bag
+    // might, a status code, a transfer size and an error status: none of them
+    // describes a response, because none had arrived.
+    const inFlight = makeEvent({
+      id: eventIdFor(141),
+      spanId: spanIdFor(141),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.in-flight-call',
+      startTime: BASE_START_MS,
+      duration: 250,
+      status: 'error',
+      attributes: {
+        'http.method': 'GET',
+        url: inFlightUrl,
+        'http.status_code': 200,
+        transferSize: TRANSFERRED_BYTES,
+        inFlight: true,
+      },
+    });
+    // The string form is NOT the marker: this request settled.
+    const settledCall = makeEvent({
+      id: eventIdFor(142),
+      spanId: spanIdFor(142),
+      kind: 'xhr',
+      tier: 'browser',
+      name: 'example.settled-call',
+      startTime: BASE_START_MS + 300,
+      duration: 70,
+      attributes: {
+        'http.method': 'GET',
+        url: settledUrl,
+        'http.status_code': 200,
+        inFlight: 'true',
+      },
+    });
+    const stub = resolvingProvider([inFlight, settledCall]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const inFlightRow = rowLabelled(inFlightUrl);
+    expect(isDrawnPending(inFlightRow, 250)).toBe(true);
+    const inFlightDescription = inFlightRow.getAttribute('aria-label') ?? '';
+    expect(inFlightDescription).toContain(IN_FLIGHT_SENTENCE);
+    expect(within(inFlightRow).queryByText('200')).toBeNull();
+    expect(within(inFlightRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(inFlightRow.classList.contains('dg-is-error')).toBe(false);
+    expect(inFlightDescription).not.toContain('status ');
+    expect(inFlightDescription).not.toContain('transferred');
+
+    const settledRow = rowLabelled(settledUrl);
+    expect(isDrawnPending(settledRow, 70)).toBe(false);
+    expect(within(settledRow).getByText('200')).toBeTruthy();
+    expect(settledRow.getAttribute('aria-label') ?? '').toContain('status 200');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Durations that are not measurements
+ *
+ * A malformed record can carry a duration no clock produced: a negative value,
+ * `null` where the schema promises a number, or `NaN`. The bar is still drawn
+ * — at zero, so it marks where the call began — but the figure a reader is
+ * shown is the unavailable label: printing the drawn zero would report a
+ * corrupt measurement as the fastest call of the capture.
+ * ---------------------------------------------------------------------------
+ */
+
+/** What a row's description says about a duration that was not measured. */
+const UNMEASURED_TOOK = `took ${NOT_AVAILABLE_LABEL}`;
+
+/** The measured-zero text the drawn value would print as. */
+const MEASURED_ZERO = formatDuration(0);
+
+/**
+ * A duration as a malformed record delivers it: `null` where the schema
+ * promises a number, which only a boundary the schema did not guard can let
+ * through — exactly the input this view must still render honestly.
+ */
+const NULL_DURATION = null as unknown as number;
+
+/**
+ * The duration cell of a row, obtained from the row the case already named.
+ *
+ * @param row The row.
+ * @returns Its duration cell.
+ */
+function durationCellOf(row: HTMLElement): HTMLElement {
+  const cell = row.querySelector<HTMLElement>('.dg-duration-cell');
+  if (cell === null) {
+    throw new Error('the row drew no duration cell');
+  }
+  return cell;
+}
+
+/**
+ * Asserts a row states its duration as unavailable in every form it prints
+ * one: the cell reads the label, takes the unavailable state and no severity
+ * step, and the description says "took n/a" — never the measured zero.
+ *
+ * @param row The row.
+ */
+function expectUnmeasured(row: HTMLElement): void {
+  const cell = durationCellOf(row);
+  expect(cell.textContent).toBe(NOT_AVAILABLE_LABEL);
+  expect(cell.classList.contains('dg-is-unavailable')).toBe(true);
+  for (const step of ['fast', 'normal', 'slow', 'critical']) {
+    expect(cell.classList.contains(`dg-duration-cell--${step}`)).toBe(false);
+  }
+  const description = row.getAttribute('aria-label') ?? '';
+  expect(description).toContain(UNMEASURED_TOOK);
+  expect(description).not.toContain(`took ${MEASURED_ZERO}`);
+  // Its bar is still drawn, so the row keeps marking where the call began.
+  expect(row.querySelector('.dg-waterfall__bar')).not.toBeNull();
+}
+
+describe('Waterfall durations that are not measurements', () => {
+  it('prints and describes a negative, null or NaN duration as unavailable, and a measured one as measured', async () => {
+    const urls = {
+      negative: 'http://127.0.0.1:3000/example/negative?page=?',
+      absent: 'http://127.0.0.1:3000/example/absent?page=?',
+      notANumber: 'http://127.0.0.1:3000/example/not-a-number?page=?',
+      noise: 'http://127.0.0.1:3000/example/noise?page=?',
+      measured: 'http://127.0.0.1:3000/example/measured?page=?',
+    } as const;
+    const call = (ordinal: number, url: string, offsetMs: number, duration: number) =>
+      makeEvent({
+        id: eventIdFor(ordinal),
+        spanId: spanIdFor(ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: 'example.call',
+        startTime: BASE_START_MS + offsetMs,
+        duration,
+        attributes: { 'http.method': 'GET', url, 'http.status_code': 200 },
+        seq: ordinal,
+        ingestSeq: ordinal,
+      });
+    const stub = resolvingProvider([
+      call(151, urls.negative, 10, -5),
+      call(152, urls.absent, 20, NULL_DURATION),
+      call(153, urls.notANumber, 25, Number.NaN),
+      // Below zero only by floating-point noise: the zero it is.
+      call(154, urls.noise, 28, -0.0004),
+      call(155, urls.measured, 30, 250),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(5);
+
+    expectUnmeasured(rowLabelled(urls.negative));
+    expectUnmeasured(rowLabelled(urls.absent));
+    expectUnmeasured(rowLabelled(urls.notANumber));
+
+    const noiseRow = rowLabelled(urls.noise);
+    expect(durationCellOf(noiseRow).textContent).toBe(MEASURED_ZERO);
+    expect(noiseRow.getAttribute('aria-label') ?? '').toContain(`took ${MEASURED_ZERO}`);
+
+    const measuredRow = rowLabelled(urls.measured);
+    expect(durationCellOf(measuredRow).textContent).toBe(formatDuration(250));
+    expect(measuredRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(250)}`);
+  });
+
+  it('states a call still in flight with no measured duration as pending, without a lower bound on nothing', async () => {
+    const url = 'http://127.0.0.1:3000/example/in-flight-unmeasured?page=?';
+    const inFlight = makeEvent({
+      id: eventIdFor(156),
+      spanId: spanIdFor(156),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.in-flight-call',
+      startTime: BASE_START_MS,
+      duration: -5,
+      attributes: { 'http.method': 'GET', url, inFlight: true },
+    });
+    const stub = resolvingProvider([inFlight]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const row = rowLabelled(url);
+    // Still pending: the badge and the sentence about the missing response.
+    expect(within(row).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+    expect(row.getAttribute('aria-label') ?? '').toContain(IN_FLIGHT_SENTENCE);
+    // But no "at least" qualifies a figure there is none of.
+    expect(within(row).queryByText(LOWER_BOUND_WORDS)).toBeNull();
+    expect(row.getAttribute('aria-label') ?? '').not.toContain(`took ${LOWER_BOUND_WORDS}`);
+    expectUnmeasured(row);
+  });
+
+  it('prints a group extent as unavailable when one of its calls has no measured end, and each call as what it was', async () => {
+    const measured = settledOccurrence(157, 0, 120);
+    const corrupt = { ...settledOccurrence(158, 200, 0), durationMs: -5 };
+    const group = makeRequestGroup([measured, corrupt]);
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    // The corrupt call's end is unknown, so the group's is too.
+    expectUnmeasured(groupRow);
+
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+    const [, measuredRow, corruptRow] = drawnRows();
+    if (measuredRow === undefined || corruptRow === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+    expect(durationCellOf(measuredRow).textContent).toBe(formatDuration(120));
+    expect(measuredRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(120)}`);
+    expectUnmeasured(corruptRow);
+  });
+
+  it('keeps printing a group extent whose every call was measured', async () => {
+    const group = makeRequestGroup([
+      settledOccurrence(159, 0, 120),
+      settledOccurrence(160, 200, 50),
+    ]);
+    const stub = groupsProvider([group]);
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    // First start to last end: 0 to 250 ms.
+    expect(durationCellOf(groupRow).textContent).toBe(formatDuration(250));
+    expect(groupRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(250)}`);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The panel's shared selection
+ *
+ * One interaction is drawn by several views at once — the timeline, the flame
+ * chart, this waterfall, the tables — and a reader who selects a span in any of
+ * them must see the same span marked in every other one, never a second,
+ * contradicting selection. Under a host the waterfall therefore keeps no
+ * selection of its own: it reports the row a reader activated and marks the
+ * row the host says is selected (`PanelSelectionContext`). Outside a host it
+ * falls back to marking what it was last activated on.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The component inside the host contexts plus the host's selection holder, as
+ * `PanelHost` provides it.
+ *
+ * @param node The node to draw.
+ * @param context The provider and actions to render it inside.
+ * @param selection What the host currently holds as selected.
+ * @returns The element tree.
+ */
+function selectionTree(
+  node: WaterfallNode,
+  context: HostContext,
+  selection: PanelSelection | undefined,
+): ReactElement {
+  return (
+    <PanelSelectionContext.Provider value={{ selection }}>
+      {hostTree(node, context)}
+    </PanelSelectionContext.Provider>
+  );
+}
+
+/** Every drawn row the view currently marks as selected, by label element. */
+function markedRows(): HTMLElement[] {
+  return drawnRows().filter(
+    (row) =>
+      row.getAttribute('aria-selected') === 'true' || row.classList.contains('dg-is-selected'),
+  );
+}
+
+/** A second trace, sharing span ids with the fixture one and nothing else. */
+const OTHER_TRACE_ID = 'c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3';
+
+describe('Waterfall shared selection', () => {
+  it('marks the row of a span another view selected, and follows the host as it moves', async () => {
+    const stub = resolvingProvider([...CHAIN, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const context = { provider: stub.provider, actions: spies.actions };
+
+    const view = render(
+      selectionTree(makeNode(), context, {
+        eventId: LONE_CALL.id,
+        traceId: TRACE_ID,
+        spanId: LONE_CALL.spanId,
+      }),
+    );
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // Selected elsewhere, marked here — by both the attribute and the state
+    // class, so assistive technology and the eye agree.
+    expect(markedRows()).toEqual([rowLabelled(LONE_CALL.name)]);
+    expect(rowLabelled(LONE_CALL.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowLabelled(LONE_CALL.name).classList.contains('dg-is-selected')).toBe(true);
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-selected')).toBe('false');
+
+    // Open the request so the server row it waited on is drawn.
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+
+    // A view that keys the span under another record id still names the same
+    // trace and span, and that pair is the span's identity: the row matches.
+    view.rerender(
+      selectionTree(makeNode(), context, {
+        eventId: 'event-from-another-view',
+        traceId: TRACE_ID,
+        spanId: SERVER_EVENT.spanId,
+      }),
+    );
+
+    expect(markedRows()).toEqual([rowLabelled(SERVER_ROUTE)]);
+
+    // The same span id in another trace is a different span, and marks nothing.
+    view.rerender(
+      selectionTree(makeNode(), context, {
+        eventId: 'event-from-another-view',
+        traceId: OTHER_TRACE_ID,
+        spanId: SERVER_EVENT.spanId,
+      }),
+    );
+
+    expect(markedRows()).toEqual([]);
+
+    // A cleared selection leaves every row unmarked.
+    view.rerender(selectionTree(makeNode(), context, undefined));
+
+    expect(markedRows()).toEqual([]);
+
+    // Following the host is not reporting to it: nothing was activated here.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('reports an activation to the host and marks only what the host then holds', async () => {
+    const stub = resolvingProvider([LONE_CALL, LATER_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const context = { provider: stub.provider, actions: spies.actions };
+
+    const view = render(
+      selectionTree(makeNode(), context, {
+        eventId: LONE_CALL.id,
+        traceId: TRACE_ID,
+        spanId: LONE_CALL.spanId,
+      }),
+    );
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    await user.click(rowLabelled(LATER_CALL.name));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: LATER_CALL.id,
+      spanId: LATER_CALL.spanId,
+      traceId: TRACE_ID,
+    });
+
+    // The host has not recorded it yet, so the panel still has one selection —
+    // the host's — and this view does not contradict it with a local one.
+    expect(markedRows()).toEqual([rowLabelled(LONE_CALL.name)]);
+
+    // Once the host holds the reported pointer, the mark moves with it.
+    const [call] = spies.onSelectEvent.mock.calls;
+    if (call === undefined) {
+      throw new Error('the selection handler recorded no call');
+    }
+    view.rerender(selectionTree(makeNode(), context, call[0]));
+
+    expect(markedRows()).toEqual([rowLabelled(LATER_CALL.name)]);
+  });
+
+  it('marks its own activation when no host holds a selection, one row at a time', async () => {
+    const stub = resolvingProvider([LONE_CALL, LATER_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(markedRows()).toEqual([]);
+
+    await user.click(rowLabelled(LONE_CALL.name));
+    expect(markedRows()).toEqual([rowLabelled(LONE_CALL.name)]);
+
+    // A second activation moves the mark rather than adding one.
+    await user.click(rowLabelled(LATER_CALL.name));
+    expect(markedRows()).toEqual([rowLabelled(LATER_CALL.name)]);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Counted copy and disclosure names
+ *
+ * Every figure the view prints beside a word agrees with it: one statement
+ * row touched is "1 row", one nested call is "1 nested call", and the footer
+ * names the unit of each of its two figures. A disclosure button names the
+ * count and the call it opens rather than a generic "Expand nested calls",
+ * which a screen reader would otherwise announce identically on every row.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A second server request the browser request was waiting on. */
+const SECOND_SERVER_ROUTE = '/example/other-resource';
+
+describe('Waterfall counted copy', () => {
+  it('agrees a statement row with the rows it touched: one row, and zero rows', async () => {
+    const oneRowStatement = 'SELECT id FROM example_ledger WHERE id = $1';
+    const noRowStatement = 'SELECT id FROM example_archive WHERE id = $1';
+    const single = makeEvent({
+      id: eventIdFor(151),
+      spanId: spanIdFor(151),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.single-row-statement',
+      startTime: BASE_START_MS,
+      duration: 30,
+      attributes: { 'db.statement': oneRowStatement, 'db.rowCount': 1 },
+    });
+    const none = makeEvent({
+      id: eventIdFor(152),
+      spanId: spanIdFor(152),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.no-row-statement',
+      startTime: BASE_START_MS + 40,
+      duration: 20,
+      attributes: { 'db.statement': noRowStatement, 'db.rowCount': 0 },
+    });
+    const stub = resolvingProvider([single, none]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // Exactly one: the singular, on the badge and in the row's name.
+    const singleRow = rowLabelled(oneRowStatement);
+    expect(
+      within(singleRow)
+        .getByText(`${formatCount(1)} row`)
+        .classList.contains('dg-badge'),
+    ).toBe(true);
+    const singleDescription = singleRow.getAttribute('aria-label') ?? '';
+    expect(singleDescription).toContain(`${formatCount(1)} row touched`);
+    expect(singleDescription).not.toContain(`${formatCount(1)} rows`);
+    expect(within(singleRow).queryByText(`${formatCount(1)} rows`)).toBeNull();
+
+    // Zero is a count like any other than one: the plural.
+    const noneRow = rowLabelled(noRowStatement);
+    expect(within(noneRow).getByText(`${formatCount(0)} rows`)).toBeTruthy();
+    expect(noneRow.getAttribute('aria-label') ?? '').toContain(`${formatCount(0)} rows touched`);
+
+    // And the footer counts two calls, in the plural, with no total reported.
+    expect(screen.getByText(`${formatCount(2)} calls`)).toBeTruthy();
+  });
+
+  it('names each disclosure by the count and the call it opens, singular and plural', async () => {
+    const secondServer = makeEvent({
+      id: eventIdFor(153),
+      spanId: spanIdFor(153),
+      parentSpanId: spanIdFor(1),
+      kind: 'http.server',
+      tier: 'server',
+      name: 'example.second-server-request',
+      startTime: BASE_START_MS + 700,
+      duration: 200,
+      attributes: {
+        'http.method': REQUEST_METHOD,
+        'http.route': SECOND_SERVER_ROUTE,
+        'http.status_code': 200,
+      },
+      seq: 4,
+      ingestSeq: 4,
+    });
+    const stub = resolvingProvider([...CHAIN, secondServer]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // Two calls nested inside the browser request: the plural, and the call.
+    const outer = within(rowLabelled(REQUEST_URL)).getByRole('button', {
+      name: `Expand the ${formatCount(2)} nested calls inside ${REQUEST_METHOD} ${REQUEST_URL} (${formatKindLabel('fetch')})`,
+    });
+    expect(outer.getAttribute('aria-expanded')).toBe('false');
+
+    await user.click(outer);
+
+    // The name follows the state it would toggle to.
+    expect(
+      within(rowLabelled(REQUEST_URL))
+        .getByRole('button', {
+          name: `Collapse the ${formatCount(2)} nested calls inside ${REQUEST_METHOD} ${REQUEST_URL} (${formatKindLabel('fetch')})`,
+        })
+        .getAttribute('aria-expanded'),
+    ).toBe('true');
+
+    // One statement nested inside the server request: the singular.
+    const inner = within(rowLabelled(SERVER_ROUTE)).getByRole('button', {
+      name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${SERVER_ROUTE} (${formatKindLabel('http.server')})`,
+    });
+    await user.click(inner);
+    expect(
+      within(rowLabelled(SERVER_ROUTE)).getByRole('button', {
+        name: `Collapse the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${SERVER_ROUTE} (${formatKindLabel('http.server')})`,
+      }),
+    ).toBeTruthy();
+
+    // No control anywhere carries the generic name, and the row with no
+    // children offers no disclosure at all.
+    expect(controlNames()).not.toContain('Expand nested calls');
+    expect(controlNames()).not.toContain('Collapse nested calls');
+    expect(
+      within(rowLabelled(SECOND_SERVER_ROUTE)).queryByRole('button', { name: EXPAND_NAME }),
+    ).toBeNull();
+    expect(spies.onExpand).toHaveBeenCalledTimes(2);
+  });
+
+  it('names a long call in its disclosure by the same preview its row shows', async () => {
+    // Longer than the 120-code-point preview a row label keeps.
+    const longUrl = `http://127.0.0.1:3000/example/${'segment/'.repeat(24)}resource?page=?`;
+    expect(Array.from(longUrl).length).toBeGreaterThan(120);
+    const shownLabel = `${Array.from(longUrl).slice(0, 119).join('')}…`;
+    const request = makeEvent({
+      ...REQUEST_EVENT,
+      attributes: { ...REQUEST_ATTRIBUTES, url: longUrl },
+    });
+    const stub = resolvingProvider([request, SERVER_EVENT]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const row = rowLabelled(shownLabel);
+    expect(
+      within(row).getByRole('button', {
+        name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${shownLabel} (${formatKindLabel('fetch')})`,
+      }),
+    ).toBeTruthy();
+  });
+
+  it('tells apart the disclosures of a browser request and the server request sharing its method and path', async () => {
+    // The ordinary shape of a correlated trace: the browser request and the
+    // server request answering it carry one method and one path, so only the
+    // kind in the disclosure's name can tell the two controls apart.
+    const request = makeEvent({
+      ...REQUEST_EVENT,
+      attributes: { ...REQUEST_ATTRIBUTES, url: SERVER_ROUTE },
+    });
+    const stub = resolvingProvider([request, SERVER_EVENT, QUERY_EVENT]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    await user.click(
+      screen.getByRole('button', {
+        name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${SERVER_ROUTE} (${formatKindLabel('fetch')})`,
+      }),
+    );
+
+    const browserSide = screen.getByRole('button', {
+      name: `Collapse the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${SERVER_ROUTE} (${formatKindLabel('fetch')})`,
+    });
+    const serverSide = screen.getByRole('button', {
+      name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${SERVER_ROUTE} (${formatKindLabel('http.server')})`,
+    });
+    expect(browserSide).not.toBe(serverSide);
+
+    // Every disclosure on screen carries a name of its own.
+    const disclosureNames = controlNames().filter(
+      (name) => EXPAND_NAME.test(name) || COLLAPSE_NAME.test(name),
+    );
+    expect(disclosureNames).toHaveLength(2);
+    expect(new Set(disclosureNames).size).toBe(disclosureNames.length);
+  });
+
+  it('names a grouped request by the calls it groups, and counts the page in request groups', async () => {
+    const group = makeRequestGroup([
+      settledOccurrence(154, 0, 80),
+      settledOccurrence(155, 150, 90),
+    ]);
+    const stub = groupsProvider([group]);
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The group row's children are the occurrences of one request, not calls
+    // it waited on, and its disclosure says so.
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    expect(
+      within(groupRow).getByRole('button', {
+        name: `Expand the ${formatCount(2)} calls grouped under GET ${PENDING_URL} (${formatKindLabel('fetch')})`,
+      }),
+    ).toBeTruthy();
+    expect(
+      within(groupRow)
+        .getByText(`${formatCount(2)} calls`)
+        .classList.contains('dg-badge'),
+    ).toBe(true);
+
+    // The footer's second figure is in the source's own unit, agreeing with
+    // the total it follows: one request group, not "1 request groups".
+    const footer = document.querySelector<HTMLElement>('.dg-waterfall__footer');
+    const counted = within(footer ?? document.body).getByText(/· loaded /);
+    expect(counted.textContent ?? '').toMatch(
+      new RegExp(`· loaded ${formatCount(1)} of ${formatCount(1)} request group$`, 'u'),
+    );
+  });
+
+  it('agrees the sentence for a single loaded record the kind filter removed', async () => {
+    // One record, of a kind this view does not draw, with more to search.
+    const stub = resolvingProvider([RENDER_EVENT], { nextOffset: 1 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const title = await screen.findByText('No network or database calls loaded yet');
+    const state = title.closest<HTMLElement>('.dg-waterfall__empty');
+    expect(state?.textContent ?? '').toContain(
+      `Loaded ${formatCount(1)} captured record so far, and it is not a network or database call.`,
+    );
+    expect(state?.textContent ?? '').not.toContain('captured records so far');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Pages folded as they arrive
+ *
+ * "Load more" folds each page into what is already held instead of rebuilding
+ * the tree from every page loaded so far, so the cases below prove the fold
+ * stays exact where a rebuild trivially would be: a call drawn at the top level
+ * because its parent was not loaded moves under that parent when a LATER page
+ * supplies it — directly, or through an undrawn span between them — and a
+ * persisted re-attachment flag a later page proves stale stops being drawn.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A function span between the server request and the statement, arriving late. */
+const LATE_BRIDGE = makeEvent({
+  id: eventIdFor(131),
+  spanId: spanIdFor(131),
+  parentSpanId: spanIdFor(2),
+  kind: 'function',
+  tier: 'server',
+  name: 'example.late-step',
+  startTime: BASE_START_MS + 12,
+  duration: 700,
+});
+
+/** A statement whose parent is the late bridging span. */
+const BRIDGED_QUERY = makeEvent({
+  id: eventIdFor(132),
+  spanId: spanIdFor(132),
+  parentSpanId: spanIdFor(131),
+  kind: 'db.query',
+  tier: 'db',
+  name: 'example.bridged-statement',
+  startTime: BASE_START_MS + 20,
+  duration: 300,
+});
+
+describe('Waterfall pages folded as they arrive', () => {
+  it('nests calls under the parents a later page supplies, directly and through an undrawn span', async () => {
+    // Page one holds the statement (its server request is not loaded yet), a
+    // second statement whose bridging span is not loaded yet, and an
+    // unrelated call. Page two supplies the browser request and the server
+    // request; page three supplies the bridging span.
+    const stub = pagingProvider([
+      { data: [QUERY_EVENT, BRIDGED_QUERY, LONE_CALL], total: 6, nextOffset: 3 },
+      { data: [REQUEST_EVENT, SERVER_EVENT], total: 6, nextOffset: 5 },
+      { data: [LATE_BRIDGE], total: 6 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // Neither statement's parent is loaded: both are top-level rows, and
+    // neither is flagged, because a parent off the page is not a re-attachment.
+    await screen.findByText(
+      `${formatCount(3)} calls · loaded ${formatCount(3)} of ${formatCount(6)} spans`,
+    );
+    expect(drawnRows()).toHaveLength(3);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('1');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('1');
+    expect(isFlaggedReattached(rowLabelled(SQL_STATEMENT))).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(5)} calls · loaded ${formatCount(5)} of ${formatCount(6)} spans`,
+    );
+
+    // The statement moved under the server request, under the browser request:
+    // the top level is now the request, the second statement and the lone call.
+    expect(drawnRows().map((row) => row.getAttribute('aria-level'))).toEqual(['1', '1', '1']);
+    expect(screen.queryByText(SQL_STATEMENT)).toBeNull();
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(within(rowLabelled(SERVER_ROUTE)).getByRole('button', { name: EXPAND_NAME }));
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-level')).toBe('2');
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('3');
+    // The second statement still waits for its bridging span.
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('1');
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(5)} calls · loaded ${formatCount(6)} of ${formatCount(6)} spans`,
+    );
+
+    // The undrawn span arrived and was collapsed through: the second statement
+    // now sits directly under the server request, beside the first one, in
+    // start order — and the rows expanded before the page arrived still are.
+    expect(screen.queryByText(LATE_BRIDGE.name)).toBeNull();
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('3');
+    const levels = drawnRows().map((row) => row.getAttribute('aria-level'));
+    expect(levels).toEqual(['1', '2', '3', '3', '1']);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-posinset')).toBe('1');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-posinset')).toBe('2');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-setsize')).toBe('2');
+    expect(descriptionAt(0)).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('stops drawing a persisted re-attachment flag once a later page supplies the parent', async () => {
+    const flagged = makeEvent({
+      id: eventIdFor(141),
+      spanId: spanIdFor(141),
+      parentSpanId: spanIdFor(140),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.late-flag',
+      startTime: BASE_START_MS + 5,
+      duration: 40,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(140) },
+    });
+    // The parent it names, undrawn, on the next page.
+    const parent = makeEvent({
+      id: eventIdFor(140),
+      spanId: spanIdFor(140),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.late-flag-parent',
+      startTime: BASE_START_MS,
+      duration: 90,
+    });
+    const stub = pagingProvider([
+      { data: [flagged], total: 2, nextOffset: 1 },
+      { data: [parent], total: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(isFlaggedReattached(rowLabelled(flagged.name))).toBe(true);
+    expect(rowLabelled(flagged.name).getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent ${spanIdFor(140)} of this call never arrived`,
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(1)} call · loaded ${formatCount(2)} of ${formatCount(2)} spans`,
+    );
+
+    // The parent arrived: the flag is proven stale, and the call is drawn as
+    // an ordinary top-level row (its parent is a kind this view does not draw).
+    expect(isFlaggedReattached(rowLabelled(flagged.name))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The held-record budget
+ *
+ * The view holds at most twice the largest page a query may ask for, and
+ * releases the oldest pages past that. The cases page through pages of that
+ * largest size — mostly records of a kind this view does not draw, so the
+ * budget is exercised without mounting thousands of rows — and hold the view
+ * to three things: what it holds never exceeds the budget, the footer states
+ * which positions are held and how many were released before them, and a
+ * released call is stated as released, never as not captured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The page size of the budget cases: the largest a query may ask for. */
+const LARGEST_PAGE = DATA_QUERY_MAX_LIMIT;
+
+/** The held-record budget the component documents: two of the largest pages. */
+const HELD_BUDGET = 2 * DATA_QUERY_MAX_LIMIT;
+
+/** The first ordinal of the bulk span ids, clear of every `spanIdFor` ordinal. */
+const BULK_ORDINAL_BASE = 0x10000;
+
+/** A 16-hex span id for bulk fixtures. */
+function bulkSpanId(ordinal: number): string {
+  return (BULK_ORDINAL_BASE + ordinal).toString(16).padStart(16, '0');
+}
+
+/**
+ * `count` records of a kind this view does not draw, numbered from `first` so
+ * every page's records are distinct.
+ *
+ * @param first The first ordinal.
+ * @param count How many records.
+ * @returns The records, in start order.
+ */
+function undrawnRecords(first: number, count: number): TelemetryEvent[] {
+  return Array.from({ length: count }, (_, at) =>
+    makeEvent({
+      id: `event-bulk-${String(first + at)}`,
+      spanId: bulkSpanId(first + at),
+      kind: 'render',
+      tier: 'browser',
+      name: 'example.bulk-render',
+      startTime: BASE_START_MS + 1000 + at,
+      duration: 1,
+    }),
+  );
+}
+
+/** A browser call of its own, for a budget case to find again by name. */
+function budgetCall(ordinal: number, startOffsetMs: number): TelemetryEvent {
+  return makeEvent({
+    id: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    kind: 'fetch',
+    tier: 'browser',
+    name: `example.budget-call-${String(ordinal)}`,
+    startTime: BASE_START_MS + startOffsetMs,
+    duration: 25,
+  });
+}
+
+/**
+ * The footer's statement about released pages, spelled as the component's
+ * contract states it, from the figures a case expects.
+ */
+function retentionSentence(first: number, last: number, total: number, released: number): string {
+  return `Holding ${formatCount(last - first + 1)} spans (positions ${formatCount(first)}–${formatCount(last)} of ${formatCount(total)}); the ${formatCount(released)} spans loaded before them were released to keep this view within ${formatCount(HELD_BUDGET)} spans. A call whose parent was released is drawn at the top level.`;
+}
+
+describe('Waterfall held-record budget', () => {
+  it('releases the oldest pages past the budget, says what it holds, and re-places what the release lifted', async () => {
+    const first = budgetCall(151, 0);
+    // A statement on page two whose parent is the call on page one, carrying a
+    // flag an earlier correlation pass wrote: stale while that parent is held.
+    const child = makeEvent({
+      id: eventIdFor(152),
+      spanId: spanIdFor(152),
+      parentSpanId: first.spanId,
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.budget-child',
+      startTime: BASE_START_MS + 10,
+      duration: 12,
+      attributes: { orphaned: true, orphanedParentSpanId: first.spanId },
+    });
+    const second = budgetCall(153, 20);
+    const third = budgetCall(154, 30);
+    const fourth = budgetCall(155, 40);
+    const total = 4 * LARGEST_PAGE;
+    const stub = pagingProvider([
+      {
+        data: [first, ...undrawnRecords(0, LARGEST_PAGE - 1)],
+        total,
+        nextOffset: LARGEST_PAGE,
+      },
+      {
+        data: [child, second, ...undrawnRecords(LARGEST_PAGE, LARGEST_PAGE - 2)],
+        total,
+        nextOffset: 2 * LARGEST_PAGE,
+      },
+      {
+        data: [third, ...undrawnRecords(2 * LARGEST_PAGE, LARGEST_PAGE - 1)],
+        total,
+        nextOffset: 3 * LARGEST_PAGE,
+      },
+      { data: [fourth, ...undrawnRecords(3 * LARGEST_PAGE, LARGEST_PAGE - 1)], total },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Two pages: exactly the budget, so nothing is released and nothing is
+    // said about releasing. The statement nests under the call on page one,
+    // and its stale flag is not drawn.
+    await screen.findByText(
+      `${formatCount(3)} calls · loaded ${formatCount(HELD_BUDGET)} of ${formatCount(total)} spans`,
+    );
+    expect(screen.queryByText(/released to keep this view within/)).toBeNull();
+    await user.click(within(rowLabelled(first.name)).getByRole('button', { name: EXPAND_NAME }));
+    expect(rowLabelled(child.name).getAttribute('aria-level')).toBe('2');
+    expect(isFlaggedReattached(rowLabelled(child.name))).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Three pages exceed the budget: the oldest is released. The footer still
+    // counts every record loaded, and says which positions are held and how
+    // many were loaded before them.
+    await screen.findByText(
+      retentionSentence(LARGEST_PAGE + 1, 3 * LARGEST_PAGE, total, LARGEST_PAGE),
+    );
+    expect(
+      screen.getByText(
+        `${formatCount(3)} calls · loaded ${formatCount(3 * LARGEST_PAGE)} of ${formatCount(total)} spans`,
+      ),
+    ).toBeTruthy();
+    // The released call is gone; the statement it held moved to the top level,
+    // and its flag — honoured again, since its parent is no longer held — is
+    // stated without claiming the parent never arrived.
+    expect(screen.queryByText(first.name)).toBeNull();
+    const lifted = rowLabelled(child.name);
+    expect(lifted.getAttribute('aria-level')).toBe('1');
+    expect(isFlaggedReattached(lifted)).toBe(true);
+    const liftedDescription = lifted.getAttribute('aria-label') ?? '';
+    expect(liftedDescription).toContain(
+      `${REATTACHED_PHRASE}: the parent ${first.spanId} of this call is not among the records held here, and may have been released`,
+    );
+    expect(liftedDescription).not.toContain('never arrived');
+    // Offsets are measured from the first call still held.
+    expect(liftedDescription).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // A fourth page releases the second: still no more than the budget held.
+    await screen.findByText(retentionSentence(2 * LARGEST_PAGE + 1, total, total, HELD_BUDGET));
+    expect(
+      screen.getByText(
+        `${formatCount(2)} calls · loaded ${formatCount(total)} of ${formatCount(total)} spans`,
+      ),
+    ).toBeTruthy();
+    expect(drawnRows().map((row) => row.getAttribute('aria-label') ?? '')).toEqual([
+      expect.stringContaining(third.name),
+      expect.stringContaining(fourth.name),
+    ]);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('states released calls as released, not as missing, when the pages it holds draw none', async () => {
+    const call = budgetCall(161, 0);
+    const total = 3 * LARGEST_PAGE;
+    const stub = pagingProvider([
+      { data: [call, ...undrawnRecords(0, LARGEST_PAGE - 1)], total, nextOffset: LARGEST_PAGE },
+      { data: undrawnRecords(LARGEST_PAGE, LARGEST_PAGE), total, nextOffset: 2 * LARGEST_PAGE },
+      { data: undrawnRecords(2 * LARGEST_PAGE, LARGEST_PAGE), total },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(1)} call · loaded ${formatCount(HELD_BUDGET)} of ${formatCount(total)} spans`,
+    );
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The only call was on the released page. The held pages draw nothing,
+    // and that is said as what it is: calls were loaded and released.
+    await screen.findByText('No calls held');
+    expect(
+      screen.getByText(
+        `The ${formatCount(HELD_BUDGET)} spans held (positions ${formatCount(LARGEST_PAGE + 1)}–${formatCount(total)} of ${formatCount(total)}) include no network or database call. The ${formatCount(LARGEST_PAGE)} spans loaded before them included calls, and were released to keep this view within ${formatCount(HELD_BUDGET)} spans.`,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(screen.queryByText(/none of them is a network or database call/)).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The mounted row window
+ *
+ * However many rows are expanded, the tree mounts at most the component's row
+ * budget at once and moves a window over the rest: Previous and Next rows,
+ * and the keyboard stepping past either edge. The footer states which rows are
+ * shown of how many, expansion survives every move, and the tree keeps exactly
+ * one row in the Tab order.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The row budget the component documents. */
+const ROW_BUDGET = 200;
+
+/** The accessible names of the window controls. */
+const PREVIOUS_ROWS_NAME = 'Previous rows';
+const NEXT_ROWS_NAME = 'Next rows';
+
+/** A server request with `count` statements nested under it, in start order. */
+function serverWithStatements(
+  ordinal: number,
+  count: number,
+  startOffsetMs: number,
+): { readonly parent: TelemetryEvent; readonly statements: readonly TelemetryEvent[] } {
+  const parent = makeEvent({
+    id: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    kind: 'http.server',
+    tier: 'server',
+    name: `example.window-server-${String(ordinal)}`,
+    startTime: BASE_START_MS + startOffsetMs,
+    duration: 5000,
+  });
+  const statements = Array.from({ length: count }, (_, at) =>
+    makeEvent({
+      id: `event-window-${String(ordinal)}-${String(at)}`,
+      spanId: bulkSpanId(ordinal * 1000 + at),
+      parentSpanId: parent.spanId,
+      kind: 'db.query',
+      tier: 'db',
+      name: `example.window-statement-${String(ordinal)}-${String(at)}`,
+      startTime: BASE_START_MS + startOffsetMs + 1 + at,
+      duration: 2,
+    }),
+  );
+  return { parent, statements };
+}
+
+/** The footer's statement of the mounted rows. */
+function rowWindowText(first: number, last: number, total: number): string {
+  return `Rows ${formatCount(first)}–${formatCount(last)} of ${formatCount(total)}`;
+}
+
+describe('Waterfall row window', () => {
+  it('mounts at most the row budget however many rows are expanded, and moves the window with Previous and Next', async () => {
+    const { parent, statements } = serverWithStatements(171, 450, 0);
+    const stub = resolvingProvider([parent, ...statements]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // One row: nothing to page, so no window controls.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: NEXT_ROWS_NAME })).toBeNull();
+
+    await user.click(within(rowLabelled(parent.name)).getByRole('button', { name: EXPAND_NAME }));
+
+    // 451 visible rows; the window mounts the budget and says so.
+    const visibleCount = statements.length + 1;
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    const previous = screen.getByRole('button', { name: PREVIOUS_ROWS_NAME });
+    expect(previous.hasAttribute('disabled')).toBe(true);
+    // Every nested row states its place among all its siblings, mounted or not.
+    const lastMounted = drawnRows()[ROW_BUDGET - 1];
+    expect(lastMounted?.getAttribute('aria-posinset')).toBe(String(ROW_BUDGET - 1));
+    expect(lastMounted?.getAttribute('aria-setsize')).toBe(String(statements.length));
+    // The mounted children sit in the group their parent owns.
+    const group = lastMounted?.parentElement;
+    expect(group?.getAttribute('role')).toBe('group');
+    expect(rowLabelled(parent.name).getAttribute('aria-owns')).toBe(group?.getAttribute('id'));
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The next window: its parent is not mounted, and its rows keep their
+    // level and their place, in the same indented group.
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+    expect(screen.queryByText(parent.name)).toBeNull();
+    const firstOfSecond = drawnRows()[0];
+    expect(firstOfSecond).toBe(rowLabelled(statements[ROW_BUDGET - 1]?.name ?? ''));
+    expect(firstOfSecond?.getAttribute('aria-level')).toBe('2');
+    expect(firstOfSecond?.getAttribute('aria-posinset')).toBe(String(ROW_BUDGET));
+    expect(firstOfSecond?.parentElement?.classList.contains('dg-waterfall__children')).toBe(true);
+    // Exactly one row is in the Tab order, and it is a mounted one.
+    expect(soleTabStop()).toBe(firstOfSecond);
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The last window holds the remainder, and there is no window after it.
+    expect(drawnRows()).toHaveLength(visibleCount - 2 * ROW_BUDGET);
+    expect(
+      screen.getByText(rowWindowText(2 * ROW_BUDGET + 1, visibleCount, visibleCount)),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: NEXT_ROWS_NAME }).hasAttribute('disabled')).toBe(
+      true,
+    );
+
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+
+    // Back at the start, the parent is mounted and still expanded.
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(rowLabelled(parent.name).getAttribute('aria-expanded')).toBe('true');
+    expect(soleTabStop()).toBe(rowLabelled(parent.name));
+  });
+
+  it('keeps every expanded row expanded, by record id, as the window moves', async () => {
+    const one = serverWithStatements(181, 250, 0);
+    const two = serverWithStatements(182, 150, 1000);
+    const three = serverWithStatements(183, 150, 2000);
+    const stub = resolvingProvider([
+      one.parent,
+      ...one.statements,
+      two.parent,
+      ...two.statements,
+      three.parent,
+      ...three.statements,
+    ]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    await user.click(
+      within(rowLabelled(three.parent.name)).getByRole('button', { name: EXPAND_NAME }),
+    );
+    await user.click(
+      within(rowLabelled(one.parent.name)).getByRole('button', { name: EXPAND_NAME }),
+    );
+
+    // 3 parents and 400 statements are visible. The first window holds the
+    // first parent and 199 of its statements; the other two parents follow
+    // its remaining 51 statements, in the second window.
+    const visibleCount = 3 + 250 + 150;
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(screen.queryByText(three.parent.name)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The third parent is mounted again, still expanded, its statements
+    // beneath it; the second one is still collapsed.
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+    expect(rowLabelled(three.parent.name).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(three.statements[0]?.name ?? '').getAttribute('aria-level')).toBe('2');
+    expect(rowLabelled(two.parent.name).getAttribute('aria-expanded')).toBe('false');
+
+    // Collapsing it here shortens the list; the window stays where it is and
+    // now reaches the end, so there is nothing after it.
+    await user.click(
+      within(rowLabelled(three.parent.name)).getByRole('button', { name: COLLAPSE_NAME }),
+    );
+    const collapsedCount = 3 + 250;
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, three.parent.id, false);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, collapsedCount, collapsedCount)),
+    ).toBeTruthy();
+    expect(drawnRows()).toHaveLength(collapsedCount - ROW_BUDGET);
+    expect(screen.getByRole('button', { name: NEXT_ROWS_NAME }).hasAttribute('disabled')).toBe(
+      true,
+    );
+
+    // Back to the first window: the first parent is still expanded.
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, collapsedCount))).toBeTruthy();
+    expect(rowLabelled(one.parent.name).getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('pages the window when the keyboard steps past either edge, and keeps one tab stop', async () => {
+    const { parent, statements } = serverWithStatements(191, 450, 0);
+    const stub = resolvingProvider([parent, ...statements]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(within(rowLabelled(parent.name)).getByRole('button', { name: EXPAND_NAME }));
+    const visibleCount = statements.length + 1;
+
+    // The last mounted row, then one step down: the window pages to the rows
+    // after it and the next row takes focus and the stop.
+    const lastOfFirst = statements[ROW_BUDGET - 2];
+    rowLabelled(lastOfFirst?.name ?? '').focus();
+    await user.keyboard('{ArrowDown}');
+    const firstOfSecond = rowLabelled(statements[ROW_BUDGET - 1]?.name ?? '');
+    expect(document.activeElement).toBe(firstOfSecond);
+    expect(soleTabStop()).toBe(firstOfSecond);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+
+    // And one step up pages back.
+    await user.keyboard('{ArrowUp}');
+    expect(document.activeElement).toBe(rowLabelled(lastOfFirst?.name ?? ''));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+
+    // End reaches the last visible row, in the last window.
+    await user.keyboard('{End}');
+    const lastRow = rowLabelled(statements[statements.length - 1]?.name ?? '');
+    expect(document.activeElement).toBe(lastRow);
+    expect(soleTabStop()).toBe(lastRow);
+    expect(
+      screen.getByText(rowWindowText(2 * ROW_BUDGET + 1, visibleCount, visibleCount)),
+    ).toBeTruthy();
+
+    // ArrowLeft from a nested row whose parent is windows away steps out to
+    // that parent, paging back to it.
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(rowLabelled(parent.name));
+    expect(soleTabStop()).toBe(rowLabelled(parent.name));
+
+    // End then Home: the first row, in the first window.
+    await user.keyboard('{End}');
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowLabelled(parent.name));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The time axis, from the data alone
+ *
+ * Tick positions are percentages of the track, and how many tick labels the
+ * axis carries is fitted once, from the scale, to a fixed logical design strip
+ * — so the drawn tick set is a pure function of the window, and these cases
+ * assert it exactly under happy-dom's layout-free DOM with nothing stubbed. The
+ * fit is also read back independently: the drawn labels, laid out on the
+ * strip the component documents at the estimate `../utils/format` documents,
+ * clear each other, and the denser set the scale offers first does not.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The design strip the component fits its tick labels to, in ems: 14. */
+const AXIS_DESIGN_WIDTH_EM = 14;
+
+/** The clear space the component keeps between two tick labels, in ems: 1. */
+const AXIS_LABEL_GAP_EM = 1;
+
+/**
+ * The advance `estimateTextWidth` documents for one narrow grapheme, in ems —
+ * every character a compact duration label is made of.
+ */
+const NARROW_ADVANCE_EM = 0.6;
+
+/** One drawn tick label: its text, its position and its anchor. */
+interface DrawnTickLabel {
+  readonly label: string;
+  /** The label's `x`, as a percentage of the strip. */
+  readonly percent: number;
+  readonly anchor: string;
+}
+
+/**
+ * The axis graphic: the one image named as the time axis. Every row's timing
+ * bar is an image too, named by where it sits in the window, so the axis is
+ * found by its name rather than by being the only image.
+ */
+function axisGraphic(): SVGSVGElement {
+  const graphic = screen.getByRole('img', { name: /^Time axis spanning / });
+  if (!(graphic instanceof SVGSVGElement)) {
+    throw new Error('the time axis is not an svg element');
+  }
+  return graphic;
+}
+
+/** The tick labels the axis drew, left to right. */
+function drawnTickLabels(): DrawnTickLabel[] {
+  return Array.from(axisGraphic().querySelectorAll('text')).map((text) => ({
+    label: text.textContent ?? '',
+    percent: Number.parseFloat(text.getAttribute('x') ?? ''),
+    anchor: text.getAttribute('text-anchor') ?? '',
+  }));
+}
+
+/** A percentage as the component writes it: rounded to three decimals. */
+function percentOf(ms: number, windowMs: number): number {
+  return Number(((ms / windowMs) * 100).toFixed(3));
+}
+
+/**
+ * Lays labels out on the design strip by the rule the component documents —
+ * centred under the tick unless that crosses an edge, then anchored to the
+ * tick — and says whether they fit inside it, each one gap clear of the last.
+ *
+ * @param labels The labels and their positions, ascending.
+ * @returns The anchors, or `undefined` when the labels do not fit.
+ */
+function layOutOnDesignStrip(
+  labels: readonly { readonly label: string; readonly percent: number }[],
+): readonly string[] | undefined {
+  const anchors: string[] = [];
+  let previousEnd = Number.NEGATIVE_INFINITY;
+  for (const { label, percent } of labels) {
+    const extent = Array.from(label).length * NARROW_ADVANCE_EM;
+    const x = (percent / 100) * AXIS_DESIGN_WIDTH_EM;
+    let anchor = 'middle';
+    let start = x - extent / 2;
+    if (start < 0) {
+      anchor = 'start';
+      start = x;
+    } else if (start + extent > AXIS_DESIGN_WIDTH_EM) {
+      anchor = 'end';
+      start = x - extent;
+    }
+    if (
+      start < 0 ||
+      start + extent > AXIS_DESIGN_WIDTH_EM ||
+      start - previousEnd < AXIS_LABEL_GAP_EM
+    ) {
+      return undefined;
+    }
+    anchors.push(anchor);
+    previousEnd = start + extent;
+  }
+  return anchors;
+}
+
+/**
+ * Two calls spanning exactly `windowMs`: one at the window's start, one ending
+ * at its end, so the axis draws that window and nothing wider.
+ */
+function callsSpanning(windowMs: number): readonly TelemetryEvent[] {
+  return [
+    makeEvent({
+      id: eventIdFor(201),
+      spanId: spanIdFor(201),
+      name: 'example.axis-first-call',
+      startTime: BASE_START_MS,
+      duration: windowMs / 4,
+    }),
+    makeEvent({
+      id: eventIdFor(202),
+      spanId: spanIdFor(202),
+      name: 'example.axis-second-call',
+      startTime: BASE_START_MS + windowMs / 2,
+      duration: windowMs / 2,
+      seq: 1,
+      ingestSeq: 2,
+    }),
+  ];
+}
+
+/** A window, the tick values the axis labels over it, and their anchors. */
+interface AxisExpectation {
+  readonly windowMs: number;
+  readonly tickMs: readonly number[];
+  readonly anchors: readonly string[];
+  /** The tick values of the densest set the scale offers, which do not fit. */
+  readonly densestMs: readonly number[];
+}
+
+const AXIS_EXPECTATIONS: readonly AxisExpectation[] = [
+  // A 50 ms step labels "0 ms" and "50 ms" into each other on the strip.
+  {
+    windowMs: 180,
+    tickMs: [0, 100],
+    anchors: ['start', 'middle'],
+    densestMs: [0, 50, 100, 150],
+  },
+  // Seconds: "1.0 s" labels every fifth of the window, too close together.
+  {
+    windowMs: 5000,
+    tickMs: [0, 2000, 4000],
+    anchors: ['start', 'middle', 'middle'],
+    densestMs: [0, 1000, 2000, 3000, 4000, 5000],
+  },
+  // A step of a millisecond fits, the last label ending at its tick.
+  {
+    windowMs: 3,
+    tickMs: [0, 1, 2, 3],
+    anchors: ['start', 'middle', 'middle', 'end'],
+    densestMs: [0, 0.5, 1, 1.5, 2, 2.5, 3],
+  },
+];
+
+describe('Waterfall time axis', () => {
+  it.each(AXIS_EXPECTATIONS)(
+    'labels a $windowMs ms window with the densest tick set that clears the design strip',
+    async ({ windowMs, tickMs, anchors, densestMs }) => {
+      renderComponent(makeNode(), {
+        provider: resolvingProvider(callsSpanning(windowMs)).provider,
+        actions: makeActions().actions,
+      });
+      await screen.findByRole('tree', { name: TREE_NAME });
+
+      const drawn = drawnTickLabels();
+      // Exactly the ticks the scale alone determines: labels, positions — the
+      // scale's percentages — and anchors.
+      expect(drawn).toEqual(
+        tickMs.map((ms, at) => ({
+          label: formatDurationCompact(ms),
+          percent: percentOf(ms, windowMs),
+          anchor: anchors[at],
+        })),
+      );
+      // The window's start is always labelled, from its own edge.
+      expect(drawn[0]).toEqual({ label: formatDurationCompact(0), percent: 0, anchor: 'start' });
+      // Read back independently: the drawn labels clear each other on the
+      // strip, with the anchors drawn, and no two of them say the same thing.
+      expect(layOutOnDesignStrip(drawn)).toEqual(drawn.map(({ anchor }) => anchor));
+      expect(new Set(drawn.map(({ label }) => label)).size).toBe(drawn.length);
+      // And the densest set the scale offers first would not have.
+      expect(
+        layOutOnDesignStrip(
+          densestMs.map((ms) => ({
+            label: formatDurationCompact(ms),
+            percent: percentOf(ms, windowMs),
+          })),
+        ),
+      ).toBeUndefined();
+    },
+  );
+
+  it('keeps two ticks from sharing a label when the step is finer than the label precision', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(callsSpanning(3)).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The densest half-millisecond step would print "2 ms" at both 1.5 ms and
+    // 2 ms; the drawn set labels every tick distinctly.
+    expect(formatDurationCompact(1.5)).toBe(formatDurationCompact(2));
+    const labels = drawnTickLabels().map(({ label }) => label);
+    expect(labels).toEqual([0, 1, 2, 3].map((ms) => formatDurationCompact(ms)));
+  });
+
+  it('draws the same ticks from the same data on every mount, sized only by its container', async () => {
+    const first = renderComponent(makeNode(), {
+      provider: resolvingProvider(callsSpanning(180)).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const before = drawnTickLabels();
+    // The graphic takes its width from the strip it sits in, relationally, and
+    // declares no coordinate system of its own for the ticks to be scaled by.
+    expect(axisGraphic().getAttribute('width')).toBe('100%');
+    expect(axisGraphic().hasAttribute('viewBox')).toBe(false);
+    first.unmount();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(callsSpanning(180)).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    expect(drawnTickLabels()).toEqual(before);
+    expect(axisGraphic().getAttribute('aria-label')).toBe(
+      `Time axis spanning ${formatDurationCompact(180)} from the first call`,
+    );
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The axis floor and the scroll viewport
+ *
+ * The tick set is fitted to a design strip, so it is legible only on a strip
+ * at least that wide. The stylesheet guarantees it: the chart's one grid — the
+ * scroll viewport's — floors the time track at a token-derived minimum, and a
+ * panel narrower than the grid's minimum scrolls the axis and the rows
+ * together in that viewport instead of squeezing the track. The same grid is
+ * what keeps every row's track in register with the axis: the axis row, the
+ * tree, every child group and every row adopt its tracks as subgrids, so no
+ * row sizes a duration column of its own and no indent narrows a track.
+ * happy-dom applies no stylesheet, so these cases hold that guarantee as
+ * contracts rather than as measurements: the tracks and floors as the
+ * stylesheet declares them, resolved through the token table in every theme,
+ * and the elements the rendered viewport holds.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The class of the scroll viewport the axis and the rows share. */
+const VIEWPORT_CLASS = 'dg-waterfall__viewport';
+
+/**
+ * A track whose minimum and share are both tokens:
+ * `minmax(var(<floor token>), var(<share token>))`.
+ */
+const TOKEN_TRACK = /^minmax\(var\((--dg-[a-z0-9-]+)\), var\((--dg-[a-z0-9-]+)\)\)$/u;
+
+/**
+ * A track floored by its items' own declared minimums, whose share is a token:
+ * `minmax(auto, var(<share token>))`.
+ */
+const ITEM_FLOORED_TOKEN_TRACK = /^minmax\(auto, var\((--dg-[a-z0-9-]+)\)\)$/u;
+
+/** A reference to one token, `var(<token>)`, capturing its name. */
+const TOKEN_REFERENCE = /^var\((--dg-[a-z0-9-]+)\)$/u;
+
+/** A token value written as a whole number of characters, e.g. `8ch`. */
+const CH_VALUE = /^(\d+)ch$/u;
+
+/** The containers that must adopt the chart grid's tracks, besides the rows. */
+const SUBGRID_CONTAINERS = [
+  '.dg-waterfall__row',
+  '.dg-waterfall__rows',
+  '.dg-waterfall__children',
+  '.dg-waterfall__child-rows',
+] as const;
+
+/** The form an extent token's value takes: a multiple of a space token, `calc(<token> * n)`. */
+const SPACE_MULTIPLE = /^calc\(var\((--dg-[a-z0-9-]+)\) \* (\d+)\)$/u;
+
+/** A token value written as a whole number of pixels, e.g. `24px`. */
+const PIXEL_VALUE = /^(\d+(?:\.\d+)?)px$/u;
+
+/** The size of a `font` shorthand token, e.g. the `11px` of `400 11px/16px …`. */
+const FONT_SHORTHAND_SIZE = /(?:^|\s)(\d+(?:\.\d+)?)px\//u;
+
+/**
+ * The declaration bodies of every rule in {@link COMPONENT_STYLESHEET} whose
+ * selector list names `selector` exactly — the grouped shared rules as well as
+ * the component's own.
+ *
+ * The stylesheet has no at-rule blocks (its header states it), so each rule is
+ * one `selectors { declarations }` pair at the top level.
+ *
+ * @param selector One selector, exactly as written in a selector list.
+ * @returns The bodies, in source order.
+ */
+function rulesSelecting(selector: string): string[] {
+  const uncommented = COMPONENT_STYLESHEET.replace(/\/\*[\s\S]*?\*\//gu, '');
+  return Array.from(uncommented.matchAll(/([^{}]+)\{([^{}]*)\}/gu))
+    .filter(([, selectors = '']) =>
+      selectors.split(',').some((listed) => listed.trim() === selector),
+    )
+    .map(([, , body = '']) => body);
+}
+
+/**
+ * The viewport's own rule — the chart grid every row adopts — as opposed to
+ * the shared scroll-container rule that also selects it.
+ *
+ * @returns The rule body that declares the viewport's `display`.
+ */
+function chartGridRule(): string {
+  const own = rulesSelecting(`.${VIEWPORT_CLASS}`).filter((body) =>
+    /(?:^|;)\s*display:\s*grid;/u.test(body),
+  );
+  expect(own).toHaveLength(1);
+  return own[0] ?? '';
+}
+
+/**
+ * The value of one declaration in a rule body, failing when it is absent.
+ *
+ * @param body The text between a rule's braces.
+ * @param property The property name.
+ * @returns The declared value, trimmed.
+ */
+function declaredValue(body: string, property: string): string {
+  const match = new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`, 'u').exec(body);
+  if (match?.[1] === undefined) {
+    throw new Error(`the rule declares no ${property}`);
+  }
+  return match[1].trim();
+}
+
+/** A bracketed set of grid line names in a template, e.g. `[full-start]`. */
+const LINE_NAMES = /\[[^\]]*\]/gu;
+
+/**
+ * The top-level tracks of a `grid-template-columns` value: split on the spaces
+ * outside any function, so `minmax(0, var(--dg-waterfall-label-share))` stays
+ * one track. Line names (`[full-start]`) name the lines between tracks and are
+ * not tracks, so they are dropped first.
+ *
+ * @param template The declared template.
+ * @returns The tracks, in order.
+ */
+function topLevelTracks(template: string): string[] {
+  const tracks: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const char of template.replace(LINE_NAMES, ' ')) {
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+    }
+    if (char === ' ' && depth === 0) {
+      if (current !== '') {
+        tracks.push(current);
+      }
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  if (current !== '') {
+    tracks.push(current);
+  }
+  return tracks;
+}
+
+/**
+ * The token a custom property name is generated from, failing on a name the
+ * token table does not declare.
+ *
+ * @param name A `--dg-*` custom property name.
+ * @returns The token key.
+ */
+function tokenKeyOf(name: string): TokenKey {
+  const key = (Object.keys(DESIGN_TOKENS.dark) as TokenKey[]).find(
+    (candidate) => cssVarName(candidate) === name,
+  );
+  if (key === undefined) {
+    throw new Error(`${name} is not a token in the token table`);
+  }
+  return key;
+}
+
+/**
+ * The number of pixels a pattern captures from a token value, failing when
+ * the value is not written that way.
+ *
+ * @param value The token value.
+ * @param pattern A pattern whose first group is the pixel figure.
+ * @returns The figure.
+ */
+function pixelsIn(value: string, pattern: RegExp): number {
+  const figure = pattern.exec(value)?.[1];
+  if (figure === undefined) {
+    throw new Error(`"${value}" states no pixel figure`);
+  }
+  return Number(figure);
+}
+
+describe('Waterfall axis floor and scroll viewport', () => {
+  it('scrolls the axis and every row in one viewport, and keeps the footer outside it', async () => {
+    const user = userEvent.setup();
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]).provider,
+      actions: makeActions().actions,
+    });
+    const tree = await screen.findByRole('tree', { name: TREE_NAME });
+    // A nested level on screen too, so the child group a row owns is covered.
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+
+    const viewports = document.querySelectorAll<HTMLElement>(`.${VIEWPORT_CLASS}`);
+    expect(viewports).toHaveLength(1);
+    const [viewport] = viewports;
+    if (viewport === undefined) {
+      throw new Error('the waterfall rendered no scroll viewport');
+    }
+
+    // Exactly two items, the axis row then the tree: the stylesheet's one grid
+    // column holds both at one inline size, so scrolling cannot move the strip
+    // against the tracks beneath it.
+    const axisRow = axisGraphic().closest<HTMLElement>('.dg-waterfall__axis');
+    expect(axisRow?.classList.contains('dg-waterfall__row')).toBe(true);
+    expect(Array.from(viewport.children)).toEqual([axisRow, tree]);
+
+    // Every drawn row — top-level and nested — scrolls with the axis.
+    const topLevel = drawnRows().filter((row) => row.getAttribute('aria-level') === '1');
+    expect(topLevel).toHaveLength(3);
+    expect(drawnRows()).toHaveLength(4);
+    for (const row of drawnRows()) {
+      expect(row.closest(`.${VIEWPORT_CLASS}`)).toBe(viewport);
+    }
+
+    // The footer — the counts and the paging controls — stays in reach below.
+    const footer = document.querySelector<HTMLElement>('.dg-waterfall__footer');
+    expect(footer).not.toBeNull();
+    expect(footer?.closest(`.${VIEWPORT_CLASS}`)).toBeNull();
+    expect(viewport.nextElementSibling).toBe(footer);
+
+    // The viewport is a plain scroll container: no role of its own and no tab
+    // stop, so the tree stays one composite widget with one stop in the Tab
+    // order.
+    expect(viewport.hasAttribute('role')).toBe(false);
+    expect(viewport.hasAttribute('tabindex')).toBe(false);
+    expect(soleTabStop().closest(`.${VIEWPORT_CLASS}`)).toBe(viewport);
+  });
+
+  it('floors the time track at the design strip in every theme, from a space token', () => {
+    // The chart's tracks are declared once, by the viewport's own rule (the
+    // other rule selecting it is the shared scroll-container helper).
+    const own = chartGridRule();
+    // The template may be laid out over several lines; a track boundary is
+    // any run of whitespace outside a function, and the two line names that
+    // bracket the tracks for `grid-column: full` are not tracks.
+    const tracks = topLevelTracks(
+      declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' '),
+    ).filter((track) => !/^\[[a-z-]+\]$/u.test(track));
+
+    // Label, time and duration. The label track is floored by what its rows
+    // declare (`auto`), the time track by a token, and the duration track is
+    // as wide as the widest figure in the chart.
+    expect(tracks).toHaveLength(3);
+    // The first and last lines are named, which is what a row — and a row's
+    // full-value detail — spans (`grid-column: full`).
+    const template = declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' ');
+    expect(template.startsWith('[full-start] ')).toBe(true);
+    expect(template.endsWith(' [full-end]')).toBe(true);
+    expect(template.match(LINE_NAMES)).toEqual(['[full-start]', '[full-end]']);
+    const label = ITEM_FLOORED_TOKEN_TRACK.exec(tracks[0] ?? '');
+    const [, labelShareName = ''] = label ?? [];
+    expect(label, 'the label track is floored by its rows').not.toBeNull();
+    expect(tracks[2]).toBe('max-content');
+    const time = TOKEN_TRACK.exec(tracks[1] ?? '');
+    const [, floorName = '', barShareName = ''] = time ?? [];
+    expect(time, 'the time track is floored by a token').not.toBeNull();
+    const floorKey = tokenKeyOf(floorName);
+    const labelShareKey = tokenKeyOf(labelShareName);
+    const barShareKey = tokenKeyOf(barShareName);
+
+    const themes = Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[];
+    expect(themes).toHaveLength(3);
+    for (const theme of themes) {
+      const values = DESIGN_TOKENS[theme];
+      // Above their floors the label and the time track divide the spare
+      // width two to five.
+      expect(values[labelShareKey], `${theme}: the label track's share`).toBe('2fr');
+      expect(values[barShareKey], `${theme}: the time track's share`).toBe('5fr');
+
+      // The floor is a whole multiple of a space token, so it stays on the
+      // design scale, and it clears the strip the ticks are fitted to.
+      const multiple = SPACE_MULTIPLE.exec(values[floorKey]);
+      const [, spaceName = '', multiplier = ''] = multiple ?? [];
+      expect(
+        multiple,
+        `${theme}: the time track's floor is a multiple of a space token`,
+      ).not.toBeNull();
+      const spaceKey = tokenKeyOf(spaceName);
+      expect(spaceKey).toMatch(/^space\d+$/u);
+      const floorPx = pixelsIn(values[spaceKey], PIXEL_VALUE) * Number(multiplier);
+      const labelFontPx = pixelsIn(values.textXs, FONT_SHORTHAND_SIZE);
+      expect(
+        floorPx,
+        `${theme}: the time track's floor clears the design strip`,
+      ).toBeGreaterThanOrEqual(AXIS_DESIGN_WIDTH_EM * labelFontPx);
+    }
+  });
+
+  it('shares one set of tracks between the axis and every row, at every nesting depth', () => {
+    // Every container between the viewport and a row, and the row itself,
+    // adopts the chart grid's tracks and spans all of them: a row never sizes
+    // a duration column of its own, and a child group's indent insets only the
+    // label column's content.
+    for (const selector of SUBGRID_CONTAINERS) {
+      const bodies = rulesSelecting(selector).filter((body) =>
+        /(?:^|;)\s*display:\s*grid;/u.test(body),
+      );
+      expect(bodies, `${selector} has one grid rule`).toHaveLength(1);
+      const [body = ''] = bodies;
+      expect(declaredValue(body, 'grid-template-columns'), selector).toBe('subgrid');
+      expect(declaredValue(body, 'grid-column'), selector).toBe('full');
+    }
+
+    // The row declares no template of its own besides the subgrid, and its
+    // column gap is the chart grid's, so no subgrid offsets an item against
+    // the track it sits in.
+    const [rowRule, ...otherRowRules] = rulesSelecting('.dg-waterfall__row');
+    expect(otherRowRules).toHaveLength(0);
+    expect(declaredValue(rowRule ?? '', 'gap')).toBe(declaredValue(chartGridRule(), 'column-gap'));
+  });
+
+  it('keeps a readable run of every label and never lets the name column reach the track', async () => {
+    // The name column and the label slot share one floor, a `ch` token of
+    // positive width in every theme: the label track is never narrower than
+    // that plus a row's inset, and the label never narrower than that either.
+    const [name, ...otherNameRules] = rulesSelecting('.dg-waterfall__name');
+    expect(otherNameRules).toHaveLength(0);
+    const floor = TOKEN_REFERENCE.exec(declaredValue(name ?? '', 'min-inline-size'));
+    const [, floorName = ''] = floor ?? [];
+    expect(floor, 'the name column is floored by a token').not.toBeNull();
+    for (const theme of Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[]) {
+      const characters = CH_VALUE.exec(DESIGN_TOKENS[theme][tokenKeyOf(floorName)]);
+      expect(Number(characters?.[1] ?? 0), `${theme}: the label floor`).toBeGreaterThan(0);
+    }
+    const [slot, ...otherSlotRules] = rulesSelecting('.dg-waterfall__label-slot');
+    expect(otherSlotRules).toHaveLength(0);
+    expect(declaredValue(slot ?? '', 'min-inline-size')).toBe(`var(${floorName})`);
+    // A zero basis that grows into what the chips leave on its line.
+    expect(declaredValue(slot ?? '', 'flex')).toBe('auto');
+    expect(declaredValue(slot ?? '', 'flex-basis')).toBe('0');
+
+    // In the DOM: the name column wraps, so a chip that does not fit beside the
+    // floored label moves to another line instead of over the time track, and
+    // the label slot carries no inline declaration that could override the
+    // floor. The source chip is the column's last item, so it wraps first.
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    let sourceChips = 0;
+    for (const row of drawnRows()) {
+      const column = row.querySelector<HTMLElement>('.dg-waterfall__name');
+      expect(column?.classList.contains('dg-stack--wrap')).toBe(true);
+      const labelSlot = column?.querySelector<HTMLElement>('.dg-waterfall__label-slot');
+      expect(labelSlot).not.toBeNull();
+      expect(labelSlot?.getAttribute('style') ?? null).toBeNull();
+      const items = Array.from(column?.querySelector('.dg-stack__items')?.children ?? []);
+      // The chip is the item itself or, with its tooltip, the item's content.
+      const sourceChip = items.findIndex(
+        (item) =>
+          item.classList.contains('dg-source-link') ||
+          item.querySelector('.dg-source-link') !== null,
+      );
+      if (sourceChip !== -1) {
+        sourceChips += 1;
+        expect(sourceChip).toBe(items.length - 1);
+      }
+    }
+    // The browser request resolved to source, so the ordering is exercised.
+    expect(sourceChips).toBeGreaterThan(0);
+  });
+
+  it('declares the viewport a scroll container that owns the chart grid', () => {
+    const bodies = rulesSelecting(`.${VIEWPORT_CLASS}`);
+    // The shared scroll-container rule, and the component's own.
+    expect(bodies).toHaveLength(2);
+    const scrolling = bodies.filter((body) => /(?:^|;)\s*overflow:\s*auto;/u.test(body));
+    expect(scrolling).toHaveLength(1);
+    const own = chartGridRule();
+    expect(declaredValue(own, 'display')).toBe('grid');
+    // The tracks are bracketed by the line names every subgrid spans by.
+    const template = declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' ');
+    expect(template.startsWith('[full-start] ')).toBe(true);
+    expect(template.endsWith(' [full-end]')).toBe(true);
+    expect(declaredValue(own, 'column-gap')).toBe('var(--dg-space-2)');
+    expect(declaredValue(own, 'min-inline-size')).toBe('0');
+
+    // The axis strip takes the track's floor from the chart grid, not a minimum
+    // of its own that could size the column differently from the bars' track.
+    const [strip] = rulesSelecting('.dg-waterfall__axis-strip');
+    expect(declaredValue(strip ?? '', 'min-inline-size')).toBe('0');
+  });
+});
+
+describe('Waterfall timing bar accessible names', () => {
+  it("names each row's timing bar as an image stating where it sits in the window and how much of it the call spans", async () => {
+    const urls = {
+      first: 'http://127.0.0.1:3000/example/first?page=?',
+      second: 'http://127.0.0.1:3000/example/second?page=?',
+      unmeasured: 'http://127.0.0.1:3000/example/unmeasured?page=?',
+    } as const;
+    const call = (ordinal: number, url: string, offsetMs: number, duration: number) =>
+      makeEvent({
+        id: eventIdFor(ordinal),
+        spanId: spanIdFor(ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: 'example.call',
+        startTime: BASE_START_MS + offsetMs,
+        duration,
+        attributes: { 'http.method': 'GET', url, 'http.status_code': 200 },
+        seq: ordinal,
+        ingestSeq: ordinal,
+      });
+    // The window runs from the first call's start to the second call's end:
+    // 0 → 200 ms.
+    const stub = resolvingProvider([
+      call(171, urls.first, 0, 100),
+      call(172, urls.unmeasured, 20, -5),
+      call(173, urls.second, 50, 150),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const windowText = formatDuration(200);
+
+    const barOf = (url: string): HTMLElement => {
+      const bar = rowLabelled(url).querySelector<HTMLElement>('.dg-waterfall__bar');
+      if (bar === null) {
+        throw new Error(`the row for ${url} drew no bar`);
+      }
+      return bar;
+    };
+
+    const first = barOf(urls.first);
+    expect(first.getAttribute('role')).toBe('img');
+    expect(first.getAttribute('aria-hidden')).toBeNull();
+    expect(first.getAttribute('aria-label')).toBe(
+      `Timing bar starting ${formatDuration(0)} into the ${windowText} window, spanning ${formatDuration(
+        100,
+      )}, ${formatShare(100, 200)} of it`,
+    );
+
+    expect(barOf(urls.second).getAttribute('aria-label')).toBe(
+      `Timing bar starting ${formatDuration(50)} into the ${windowText} window, spanning ${formatDuration(
+        150,
+      )}, ${formatShare(150, 200)} of it`,
+    );
+
+    // A duration that was not measured is said to be so, never given the zero
+    // its bar is drawn at.
+    const unmeasured = barOf(urls.unmeasured).getAttribute('aria-label') ?? '';
+    expect(unmeasured).toBe(
+      `Timing bar starting ${formatDuration(20)} into the ${windowText} window; its duration was not measured (${NOT_AVAILABLE_LABEL})`,
+    );
+    expect(unmeasured).not.toContain(`spanning ${formatDuration(0)}`);
+
+    // Every bar is reachable by role, beside the one axis image.
+    expect(screen.getAllByRole('img', { name: /^Timing bar starting / })).toHaveLength(3);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The whole of a long value
+ *
+ * A row cuts its label to a 120-code-point preview, and its accessible name
+ * bounds the label too. The whole redacted URL or parameterized statement is
+ * still reachable: whole in the description bubble, and whole — exactly as it
+ * arrived — in the full-value detail an abbreviated row expands into, by
+ * ArrowRight or by its disclosure button, children or not.
+ * ---------------------------------------------------------------------------
+ */
+
+/** How much of a label a row shows before eliding it. */
+const ROW_LABEL_PREVIEW = 120;
+
+/** How much of a label a row's accessible name repeats. */
+const ROW_NAME_LABEL_PREVIEW = 400;
+
+/** The words at the very end of the long statement, which only the whole value holds. */
+const LONG_STATEMENT_TAIL = 'example-end-of-statement';
+
+/**
+ * A parameterized statement past both bounds and laid out over lines, as a
+ * producer reports a long one: literals already replaced, `$1` kept.
+ */
+const LONG_STATEMENT = [
+  'SELECT',
+  Array.from(
+    { length: 40 },
+    (_, at) => `  COALESCE(example_ledger.column_${String(at)}, ?) AS column_${String(at)}`,
+  ).join(',\n'),
+  'FROM example_ledger',
+  'WHERE tenant_id = $1 AND recorded_at > ?',
+  `LIMIT ? /* ${LONG_STATEMENT_TAIL} */`,
+].join('\n');
+
+/** A redacted URL past the row's preview, with a tail only the whole value holds. */
+const LONG_URL = `http://127.0.0.1:3000/example/${'segment/'.repeat(24)}resource?page=?&tail=?`;
+
+/** Controls a full-value detail must never hold: it is text, not a focus stop. */
+const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
+
+/** A top-level statement whose text is {@link LONG_STATEMENT}. */
+const LONG_STATEMENT_EVENT = makeEvent({
+  id: eventIdFor(161),
+  spanId: spanIdFor(161),
+  kind: 'db.query',
+  tier: 'db',
+  name: 'example.long-statement',
+  startTime: BASE_START_MS + 10,
+  duration: 320,
+  attributes: { 'db.system': 'postgresql', 'db.statement': LONG_STATEMENT, 'db.rowCount': 3 },
+  seq: 5,
+  ingestSeq: 5,
+});
+
+/**
+ * The full-value detail a row describes itself with, or `null` while it shows
+ * none: the element its `aria-describedby` names, which must sit inside it.
+ *
+ * @param row The row.
+ * @returns The detail element, when the row is described by one.
+ */
+function fullValueDetail(row: HTMLElement): HTMLElement | null {
+  const id = row.getAttribute('aria-describedby');
+  if (id === null) {
+    expect(row.querySelector('.dg-waterfall__detail')).toBeNull();
+    return null;
+  }
+  const detail = document.getElementById(id);
+  expect(detail).not.toBeNull();
+  expect(detail?.classList.contains('dg-waterfall__detail')).toBe(true);
+  expect(detail !== null && row.contains(detail)).toBe(true);
+  return detail;
+}
+
+/**
+ * The description bubble of a row whose name bounds its label: the one
+ * `role="tooltip"` in the row whose text opens with the whole label.
+ *
+ * @param row The row.
+ * @param label The row's whole label.
+ * @returns The bubble.
+ */
+function wholeLabelBubble(row: HTMLElement, label: string): HTMLElement {
+  const bubbles = within(row)
+    .queryAllByRole('tooltip', { hidden: true })
+    .filter((bubble) => (bubble.textContent ?? '').startsWith(`${collapseWhitespace(label)} · `));
+  expect(bubbles).toHaveLength(1);
+  const [bubble] = bubbles;
+  if (bubble === undefined) {
+    throw new Error('the row has no bubble carrying its whole label');
+  }
+  return bubble;
+}
+
+describe('Waterfall full values', () => {
+  it('keeps the whole of an abbreviated statement one hover, one focus or one key away', async () => {
+    const stub = resolvingProvider([LONG_STATEMENT_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The row shows the preview, and its name repeats a longer but still
+    // bounded one: the tail is in neither.
+    const shown = oneLinePreview(LONG_STATEMENT, ROW_LABEL_PREVIEW);
+    expect(shown.endsWith('…')).toBe(true);
+    const row = rowLabelled(shown);
+    const name = row.getAttribute('aria-label') ?? '';
+    expect(name.startsWith(`${oneLinePreview(LONG_STATEMENT, ROW_NAME_LABEL_PREVIEW)} · `)).toBe(
+      true,
+    );
+    expect(name).not.toContain(LONG_STATEMENT_TAIL);
+    expect(name).toContain(`${formatCount(3)} rows touched`);
+
+    // The bubble carries the whole statement, whitespace folded onto one line,
+    // followed by the same facts the name states.
+    const bubble = wholeLabelBubble(row, LONG_STATEMENT);
+    expect(bubble.textContent ?? '').toContain(LONG_STATEMENT_TAIL);
+    expect(bubble.textContent ?? '').toContain(`${formatCount(3)} rows touched`);
+
+    // A leaf, and still expandable: its disclosure names the full value, never
+    // nested calls it does not have, and is out of the Tab order.
+    expect(row.getAttribute('aria-expanded')).toBe('false');
+    expect(fullValueDetail(row)).toBeNull();
+    const call = `${shown} (${formatKindLabel('db.query')})`;
+    const show = within(row).getByRole('button', { name: `Show the full statement of ${call}` });
+    expect(EXPAND_NAME.test(show.getAttribute('aria-label') ?? '')).toBe(false);
+    expect(show.getAttribute('tabindex')).toBe('-1');
+    expect(show.getAttribute('aria-expanded')).toBe('false');
+    expect(show.hasAttribute('aria-controls')).toBe(false);
+
+    // The keyboard: Tab onto the row, ArrowRight opens the detail, focus stays.
+    await user.tab();
+    expect(document.activeElement).toBe(row);
+    await user.keyboard('{ArrowRight}');
+    const opened = rowLabelled(shown);
+    expect(document.activeElement).toBe(opened);
+    expect(opened.getAttribute('aria-expanded')).toBe('true');
+    expect(opened.classList.contains('dg-is-expanded')).toBe(true);
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_STATEMENT_EVENT.id, true);
+
+    // The detail: the heading word, then the statement byte for byte — its
+    // lines kept, nothing folded, nothing cut — as monospaced text with no
+    // control in it.
+    const detail = fullValueDetail(opened);
+    if (detail === null) {
+      throw new Error('the expanded row shows no full-value detail');
+    }
+    const value = detail.querySelector('code');
+    expect(value?.textContent).toBe(LONG_STATEMENT);
+    expect(value?.classList.contains('dg-code--wrap')).toBe(true);
+    expect(detail.textContent).toBe(`Statement${LONG_STATEMENT}`);
+    expect(detail.querySelectorAll(FOCUSABLE_SELECTOR)).toHaveLength(0);
+    const hide = within(opened).getByRole('button', { name: `Hide the full statement of ${call}` });
+    expect(hide.getAttribute('aria-expanded')).toBe('true');
+    expect(hide.getAttribute('aria-controls')).toBe(detail.id);
+
+    // The description the keyboard revealed stays open, above the label, so
+    // it never covers the detail below it.
+    const held = wholeLabelBubble(opened, LONG_STATEMENT);
+    expect(isShown(held)).toBe(true);
+    expect(held.classList.contains('dg-tooltip--top')).toBe(true);
+
+    // A leaf has no child to step into: a second ArrowRight moves nothing.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(rowLabelled(shown));
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+
+    // ArrowLeft closes it again, and the row is described by nothing.
+    await user.keyboard('{ArrowLeft}');
+    const closed = rowLabelled(shown);
+    expect(document.activeElement).toBe(closed);
+    expect(closed.getAttribute('aria-expanded')).toBe('false');
+    expect(fullValueDetail(closed)).toBeNull();
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_STATEMENT_EVENT.id, false);
+    expect(isShown(wholeLabelBubble(closed, LONG_STATEMENT))).toBe(true);
+    expect(wholeLabelBubble(closed, LONG_STATEMENT).classList.contains('dg-tooltip--bottom')).toBe(
+      true,
+    );
+
+    // The pointer's route is the disclosure button, both ways.
+    await user.click(
+      within(closed).getByRole('button', { name: `Show the full statement of ${call}` }),
+    );
+    expect(fullValueDetail(rowLabelled(shown))?.querySelector('code')?.textContent).toBe(
+      LONG_STATEMENT,
+    );
+    await user.click(
+      within(rowLabelled(shown)).getByRole('button', {
+        name: `Hide the full statement of ${call}`,
+      }),
+    );
+    expect(fullValueDetail(rowLabelled(shown))).toBeNull();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('offers no full-value disclosure for a label the row already shows whole', async () => {
+    // Laid out over lines, but short: folding its whitespace is all the row
+    // does to it, so there is nothing more to show.
+    const folded = 'SELECT id\n  FROM example_ledger\n WHERE tenant_id = $1';
+    const foldedEvent = makeEvent({
+      ...LONG_STATEMENT_EVENT,
+      attributes: { 'db.system': 'postgresql', 'db.statement': folded, 'db.rowCount': 1 },
+    });
+    const stub = resolvingProvider([foldedEvent, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const label of [collapseWhitespace(folded), LONE_CALL.name]) {
+      const row = rowLabelled(label);
+      expect(row.hasAttribute('aria-expanded')).toBe(false);
+      expect(within(row).queryByRole('button', { name: /^Show the full / })).toBeNull();
+      expect(fullValueDetail(row)).toBeNull();
+      // The name and the bubble carry one sentence.
+      expect(descriptionBubble(row)?.textContent).toBe(row.getAttribute('aria-label'));
+    }
+
+    // ArrowRight on such a leaf opens nothing.
+    await user.tab();
+    await user.keyboard('{ArrowRight}');
+    expect(fullValueDetail(rowLabelled(collapseWhitespace(folded)))).toBeNull();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('opens the whole of a long URL with its nested calls, in one expanded state', async () => {
+    const request = makeEvent({
+      ...REQUEST_EVENT,
+      attributes: { ...REQUEST_ATTRIBUTES, url: LONG_URL },
+    });
+    const stub = resolvingProvider([request, SERVER_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const shown = oneLinePreview(LONG_URL, ROW_LABEL_PREVIEW);
+    const row = rowLabelled(shown);
+    expect(wholeLabelBubble(row, LONG_URL).textContent ?? '').toContain('&tail=?');
+    // The disclosure keeps naming the nested call it opens.
+    await user.click(
+      within(row).getByRole('button', {
+        name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${shown} (${formatKindLabel('fetch')})`,
+      }),
+    );
+
+    // One expansion: the child group and the detail, both controlled by it.
+    const opened = rowLabelled(shown);
+    expect(drawnRows()).toHaveLength(2);
+    const groupId = opened.getAttribute('aria-owns');
+    expect(groupId).not.toBeNull();
+    const detail = fullValueDetail(opened);
+    if (detail === null || groupId === null) {
+      throw new Error('the expanded row shows its children or its detail only');
+    }
+    expect(detail.textContent).toBe(`URL${LONG_URL}`);
+    const collapse = within(opened).getByRole('button', { name: COLLAPSE_NAME });
+    expect(collapse.getAttribute('aria-controls')).toBe(`${groupId} ${detail.id}`);
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+
+    // Closing the row closes both.
+    await user.click(collapse);
+    expect(drawnRows()).toHaveLength(1);
+    expect(fullValueDetail(rowLabelled(shown))).toBeNull();
+  });
+
+  it('shows a long grouped URL once, on the group row, and never lets an occurrence collapse the group', async () => {
+    const group: RequestGroup = {
+      ...makeRequestGroup([settledOccurrence(162, 0, 120), settledOccurrence(163, 200, 90)]),
+      url: LONG_URL,
+    };
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+
+    // The group row shows the whole URL; its occurrences carry the same URL,
+    // so none of them offers a detail — or a disclosure — of its own.
+    const [openedGroup, ...occurrences] = drawnRows();
+    expect(occurrences).toHaveLength(2);
+    if (openedGroup === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    expect(fullValueDetail(openedGroup)?.textContent).toBe(`URL${LONG_URL}`);
+    expect(document.querySelectorAll('.dg-waterfall__detail')).toHaveLength(1);
+    for (const occurrence of occurrences) {
+      expect(occurrence.hasAttribute('aria-expanded')).toBe(false);
+      expect(
+        within(occurrence).queryAllByRole('button', { name: /^(?:Show|Hide) the full / }),
+      ).toHaveLength(0);
+      expect(fullValueDetail(occurrence)).toBeNull();
+    }
+
+    // ArrowRight on the first occurrence — whose record id is the group row's
+    // — leaves the group open.
+    const [firstOccurrence] = occurrences;
+    if (firstOccurrence === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+    firstOccurrence.focus();
+    await user.keyboard('{ArrowRight}');
+    expect(drawnRows()).toHaveLength(3);
+    expect(drawnRows()[0]?.getAttribute('aria-expanded')).toBe('true');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Direction controls in captured text
+ *
+ * The QA report's payload — an escaped script tag behind a right-to-left
+ * override, which a browser draws backwards while `textContent` still holds the
+ * logical string — as a server request's matched route, beside a lineage
+ * candidate and an unresolved parent id that carry the same pair. Written with
+ * escapes, never with the characters.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A matched route carrying an override and its pop around escaped markup. */
+const BIDI_ROUTE = '/qa/\u202E</td><script>alert(7)</script>\u202C';
+
+/** That route as it must display: both controls as their printable escapes. */
+const BIDI_ROUTE_SHOWN = '/qa/\\u202E</td><script>alert(7)</script>\\u202C';
+
+/** The other candidate parent the attribution recorded, and how it must display. */
+const BIDI_CANDIDATE = '\u202Ecandidate\u202C';
+const BIDI_CANDIDATE_SHOWN = '\\u202Ecandidate\\u202C';
+
+/** The parent the re-attached call named, and how it must display. */
+const BIDI_PARENT = '\u202Eparent\u202C';
+const BIDI_PARENT_SHOWN = '\\u202Eparent\\u202C';
+
+/** The call's event id, carrying an override that must reach the host raw. */
+const BIDI_EVENT_ID = 'event-\u202Ewaterfall-0040';
+
+/** A re-attached server request with an ambiguous attribution, every captured string hostile. */
+const BIDI_SERVER_EVENT = makeEvent({
+  id: BIDI_EVENT_ID,
+  spanId: spanIdFor(40),
+  parentSpanId: spanIdFor(41),
+  kind: 'http.server',
+  tier: 'server',
+  name: 'example.server-request',
+  startTime: BASE_START_MS,
+  duration: 300,
+  attributes: {
+    'http.method': REQUEST_METHOD,
+    'http.route': BIDI_ROUTE,
+    'http.status_code': 200,
+    lineageAmbiguous: true,
+    lineageCandidates: [BIDI_CANDIDATE],
+    orphaned: true,
+    orphanedParentSpanId: BIDI_PARENT,
+  },
+});
+
+/**
+ * Asserts nothing in the document displays a raw direction control — not its
+ * text, which includes every description bubble, and not a `title` or
+ * `aria-label` — and that the payload's escaped markup never became an element.
+ */
+function expectNothingReorders(): void {
+  const root = document.body;
+  expect(containsDirectionControl(root.textContent)).toBe(false);
+  for (const element of Array.from(root.querySelectorAll('*'))) {
+    for (const attribute of ['title', 'aria-label']) {
+      const value = element.getAttribute(attribute);
+      if (value !== null) {
+        expect(containsDirectionControl(value)).toBe(false);
+      }
+    }
+  }
+  expect(root.querySelector('script')).toBeNull();
+}
+
+describe('Waterfall direction controls in captured text', () => {
+  it('labels, names and describes a hostile call in its logical order, and selects it raw', async () => {
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([BIDI_SERVER_EVENT]).provider,
+      actions: spies.actions,
+    });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The visible label is the revealed route, and the row's accessible name
+    // opens with it and names the other candidate and the unresolved parent,
+    // revealed too.
+    const row = rowLabelled(BIDI_ROUTE_SHOWN);
+    const name = row.getAttribute('aria-label') ?? '';
+    expect(name.startsWith(`${BIDI_ROUTE_SHOWN} · `)).toBe(true);
+    expect(name).toContain(`other candidates: ${BIDI_CANDIDATE_SHOWN}`);
+    expect(name).toContain(`the parent ${BIDI_PARENT_SHOWN} of this call never arrived`);
+
+    expectNothingReorders();
+
+    // Activating the row hands the host the raw coordinates of its record.
+    await user.click(row);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: BIDI_EVENT_ID,
+      spanId: BIDI_SERVER_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(rowLabelled(BIDI_ROUTE_SHOWN).getAttribute('aria-selected')).toBe('true');
+  });
+});

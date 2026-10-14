@@ -1,0 +1,53 @@
+/*
+ * StockBadge - the availability indicator on a product detail page.
+ *
+ * This module owns two things and deliberately nothing else: how the chip and its optional
+ * supporting note sit next to each other, and how that note reads.
+ *
+ * The chip itself is `src/components/ui/Badge`, and `Badge.module.css` is the single owner of its
+ * appearance - padding, border, corner radius, font size and weight, `white-space: nowrap` and the
+ * tone colour that `StockBadge.tsx` selects through the `tone` prop. Restating any of that here
+ * would give one element two owners, and the copy would be the one that drifts. So there is no
+ * background, border, padding or radius below: the wrapper is a bare layout box around a chip that
+ * already knows how to look.
+ *
+ * Every value is read as `var(--ls-TOKEN, <literal fallback>)`. The tokens are declared once, in
+ * `app/globals.css`; the fallbacks mirror those declarations so this module still renders sensibly
+ * on its own, and the declaration in `globals.css` is what the browser actually paints. The only
+ * bare values here are CSS keywords - no colour, length, font stack or shadow appears outside a
+ * `var()` fallback. Hex fallbacks are lowercase because Prettier normalises CSS colours and
+ * `pnpm format:check` is a blocking gate; the same applies to the single-quoted attribute value in
+ * the last rule, which matches the `data-emphasis="true"` attribute the component renders.
+ */
+
+/* The wrapper around the chip and the note. It stays inline so it can sit on a line of product
+ * copy or inside a specification row, and `flex-wrap` is what keeps a long note from widening that
+ * line: on a narrow viewport the note drops underneath the chip instead of overflowing, which
+ * matters because the chip cannot break internally - `Badge` sets `white-space: nowrap`. The gap
+ * therefore does double duty as the column spacing on one line and the row spacing on two. */
+.root {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The supporting line beside the chip: a quantity or a short qualifier that the chip's label does
+ * not already state. It is secondary information, so it takes the muted foreground and the
+ * smallest type size, and it inherits the body font family and line height from `globals.css`
+ * rather than redeclaring them. `tabular-nums` keeps the digits on a fixed pitch, so a count does
+ * not visibly shift the note as the number changes. */
+.note {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One emphasised variant, for the state where the product cannot be ordered. The component marks
+ * it with `data-emphasis="true"` on the wrapper - variants in this application are driven by data
+ * attributes, never by a conditional lookup in the styles object - and the note picks up the
+ * danger colour so the qualifying line carries the same weight as the chip beside it. Colour is
+ * never the whole message: the chip's label states the state in words. */
+.root[data-emphasis='true'] .note {
+  color: var(--ls-danger, #b42318);
+}
