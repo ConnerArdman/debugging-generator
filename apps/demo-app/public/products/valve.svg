@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Valves and fittings</title>
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M118 180 H170" stroke="#0F172A" stroke-width="8" />
+    <path d="M118 212 H170" stroke="#0F172A" stroke-width="8" />
+    <path d="M230 180 H282" stroke="#0F172A" stroke-width="8" />
+    <path d="M230 212 H282" stroke="#0F172A" stroke-width="8" />
+    <path d="M118 172 V220" stroke="#0F172A" stroke-width="8" />
+    <path d="M282 172 V220" stroke="#0F172A" stroke-width="8" />
+    <rect x="170" y="168" width="60" height="56" rx="10" stroke="#0F172A" stroke-width="8" />
+    <path d="M150 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M160 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M240 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M250 176 V216" stroke="#475569" stroke-width="6" />
+    <circle cx="200" cy="158" r="10" stroke="#475569" stroke-width="6" />
+    <path d="M205 154 L258 120" stroke="#0F172A" stroke-width="8" />
+    <path d="M243 117 L255 135 L281 119 L269 101 Z" fill="#F59E0B" stroke="#0F172A" stroke-width="8" />
+  </g>
+</svg>

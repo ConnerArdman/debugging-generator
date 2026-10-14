@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Lumen Supply, the Next.js 16 App Router app this repository instruments. It imports no workspace package, so it declares no project `references`.",
+
+  "// format": "Strict JSON, so notes are top-level `\"// …\"` keys, which TypeScript ignores and Next.js neither requires nor suggests; inside `compilerOptions` such a key is an error (TS5023).",
+
+  "// next-rewrite": "`next dev` and `next build` rewrite tsconfig.json through writeConfigurationDefaults() unless the raw file contains `extends` or `references`. The `extends` below keeps this file byte-stable: a rewrite would dirty `git status` and fail the `residual-worktree` rule of `pnpm check:no-residual-instrumentation`. Every compiler option Next.js requires or suggests is also present in the raw file: required ones with Next's values, suggested ones as well, where `target`, `lib`, `allowJs`, `strict` and `noEmit` deliberately differ from the suggestion. Next leaves those alone because it writes a suggestion only when the key is missing.",
+
+  "// compilerOptions.emit": "`noEmit` is false where Next.js suggests true: a composite project with emit disabled writes only its .tsbuildinfo and contributes nothing to the solution build. `tsc -b` emits declarations only, into .tsbuild; `next build` produces the app.",
+
+  "// compilerOptions.lib": "DOM and DOM.Iterable join ES2023 for the client components.",
+
+  "// compilerOptions.verbatimModuleSyntax": "Stated together with `isolatedModules`: Next.js requires `isolatedModules` unless the raw file sets `verbatimModuleSyntax`, so both branches of its check match.",
+
+  "// compilerOptions.jsx": "Next.js 16 requires \"react-jsx\", the React automatic runtime.",
+
+  "// compilerOptions.strict": "`strict`, `strictNullChecks` and `allowJs: false` are stated against Next.js's suggested `strict: false` and `allowJs: true`.",
+
+  "// compilerOptions.skipLibCheck": "Does not cover the generated Prisma client under src/generated/prisma: it is TypeScript source and is checked as first-party code.",
+
+  "// compilerOptions.plugins": "The Next.js language-service plugin, for editors; tsc ignores it.",
+
+  "// compilerOptions.types": "node, react and react-dom are named because TypeScript 6.0 includes no @types package that `types` omits.",
+
+  "// compilerOptions.paths": "The single alias `@/*` -> ./src/*. `baseUrl` is absent: TypeScript 6.0.3 rejects it (TS5101), and both tsc and Next.js resolve `paths` without it.",
+
+  "// include": "next-env.d.ts is generated and git-ignored, so it sits in `include`, where a missing match is ignored, rather than in `files`, where it is an error; nothing may depend on it, which is why the app uses no static image imports. Both .next/types and .next/dev/types globs are listed so Next.js never appends one.",
+
+  "// exclude": "`exclude` replaces the base list, so .tsbuild is repeated. .next is not excluded, because the `include` globs pick up its generated route types.",
+
+  "extends": "../../tsconfig.base.json",
+
+  "compilerOptions": {
+    "composite": true,
+    "incremental": true,
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo",
+
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "allowJs": false,
+    "strict": true,
+    "strictNullChecks": true,
+    "skipLibCheck": true,
+
+    "plugins": [{ "name": "next" }],
+
+    "types": ["node", "react", "react-dom"],
+
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+
+  "exclude": ["node_modules", ".tsbuild"]
+}

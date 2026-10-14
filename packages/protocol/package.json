@@ -1,0 +1,35 @@
+{
+  "name": "@debuggen/protocol",
+  "version": "0.1.0",
+  "description": "Single cross-process contract layer: WebSocket message envelope and payload schemas, HTTP route schemas, the session record, the analysis result and the reconnecting client SDK.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": [
+        "./src/index.ts",
+        "./dist/index.d.ts"
+      ],
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project protocol"
+  },
+  "dependencies": {
+    "@debuggen/instrumentation": "workspace:*",
+    "@debuggen/panel-schema": "workspace:*",
+    "@debuggen/shared": "workspace:*",
+    "@debuggen/telemetry": "workspace:*",
+    "zod": "4.6.5"
+  }
+}

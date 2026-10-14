@@ -1,0 +1,84 @@
+# Repository ignore list for the Custom Debugging Generator monorepo.
+#
+# Policy: dependencies and generated artifacts are never committed, and no secret ever
+# reaches the index. Directory rules carry a trailing slash so a *file* that happens to
+# share a directory's name is left alone. Paths are repository-relative; nothing here is
+# absolute or specific to one developer's machine.
+#
+# Deliverables that look generated but are committed on purpose - never add these:
+#   pnpm-lock.yaml                                   reproducible installs
+#   .vscode/{launch,tasks,settings,extensions}.json  contributed developer setup
+#   apps/demo-app/prisma/migrations/**               schema history
+#   scripts/no-hardcoding.policy.json                reviewed guard policy
+#   packages/panel-renderer/src/tokens/tokens.css    generated from tokens.ts by
+#     packages/panel-renderer/scripts/build-tokens.mjs, yet committed deliberately:
+#     the token tests (and `pnpm --filter @debuggen/panel-renderer tokens:check`) fail
+#     when the committed CSS drifts from its TypeScript source, so the file is listed in
+#     .prettierignore rather than ignored here.
+
+# dependencies. node_modules/ is the whole of it: pnpm keeps its
+# content-addressable store outside every checkout (neither .npmrc nor
+# pnpm-workspace.yaml sets `store-dir`), and the virtual store that store is
+# linked from lives under node_modules/.pnpm, already covered here.
+node_modules/
+
+# build output, and the complete list of paths anything in this repository may
+# write to. `.tsbuild/` holds the declaration output of the root `tsc -b`
+# solution build: its projects set composite, which cannot be combined with noEmit.
+# Every bundler here is configured onto one of these paths - tsup (every package
+# and the service) to dist/, esbuild to named outfiles under dist/, Vite to dist/
+# and dist/webview, Next to .next/ - so a new build step reuses one of them rather
+# than introducing a fresh rule below.
+dist/
+out/
+.next/
+.tsbuild/
+*.tsbuildinfo
+*.vsix
+
+# test, coverage and harness output. playwright-report/ and test-results/ are the
+# two paths playwright.config.ts is configured to write (an `html` reporter with
+# `outputFolder: 'playwright-report'`, and `outputDir: 'test-results'`); a reporter
+# added later is pointed at one of them rather than given a rule of its own.
+# `.vscode-test/` is where @vscode/test-cli and @vscode/test-electron download a
+# VS Code build during `pnpm test:vscode`.
+coverage/
+playwright-report/
+test-results/
+.vscode-test/
+
+# environment files - order matters. The two example files are required deliverables and
+# are re-included; the secrets check fails the build on any other tracked .env* file.
+.env*
+!.env.example
+!apps/demo-app/.env.example
+
+# local databases and session state (the session store lives outside the checkout,
+# under $DEBUGGEN_HOME, but a stray database must never be committable)
+*.sqlite*
+
+# generated code and assets
+apps/demo-app/src/generated/
+apps/demo-app/next-env.d.ts
+apps/chrome-extension/public/agent.iife.js
+# copy of the root LICENSE staged for vsce by `esbuild.mjs --package` (vscode:prepublish)
+apps/vscode-extension/LICENSE
+
+# captured telemetry - the curated, redacted fixtures under
+# packages/telemetry/test/fixtures/ are committed; live captures never are. These are
+# deliberately file globs: a negation cannot re-include a file whose parent directory is
+# ignored, so a committed fixture directory must never be named "captures".
+*.capture.json
+!packages/telemetry/test/fixtures/**/*.capture.json
+**/captures/
+
+# logs are generated artifacts. `pnpm-debug.log*` is listed separately because
+# `*.log` does not match a rotated name such as pnpm-debug.log.1.
+*.log
+pnpm-debug.log*
+
+# OS noise
+.DS_Store
+
+# Blitzy run artifacts (screenshots, screen recordings)
+blitzy/

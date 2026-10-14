@@ -1,0 +1,173 @@
+/*
+ * Lumen Supply - Input: the text-field stylesheet.
+ *
+ * Owned by `Input.tsx`, a thin wrapper over the native `<input>` that renders this module's single
+ * `.root` class and expresses every variant as a data attribute:
+ *
+ *   data-size="sm" | "md"   field density; "md" is the base metrics declared on `.root`, so only
+ *                           the "sm" case needs a rule of its own
+ *   data-invalid="true"     the field failed validation
+ *   data-numeric="true"     quantity-style entry: right-aligned, tabular figures
+ *
+ * There is no class-name lookup map: a variant is an attribute, so the component forwards the
+ * props it is given and this file owns every appearance decision.
+ *
+ * What this file deliberately does not own: the label, the hint and the error message. `FormField`
+ * renders those, which is why the invalid appearance here is only a border colour - the meaning is
+ * carried by FormField's text, never by colour alone.
+ *
+ * Tokens: every colour, spacing step, radius and type size is `var(--ls-NAME, <literal fallback>)`.
+ * The declarations live in `app/globals.css`; the fallbacks mirror them so a field still renders
+ * sensibly if it is ever mounted outside the application shell, and they are spelled in lowercase
+ * because Prettier normalises CSS colours and `pnpm format:check` is a blocking gate. The same gate
+ * is why the attribute selectors below are written with single quotes even though the component
+ * writes the attributes with double ones: the repository's Prettier configuration sets
+ * `singleQuote`, and the two spellings select identically - do not "restore" either one.
+ *
+ * Cascade note, load-bearing: the state rules below all sit at the same specificity - one class
+ * plus one simple selector, with `:not()` wrapped in zero-specificity `:where()` where it appears -
+ * so plain source order decides which state wins. The order is hover -> focus -> read-only ->
+ * disabled -> invalid, and the only rule allowed to go higher is the invalid focus ring. Reorder
+ * them and an invalid field silently loses its red border while the pointer is over it.
+ */
+
+.root {
+  /* Metrics first. `font: inherit` adopts the body's family, weight and line height - a unitless
+   * number, so it keeps scaling with whichever size token follows - and the size token then sets
+   * this field's own size. The shorthand has to come before `font-size` or it would reset it. */
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  /* Lets the field shrink inside a flex or grid track instead of forcing its parent wider, which
+   * is what keeps a 100%-wide field inside a padded `Card` rather than over its padding. */
+  min-width: 0;
+  margin: 0;
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+  font: inherit;
+  font-size: var(--ls-text-md, 15px);
+  /* Drop the platform's own field chrome - inset shadow, native radius, iOS gradient - so the
+   * border and radius declared above are what the reader actually sees. */
+  appearance: none;
+  /* The border colour is the only thing that moves, and the only thing that can: no state below
+   * changes padding, border width or font size, so a form row never changes height mid-entry -
+   * which matters while the checkout page is waiting on a shipping quote. */
+  transition: border-color 150ms ease-out;
+}
+
+/*
+ * `opacity: 1` is not cosmetic. Several engines dim the placeholder on top of whatever colour is
+ * declared, which would drag this muted grey below the 4.5:1 contrast floor; pinning the opacity
+ * keeps it at its measured 7.5:1 on the field background.
+ */
+.root::placeholder {
+  color: var(--ls-text-muted, #475569);
+  opacity: 1;
+}
+
+/*
+ * Pointer affordance. Declared unconditionally rather than behind `@media (hover: hover)`: a
+ * browser that reports `hover: none` would otherwise never show this state. The usual reason for
+ * the query, a touch device leaving the darker border stuck on after a tap, does not apply to a
+ * text field: tapping one focuses it, and the focus rule below wins the cascade for the whole time
+ * the reader is typing.
+ *
+ * `:not(:disabled)` is wrapped in zero-specificity `:where()` so this rule stays level with the
+ * focus and invalid rules that follow it; written plainly it would outrank both and a hovered field
+ * would lose its focus ring colour and its error border.
+ */
+.root:hover:where(:not(:disabled)) {
+  border-color: var(--ls-slate, #475569);
+}
+
+/*
+ * Focus. `:focus-visible` is the intended selector; `:focus` is listed alongside it for engines
+ * that focus a text field without applying the heuristic, and a text field is keyboard-operable in
+ * every case, so the ring is never shown where it should not be. `outline-offset` leaves a hairline
+ * gap so the ring reads as a ring rather than a thicker border, and the outline is drawn outside
+ * the box, so showing it shifts nothing.
+ */
+.root:focus,
+.root:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 1px;
+  border-color: var(--ls-focus, #0f766e);
+}
+
+/* A field that shows a value the reader may copy but not change. Recessed, still focusable, still
+ * selectable - only the editing affordance is gone, so the metrics stay put. */
+.root:read-only {
+  background: var(--ls-surface-sunken, #f8fafc);
+}
+
+.root:disabled {
+  background: var(--ls-surface-sunken, #f8fafc);
+  color: var(--ls-text-muted, #475569);
+  /* Engines fade a disabled control by two separate routes - a blanket opacity and, on WebKit, a
+   * text fill colour that outranks `color` - and the two are handled differently here on purpose.
+   *
+   * The opacity is the shared `--ls-disabled-opacity`, so this field dims by exactly the amount
+   * Button, Pill and Select dim by. WCAG 1.4.3 exempts an inactive control from the 4.5:1 minimum,
+   * and the state is carried by more than the dimming - the recessed fill, the `not-allowed`
+   * cursor and the native `disabled` semantics `FormField` announces.
+   *
+   * The `-webkit-text-fill-color` pin is not a contrast measure but a double-fade guard: that
+   * engine applies its own text fill on top of whatever opacity is in force, so without it the
+   * label would be faded twice and end up visibly lighter on WebKit than on every other engine. */
+  -webkit-text-fill-color: var(--ls-text-muted, #475569);
+  opacity: var(--ls-disabled-opacity, 0.55);
+  cursor: not-allowed;
+}
+
+/*
+ * Invalid. Declared after the hover, focus and disabled rules so the error border survives all
+ * three: at equal specificity the later rule wins, which is exactly the behaviour wanted here.
+ * Colour alone never carries this state - `FormField` renders the message and wires
+ * `aria-describedby` - so this rule is an emphasis, not the signal.
+ */
+.root[data-invalid='true'] {
+  border-color: var(--ls-danger, #b42318);
+}
+
+/* The one rule that is allowed to outrank the block above: a focused invalid field keeps the error
+ * colour in both the border and the ring, so focusing the field never reads as clearing its error. */
+.root[data-invalid='true']:focus,
+.root[data-invalid='true']:focus-visible {
+  outline-color: var(--ls-danger, #b42318);
+  border-color: var(--ls-danger, #b42318);
+}
+
+/* Dense variant, for a toolbar or a table cell. The type floor is the small step: anything smaller
+ * makes mobile Safari zoom the page on focus and costs legibility in the checkout flow.
+ *
+ * The height floor is `--ls-control-sm`, the shared compact-control token, and it is here because
+ * this field does not sit alone: the dashboard's filter row and the catalog toolbar put a `sm`
+ * field, a `sm` select and a `sm` Button on one line, and one shared floor lines the three up.
+ * `min-block-size` raises the box and touches nothing else, so the padding, border width and type
+ * step above still decide everything about how the field reads. */
+.root[data-size='sm'] {
+  min-block-size: var(--ls-control-sm, 32px);
+  padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Quantity entry: figures line up column-wise and the value sits against the edge the reader's eye
+ * returns to. Nothing else - a numeric field is the same field. */
+.root[data-numeric='true'] {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/*
+ * A reader who has asked for less motion gets the same appearance with no tween. This is the
+ * module's own reduced-motion rule, at the module's own specificity, as the baseline in
+ * `app/globals.css` expects of every component that introduces motion.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}

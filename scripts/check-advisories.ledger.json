@@ -1,0 +1,17 @@
+{
+  "notes": "Read by scripts/check-advisories.mjs. `advisories` holds normalized vendor advisories: any locked version or exact manifest pin inside one of an entry's `vulnerableRanges` fails the check, offline. `vendorFeeds` names the GitHub repositories whose published security advisories the --online layer reads directly, ahead of the aggregated feeds `pnpm audit` uses; every vendor entry is evaluated as published, including entries of advisories recorded here, so a revised vendor range is never hidden by its ledger entry. `vendorEntries` lists, verbatim (package, `vulnerable_version_range`, `patched_versions`), the vendor entries an advisory's normalized ranges replace: use it only for a vendor range the check cannot parse or that over-matches, after review; a vendor entry whose text changes no longer matches and is evaluated again. Add an advisory when a vendor publishes one ahead of OSV; remove it once the patched version is locked everywhere and OSV carries the advisory.",
+  "vendorFeeds": [{ "package": "next", "repository": "vercel/next.js" }],
+  "advisories": [
+    {
+      "id": "GHSA-vcvr-r3jv-pc5j",
+      "aliases": ["CVE-2026-94545"],
+      "package": "next",
+      "severity": "critical",
+      "vulnerableRanges": [">= 16.2.0 < 16.3.6"],
+      "patched": "16.3.6",
+      "published": "2026-09-22",
+      "source": "https://github.com/vercel/next.js/security/advisories/GHSA-vcvr-r3jv-pc5j",
+      "vendorEntries": []
+    }
+  ]
+}

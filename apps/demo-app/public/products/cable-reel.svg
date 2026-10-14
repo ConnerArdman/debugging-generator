@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Cable reel</title>
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="238" cy="124" rx="36.4" ry="50.96" stroke="#0F172A" stroke-width="8" />
+    <path d="M188.87 195.92 C206.87 209.92 228.87 226 246.87 226 L294 226" stroke="#0F766E" stroke-width="8" />
+    <path d="M161.03 211.24 L248.04 163.35 Q205.96 140.02 227.96 84.65 L138.97 124.76 Z" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+    <path d="M187.16 189.2 Q152.52 166.74 169.16 118.64 M206.34 178.8 Q172.4 156.8 188.7 109.68 M225.51 168.4 Q192.28 146.86 208.25 100.72 M237.72 161.78 Q204.94 140.53 220.68 95.02" stroke="#475569" stroke-width="6" />
+    <rect x="192.32" y="131.34" width="28" height="17" rx="5" transform="rotate(-26.57 206.32 139.84)" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+    <ellipse cx="150" cy="168" rx="40" ry="56" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+    <circle cx="150" cy="168" r="12" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>

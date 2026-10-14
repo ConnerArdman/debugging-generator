@@ -1,0 +1,46 @@
+{
+  "title": "Trail report latency",
+  "summary": "Most of the interaction time is spent in one database query.",
+  "layout": [
+    {
+      "type": "metricCards",
+      "metrics": ["total_duration", "frontend_duration", "backend_duration", "database_duration"]
+    },
+    {
+      "type": "timeline",
+      "source": "trace",
+      "filter": {
+        "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e"
+      }
+    },
+    {
+      "type": "section",
+      "title": "Where the time went",
+      "children": [
+        {
+          "type": "table",
+          "title": "Slowest operations",
+          "source": "spans",
+          "sort": "duration_desc",
+          "limit": 10
+        },
+        {
+          "type": "queryTable",
+          "source": "queries",
+          "sort": "duration_desc"
+        }
+      ]
+    },
+    {
+      "type": "sourceLink",
+      "location": {
+        "file": "src/server/services/trail-report.service.ts",
+        "line": 88,
+        "column": 23,
+        "symbol": "loadTrailReport",
+        "resolvedBy": "patch",
+        "confidence": 1
+      }
+    }
+  ]
+}

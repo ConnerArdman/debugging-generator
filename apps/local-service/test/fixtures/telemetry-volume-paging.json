@@ -1,0 +1,3741 @@
+[
+  {
+    "id": "evt_vl00000000000001",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00001",
+    "kind": "interaction",
+    "name": "click TrailList refresh",
+    "startTime": 1789819200000,
+    "duration": 1400,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 1
+  },
+  {
+    "id": "evt_vl00000000000002",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00002",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000002.json",
+    "startTime": 1789819200010,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 2
+  },
+  {
+    "id": "evt_vl00000000000003",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00003",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000003.json",
+    "startTime": 1789819200015,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 3
+  },
+  {
+    "id": "evt_vl00000000000004",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00004",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000004.json",
+    "startTime": 1789819200020,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 4
+  },
+  {
+    "id": "evt_vl00000000000005",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00005",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000005.json",
+    "startTime": 1789819200025,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 5
+  },
+  {
+    "id": "evt_vl00000000000006",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00006",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000006.json",
+    "startTime": 1789819200030,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 6
+  },
+  {
+    "id": "evt_vl00000000000007",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00007",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000007.json",
+    "startTime": 1789819200035,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 7
+  },
+  {
+    "id": "evt_vl00000000000008",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00008",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000008.json",
+    "startTime": 1789819200040,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 8
+  },
+  {
+    "id": "evt_vl00000000000009",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00009",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000009.json",
+    "startTime": 1789819200045,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 9
+  },
+  {
+    "id": "evt_vl00000000000010",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00010",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000010.json",
+    "startTime": 1789819200050,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 10
+  },
+  {
+    "id": "evt_vl00000000000011",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00011",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000011.json",
+    "startTime": 1789819200055,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 11
+  },
+  {
+    "id": "evt_vl00000000000012",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00012",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000012.json",
+    "startTime": 1789819200060,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 12
+  },
+  {
+    "id": "evt_vl00000000000013",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00013",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000013.json",
+    "startTime": 1789819200065,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 13
+  },
+  {
+    "id": "evt_vl00000000000014",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00014",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000014.json",
+    "startTime": 1789819200070,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 14
+  },
+  {
+    "id": "evt_vl00000000000015",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00015",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000015.json",
+    "startTime": 1789819200075,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 15
+  },
+  {
+    "id": "evt_vl00000000000016",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00016",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000016.json",
+    "startTime": 1789819200080,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 16
+  },
+  {
+    "id": "evt_vl00000000000017",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00017",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000017.json",
+    "startTime": 1789819200085,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 17
+  },
+  {
+    "id": "evt_vl00000000000018",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00018",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000018.json",
+    "startTime": 1789819200090,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 18
+  },
+  {
+    "id": "evt_vl00000000000019",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00019",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000019.json",
+    "startTime": 1789819200095,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 19
+  },
+  {
+    "id": "evt_vl00000000000020",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00020",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000020.json",
+    "startTime": 1789819200100,
+    "duration": 31.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 20
+  },
+  {
+    "id": "evt_vl00000000000021",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00021",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000021.json",
+    "startTime": 1789819200105,
+    "duration": 33,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 21
+  },
+  {
+    "id": "evt_vl00000000000022",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00022",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000022.json",
+    "startTime": 1789819200110,
+    "duration": 34.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 22
+  },
+  {
+    "id": "evt_vl00000000000023",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00023",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000023.json",
+    "startTime": 1789819200115,
+    "duration": 36,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 23
+  },
+  {
+    "id": "evt_vl00000000000024",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00024",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000024.json",
+    "startTime": 1789819200120,
+    "duration": 37.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 24
+  },
+  {
+    "id": "evt_vl00000000000025",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00025",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000025.json",
+    "startTime": 1789819200125,
+    "duration": 39,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 25
+  },
+  {
+    "id": "evt_vl00000000000026",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00026",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000026.json",
+    "startTime": 1789819200130,
+    "duration": 40.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 26
+  },
+  {
+    "id": "evt_vl00000000000027",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00027",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000027.json",
+    "startTime": 1789819200135,
+    "duration": 42,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 27
+  },
+  {
+    "id": "evt_vl00000000000028",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00028",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000028.json",
+    "startTime": 1789819200140,
+    "duration": 43.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 28
+  },
+  {
+    "id": "evt_vl00000000000029",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00029",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000029.json",
+    "startTime": 1789819200145,
+    "duration": 45,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 29
+  },
+  {
+    "id": "evt_vl00000000000030",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00030",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000030.json",
+    "startTime": 1789819200150,
+    "duration": 46.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 30
+  },
+  {
+    "id": "evt_vl00000000000031",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00031",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000031.json",
+    "startTime": 1789819200155,
+    "duration": 48,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 31
+  },
+  {
+    "id": "evt_vl00000000000032",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00032",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000032.json",
+    "startTime": 1789819200160,
+    "duration": 49.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 32
+  },
+  {
+    "id": "evt_vl00000000000033",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00033",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000033.json",
+    "startTime": 1789819200165,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 33
+  },
+  {
+    "id": "evt_vl00000000000034",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00034",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000034.json",
+    "startTime": 1789819200170,
+    "duration": 52.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 34
+  },
+  {
+    "id": "evt_vl00000000000035",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00035",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000035.json",
+    "startTime": 1789819200175,
+    "duration": 54,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 35
+  },
+  {
+    "id": "evt_vl00000000000036",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00036",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000036.json",
+    "startTime": 1789819200180,
+    "duration": 55.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 36
+  },
+  {
+    "id": "evt_vl00000000000037",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00037",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000037.json",
+    "startTime": 1789819200185,
+    "duration": 57,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 37
+  },
+  {
+    "id": "evt_vl00000000000038",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00038",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000038.json",
+    "startTime": 1789819200190,
+    "duration": 58.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 38
+  },
+  {
+    "id": "evt_vl00000000000039",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00039",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000039.json",
+    "startTime": 1789819200195,
+    "duration": 60,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 39
+  },
+  {
+    "id": "evt_vl00000000000040",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00040",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000040.json",
+    "startTime": 1789819200200,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 40
+  },
+  {
+    "id": "evt_vl00000000000041",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00041",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000041.json",
+    "startTime": 1789819200205,
+    "duration": 3,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 41
+  },
+  {
+    "id": "evt_vl00000000000042",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00042",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000042.json",
+    "startTime": 1789819200210,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 42
+  },
+  {
+    "id": "evt_vl00000000000043",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00043",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000043.json",
+    "startTime": 1789819200215,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 43
+  },
+  {
+    "id": "evt_vl00000000000044",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00044",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000044.json",
+    "startTime": 1789819200220,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 44
+  },
+  {
+    "id": "evt_vl00000000000045",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00045",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000045.json",
+    "startTime": 1789819200225,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 45
+  },
+  {
+    "id": "evt_vl00000000000046",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00046",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000046.json",
+    "startTime": 1789819200230,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 46
+  },
+  {
+    "id": "evt_vl00000000000047",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00047",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000047.json",
+    "startTime": 1789819200235,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 47
+  },
+  {
+    "id": "evt_vl00000000000048",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00048",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000048.json",
+    "startTime": 1789819200240,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 48
+  },
+  {
+    "id": "evt_vl00000000000049",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00049",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000049.json",
+    "startTime": 1789819200245,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 49
+  },
+  {
+    "id": "evt_vl00000000000050",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00050",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000050.json",
+    "startTime": 1789819200250,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 50
+  },
+  {
+    "id": "evt_vl00000000000051",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00051",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000051.json",
+    "startTime": 1789819200255,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 51
+  },
+  {
+    "id": "evt_vl00000000000052",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00052",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000052.json",
+    "startTime": 1789819200260,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 52
+  },
+  {
+    "id": "evt_vl00000000000053",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00053",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000053.json",
+    "startTime": 1789819200265,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 53
+  },
+  {
+    "id": "evt_vl00000000000054",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00054",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000054.json",
+    "startTime": 1789819200270,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 54
+  },
+  {
+    "id": "evt_vl00000000000055",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00055",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000055.json",
+    "startTime": 1789819200275,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 55
+  },
+  {
+    "id": "evt_vl00000000000056",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00056",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000056.json",
+    "startTime": 1789819200280,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 56
+  },
+  {
+    "id": "evt_vl00000000000057",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00057",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000057.json",
+    "startTime": 1789819200285,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 57
+  },
+  {
+    "id": "evt_vl00000000000058",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00058",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000058.json",
+    "startTime": 1789819200290,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 58
+  },
+  {
+    "id": "evt_vl00000000000059",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00059",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000059.json",
+    "startTime": 1789819200295,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 59
+  },
+  {
+    "id": "evt_vl00000000000060",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00060",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000060.json",
+    "startTime": 1789819200300,
+    "duration": 31.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 60
+  },
+  {
+    "id": "evt_vl00000000000061",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00061",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000061.json",
+    "startTime": 1789819200305,
+    "duration": 33,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 61
+  },
+  {
+    "id": "evt_vl00000000000062",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00062",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000062.json",
+    "startTime": 1789819200310,
+    "duration": 34.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 62
+  },
+  {
+    "id": "evt_vl00000000000063",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00063",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000063.json",
+    "startTime": 1789819200315,
+    "duration": 36,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 63
+  },
+  {
+    "id": "evt_vl00000000000064",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00064",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000064.json",
+    "startTime": 1789819200320,
+    "duration": 37.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 64
+  },
+  {
+    "id": "evt_vl00000000000065",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00065",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000065.json",
+    "startTime": 1789819200325,
+    "duration": 39,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 65
+  },
+  {
+    "id": "evt_vl00000000000066",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00066",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000066.json",
+    "startTime": 1789819200330,
+    "duration": 40.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 66
+  },
+  {
+    "id": "evt_vl00000000000067",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00067",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000067.json",
+    "startTime": 1789819200335,
+    "duration": 42,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 67
+  },
+  {
+    "id": "evt_vl00000000000068",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00068",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000068.json",
+    "startTime": 1789819200340,
+    "duration": 43.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 68
+  },
+  {
+    "id": "evt_vl00000000000069",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00069",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000069.json",
+    "startTime": 1789819200345,
+    "duration": 45,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 69
+  },
+  {
+    "id": "evt_vl00000000000070",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00070",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000070.json",
+    "startTime": 1789819200350,
+    "duration": 46.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 70
+  },
+  {
+    "id": "evt_vl00000000000071",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00071",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000071.json",
+    "startTime": 1789819200355,
+    "duration": 48,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 71
+  },
+  {
+    "id": "evt_vl00000000000072",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00072",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000072.json",
+    "startTime": 1789819200360,
+    "duration": 49.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 72
+  },
+  {
+    "id": "evt_vl00000000000073",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00073",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000073.json",
+    "startTime": 1789819200365,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 73
+  },
+  {
+    "id": "evt_vl00000000000074",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00074",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000074.json",
+    "startTime": 1789819200370,
+    "duration": 52.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 74
+  },
+  {
+    "id": "evt_vl00000000000075",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00075",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000075.json",
+    "startTime": 1789819200375,
+    "duration": 54,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 75
+  },
+  {
+    "id": "evt_vl00000000000076",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00076",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000076.json",
+    "startTime": 1789819200380,
+    "duration": 55.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 76
+  },
+  {
+    "id": "evt_vl00000000000077",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00077",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000077.json",
+    "startTime": 1789819200385,
+    "duration": 57,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 77
+  },
+  {
+    "id": "evt_vl00000000000078",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00078",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000078.json",
+    "startTime": 1789819200390,
+    "duration": 58.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 78
+  },
+  {
+    "id": "evt_vl00000000000079",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00079",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000079.json",
+    "startTime": 1789819200395,
+    "duration": 60,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 79
+  },
+  {
+    "id": "evt_vl00000000000080",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00080",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000080.json",
+    "startTime": 1789819200400,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 80
+  },
+  {
+    "id": "evt_vl00000000000081",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00081",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000081.json",
+    "startTime": 1789819200405,
+    "duration": 3,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 81
+  },
+  {
+    "id": "evt_vl00000000000082",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00082",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000082.json",
+    "startTime": 1789819200410,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 82
+  },
+  {
+    "id": "evt_vl00000000000083",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00083",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000083.json",
+    "startTime": 1789819200415,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 83
+  },
+  {
+    "id": "evt_vl00000000000084",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00084",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000084.json",
+    "startTime": 1789819200420,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 84
+  },
+  {
+    "id": "evt_vl00000000000085",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00085",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000085.json",
+    "startTime": 1789819200425,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 85
+  },
+  {
+    "id": "evt_vl00000000000086",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00086",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000086.json",
+    "startTime": 1789819200430,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 86
+  },
+  {
+    "id": "evt_vl00000000000087",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00087",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000087.json",
+    "startTime": 1789819200435,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 87
+  },
+  {
+    "id": "evt_vl00000000000088",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00088",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000088.json",
+    "startTime": 1789819200440,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 88
+  },
+  {
+    "id": "evt_vl00000000000089",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00089",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000089.json",
+    "startTime": 1789819200445,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 89
+  },
+  {
+    "id": "evt_vl00000000000090",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00090",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000090.json",
+    "startTime": 1789819200450,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 90
+  },
+  {
+    "id": "evt_vl00000000000091",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00091",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000091.json",
+    "startTime": 1789819200455,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 91
+  },
+  {
+    "id": "evt_vl00000000000092",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00092",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000092.json",
+    "startTime": 1789819200460,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 92
+  },
+  {
+    "id": "evt_vl00000000000093",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00093",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000093.json",
+    "startTime": 1789819200465,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 93
+  },
+  {
+    "id": "evt_vl00000000000094",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00094",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000094.json",
+    "startTime": 1789819200470,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 94
+  },
+  {
+    "id": "evt_vl00000000000095",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00095",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000095.json",
+    "startTime": 1789819200475,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 95
+  },
+  {
+    "id": "evt_vl00000000000096",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00096",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000096.json",
+    "startTime": 1789819200480,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 96
+  },
+  {
+    "id": "evt_vl00000000000097",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00097",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000097.json",
+    "startTime": 1789819200485,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 97
+  },
+  {
+    "id": "evt_vl00000000000098",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00098",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000098.json",
+    "startTime": 1789819200490,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 98
+  },
+  {
+    "id": "evt_vl00000000000099",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00099",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000099.json",
+    "startTime": 1789819200495,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 99
+  },
+  {
+    "id": "evt_vl00000000000100",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00100",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000100.json",
+    "startTime": 1789819200500,
+    "duration": 31.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 100
+  },
+  {
+    "id": "evt_vl00000000000101",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00101",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000101.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 101
+  },
+  {
+    "id": "evt_vl00000000000102",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00102",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000102.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 102
+  },
+  {
+    "id": "evt_vl00000000000103",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00103",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000103.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 103
+  },
+  {
+    "id": "evt_vl00000000000104",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00104",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000104.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 104
+  },
+  {
+    "id": "evt_vl00000000000105",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00105",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000105.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 105
+  },
+  {
+    "id": "evt_vl00000000000106",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00106",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000106.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 106
+  },
+  {
+    "id": "evt_vl00000000000107",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00107",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000107.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 107
+  },
+  {
+    "id": "evt_vl00000000000108",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00108",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000108.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 108
+  },
+  {
+    "id": "evt_vl00000000000109",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00109",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000109.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 109
+  },
+  {
+    "id": "evt_vl00000000000110",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00110",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000110.json",
+    "startTime": 1789819200505,
+    "duration": 12.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 110
+  },
+  {
+    "id": "evt_vl00000000000111",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00111",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000111.json",
+    "startTime": 1789819200555,
+    "duration": 48,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 111
+  },
+  {
+    "id": "evt_vl00000000000112",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00112",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000112.json",
+    "startTime": 1789819200560,
+    "duration": 49.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 112
+  },
+  {
+    "id": "evt_vl00000000000113",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00113",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000113.json",
+    "startTime": 1789819200565,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 113
+  },
+  {
+    "id": "evt_vl00000000000114",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00114",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000114.json",
+    "startTime": 1789819200570,
+    "duration": 52.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 114
+  },
+  {
+    "id": "evt_vl00000000000115",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00115",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000115.json",
+    "startTime": 1789819200575,
+    "duration": 54,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 115
+  },
+  {
+    "id": "evt_vl00000000000116",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00116",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000116.json",
+    "startTime": 1789819200580,
+    "duration": 55.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 116
+  },
+  {
+    "id": "evt_vl00000000000117",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00117",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000117.json",
+    "startTime": 1789819200585,
+    "duration": 57,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 117
+  },
+  {
+    "id": "evt_vl00000000000118",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00118",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000118.json",
+    "startTime": 1789819200590,
+    "duration": 58.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 118
+  },
+  {
+    "id": "evt_vl00000000000119",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00119",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000119.json",
+    "startTime": 1789819200595,
+    "duration": 60,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 119
+  },
+  {
+    "id": "evt_vl00000000000120",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00120",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000120.json",
+    "startTime": 1789819200600,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 120
+  },
+  {
+    "id": "evt_vl00000000000121",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00121",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000121.json",
+    "startTime": 1789819200605,
+    "duration": 3,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 121
+  },
+  {
+    "id": "evt_vl00000000000122",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00122",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000122.json",
+    "startTime": 1789819200610,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 122
+  },
+  {
+    "id": "evt_vl00000000000123",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00123",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000123.json",
+    "startTime": 1789819200615,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 123
+  },
+  {
+    "id": "evt_vl00000000000124",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00124",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000124.json",
+    "startTime": 1789819200620,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 124
+  },
+  {
+    "id": "evt_vl00000000000125",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00125",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000125.json",
+    "startTime": 1789819200625,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 125
+  },
+  {
+    "id": "evt_vl00000000000126",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00126",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000126.json",
+    "startTime": 1789819200630,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 126
+  },
+  {
+    "id": "evt_vl00000000000127",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00127",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000127.json",
+    "startTime": 1789819200635,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 127
+  },
+  {
+    "id": "evt_vl00000000000128",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00128",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000128.json",
+    "startTime": 1789819200640,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 128
+  },
+  {
+    "id": "evt_vl00000000000129",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00129",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000129.json",
+    "startTime": 1789819200645,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 129
+  },
+  {
+    "id": "evt_vl00000000000130",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00130",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000130.json",
+    "startTime": 1789819200650,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 130
+  },
+  {
+    "id": "evt_vl00000000000131",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00131",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000131.json",
+    "startTime": 1789819200655,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 131
+  },
+  {
+    "id": "evt_vl00000000000132",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00132",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000132.json",
+    "startTime": 1789819200660,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 132
+  },
+  {
+    "id": "evt_vl00000000000133",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00133",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000133.json",
+    "startTime": 1789819200665,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 133
+  },
+  {
+    "id": "evt_vl00000000000134",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00134",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000134.json",
+    "startTime": 1789819200670,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 134
+  },
+  {
+    "id": "evt_vl00000000000135",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00135",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000135.json",
+    "startTime": 1789819200675,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 135
+  },
+  {
+    "id": "evt_vl00000000000136",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00136",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000136.json",
+    "startTime": 1789819200680,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 136
+  },
+  {
+    "id": "evt_vl00000000000137",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00137",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000137.json",
+    "startTime": 1789819200685,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 137
+  },
+  {
+    "id": "evt_vl00000000000138",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00138",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000138.json",
+    "startTime": 1789819200690,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 138
+  },
+  {
+    "id": "evt_vl00000000000139",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00139",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000139.json",
+    "startTime": 1789819200695,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 139
+  },
+  {
+    "id": "evt_vl00000000000140",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00140",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000140.json",
+    "startTime": 1789819200700,
+    "duration": 31.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 140
+  },
+  {
+    "id": "evt_vl00000000000141",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00141",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000141.json",
+    "startTime": 1789819200705,
+    "duration": 33,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 141
+  },
+  {
+    "id": "evt_vl00000000000142",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00142",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000142.json",
+    "startTime": 1789819200710,
+    "duration": 34.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 142
+  },
+  {
+    "id": "evt_vl00000000000143",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00143",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000143.json",
+    "startTime": 1789819200715,
+    "duration": 36,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 143
+  },
+  {
+    "id": "evt_vl00000000000144",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00144",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000144.json",
+    "startTime": 1789819200720,
+    "duration": 37.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 144
+  },
+  {
+    "id": "evt_vl00000000000145",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00145",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000145.json",
+    "startTime": 1789819200725,
+    "duration": 39,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 145
+  },
+  {
+    "id": "evt_vl00000000000146",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00146",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000146.json",
+    "startTime": 1789819200730,
+    "duration": 40.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 146
+  },
+  {
+    "id": "evt_vl00000000000147",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00147",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000147.json",
+    "startTime": 1789819200735,
+    "duration": 42,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 147
+  },
+  {
+    "id": "evt_vl00000000000148",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00148",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000148.json",
+    "startTime": 1789819200740,
+    "duration": 43.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 148
+  },
+  {
+    "id": "evt_vl00000000000149",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00149",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000149.json",
+    "startTime": 1789819200745,
+    "duration": 45,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 149
+  },
+  {
+    "id": "evt_vl00000000000150",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00150",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000150.json",
+    "startTime": 1789819200750,
+    "duration": 46.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 150
+  },
+  {
+    "id": "evt_vl00000000000151",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00151",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000151.json",
+    "startTime": 1789819200755,
+    "duration": 48,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 151
+  },
+  {
+    "id": "evt_vl00000000000152",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00152",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000152.json",
+    "startTime": 1789819200760,
+    "duration": 49.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 152
+  },
+  {
+    "id": "evt_vl00000000000153",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00153",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000153.json",
+    "startTime": 1789819200765,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 153
+  },
+  {
+    "id": "evt_vl00000000000154",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00154",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000154.json",
+    "startTime": 1789819200770,
+    "duration": 52.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 154
+  },
+  {
+    "id": "evt_vl00000000000155",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00155",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000155.json",
+    "startTime": 1789819200775,
+    "duration": 54,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 155
+  },
+  {
+    "id": "evt_vl00000000000156",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00156",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000156.json",
+    "startTime": 1789819200780,
+    "duration": 55.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 156
+  },
+  {
+    "id": "evt_vl00000000000157",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00157",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000157.json",
+    "startTime": 1789819200785,
+    "duration": 57,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 157
+  },
+  {
+    "id": "evt_vl00000000000158",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00158",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000158.json",
+    "startTime": 1789819200790,
+    "duration": 58.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 158
+  },
+  {
+    "id": "evt_vl00000000000159",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00159",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000159.json",
+    "startTime": 1789819200795,
+    "duration": 60,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 159
+  },
+  {
+    "id": "evt_vl00000000000160",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00160",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000160.json",
+    "startTime": 1789819200800,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 160
+  },
+  {
+    "id": "evt_vl00000000000161",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00161",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000161.json",
+    "startTime": 1789819200805,
+    "duration": 3,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 161
+  },
+  {
+    "id": "evt_vl00000000000162",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00162",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000162.json",
+    "startTime": 1789819200810,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 162
+  },
+  {
+    "id": "evt_vl00000000000163",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00163",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000163.json",
+    "startTime": 1789819200815,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 163
+  },
+  {
+    "id": "evt_vl00000000000164",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00164",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000164.json",
+    "startTime": 1789819200820,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 164
+  },
+  {
+    "id": "evt_vl00000000000165",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00165",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000165.json",
+    "startTime": 1789819200825,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 165
+  },
+  {
+    "id": "evt_vl00000000000166",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00166",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000166.json",
+    "startTime": 1789819200830,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 166
+  },
+  {
+    "id": "evt_vl00000000000167",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00167",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000167.json",
+    "startTime": 1789819200835,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 167
+  },
+  {
+    "id": "evt_vl00000000000168",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00168",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000168.json",
+    "startTime": 1789819200840,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 168
+  },
+  {
+    "id": "evt_vl00000000000169",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00169",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000169.json",
+    "startTime": 1789819200845,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 169
+  },
+  {
+    "id": "evt_vl00000000000170",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00170",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000170.json",
+    "startTime": 1789819200850,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 170
+  },
+  {
+    "id": "evt_vl00000000000171",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00171",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000171.json",
+    "startTime": 1789819200855,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 171
+  },
+  {
+    "id": "evt_vl00000000000172",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00172",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000172.json",
+    "startTime": 1789819200860,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 172
+  },
+  {
+    "id": "evt_vl00000000000173",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00173",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000173.json",
+    "startTime": 1789819200865,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 173
+  },
+  {
+    "id": "evt_vl00000000000174",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00174",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000174.json",
+    "startTime": 1789819200870,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 174
+  },
+  {
+    "id": "evt_vl00000000000175",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00175",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000175.json",
+    "startTime": 1789819200875,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 175
+  },
+  {
+    "id": "evt_vl00000000000176",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00176",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000176.json",
+    "startTime": 1789819200880,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 176
+  },
+  {
+    "id": "evt_vl00000000000177",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00177",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000177.json",
+    "startTime": 1789819200885,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 177
+  },
+  {
+    "id": "evt_vl00000000000178",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00178",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000178.json",
+    "startTime": 1789819200890,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 178
+  },
+  {
+    "id": "evt_vl00000000000179",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00179",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000179.json",
+    "startTime": 1789819200895,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 179
+  },
+  {
+    "id": "evt_vl00000000000180",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00180",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000180.json",
+    "startTime": 1789819200900,
+    "duration": 31.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 180
+  },
+  {
+    "id": "evt_vl00000000000181",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00181",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000181.json",
+    "startTime": 1789819200905,
+    "duration": 33,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 181
+  },
+  {
+    "id": "evt_vl00000000000182",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00182",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000182.json",
+    "startTime": 1789819200910,
+    "duration": 34.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 182
+  },
+  {
+    "id": "evt_vl00000000000183",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00183",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000183.json",
+    "startTime": 1789819200915,
+    "duration": 36,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 183
+  },
+  {
+    "id": "evt_vl00000000000184",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00184",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000184.json",
+    "startTime": 1789819200920,
+    "duration": 37.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 184
+  },
+  {
+    "id": "evt_vl00000000000185",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00185",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000185.json",
+    "startTime": 1789819200925,
+    "duration": 39,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 185
+  },
+  {
+    "id": "evt_vl00000000000186",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00186",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000186.json",
+    "startTime": 1789819200930,
+    "duration": 40.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 186
+  },
+  {
+    "id": "evt_vl00000000000187",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00187",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000187.json",
+    "startTime": 1789819200935,
+    "duration": 42,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 187
+  },
+  {
+    "id": "evt_vl00000000000188",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00188",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000188.json",
+    "startTime": 1789819200940,
+    "duration": 43.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 188
+  },
+  {
+    "id": "evt_vl00000000000189",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00189",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000189.json",
+    "startTime": 1789819200945,
+    "duration": 45,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 189
+  },
+  {
+    "id": "evt_vl00000000000190",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00190",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000190.json",
+    "startTime": 1789819200950,
+    "duration": 46.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 190
+  },
+  {
+    "id": "evt_vl00000000000191",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00191",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000191.json",
+    "startTime": 1789819200955,
+    "duration": 48,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 191
+  },
+  {
+    "id": "evt_vl00000000000192",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00192",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000192.json",
+    "startTime": 1789819200960,
+    "duration": 49.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 192
+  },
+  {
+    "id": "evt_vl00000000000193",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00193",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000193.json",
+    "startTime": 1789819200965,
+    "duration": 51,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 193
+  },
+  {
+    "id": "evt_vl00000000000194",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00194",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000194.json",
+    "startTime": 1789819200970,
+    "duration": 52.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 194
+  },
+  {
+    "id": "evt_vl00000000000195",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00195",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000195.json",
+    "startTime": 1789819200975,
+    "duration": 54,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 195
+  },
+  {
+    "id": "evt_vl00000000000196",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00196",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000196.json",
+    "startTime": 1789819200980,
+    "duration": 55.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 196
+  },
+  {
+    "id": "evt_vl00000000000197",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00197",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000197.json",
+    "startTime": 1789819200985,
+    "duration": 57,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 197
+  },
+  {
+    "id": "evt_vl00000000000198",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00198",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000198.json",
+    "startTime": 1789819200990,
+    "duration": 58.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 198
+  },
+  {
+    "id": "evt_vl00000000000199",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00199",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000199.json",
+    "startTime": 1789819200995,
+    "duration": 60,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 199
+  },
+  {
+    "id": "evt_vl00000000000200",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00200",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000200.json",
+    "startTime": 1789819201000,
+    "duration": 1.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 200
+  },
+  {
+    "id": "evt_vl00000000000201",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00201",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000201.json",
+    "startTime": 1789819201005,
+    "duration": 3,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 201
+  },
+  {
+    "id": "evt_vl00000000000202",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00202",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000202.json",
+    "startTime": 1789819201010,
+    "duration": 4.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 202
+  },
+  {
+    "id": "evt_vl00000000000203",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00203",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000203.json",
+    "startTime": 1789819201015,
+    "duration": 6,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 203
+  },
+  {
+    "id": "evt_vl00000000000204",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00204",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000204.json",
+    "startTime": 1789819201020,
+    "duration": 7.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 204
+  },
+  {
+    "id": "evt_vl00000000000205",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00205",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000205.json",
+    "startTime": 1789819201025,
+    "duration": 9,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 205
+  },
+  {
+    "id": "evt_vl00000000000206",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00206",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000206.json",
+    "startTime": 1789819201030,
+    "duration": 10.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 206
+  },
+  {
+    "id": "evt_vl00000000000207",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00207",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000207.json",
+    "startTime": 1789819201035,
+    "duration": 12,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 207
+  },
+  {
+    "id": "evt_vl00000000000208",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00208",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000208.json",
+    "startTime": 1789819201040,
+    "duration": 13.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 208
+  },
+  {
+    "id": "evt_vl00000000000209",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00209",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000209.json",
+    "startTime": 1789819201045,
+    "duration": 15,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 209
+  },
+  {
+    "id": "evt_vl00000000000210",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00210",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000210.json",
+    "startTime": 1789819201050,
+    "duration": 16.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 210
+  },
+  {
+    "id": "evt_vl00000000000211",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00211",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000211.json",
+    "startTime": 1789819201055,
+    "duration": 18,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 211
+  },
+  {
+    "id": "evt_vl00000000000212",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00212",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000212.json",
+    "startTime": 1789819201060,
+    "duration": 19.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 212
+  },
+  {
+    "id": "evt_vl00000000000213",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00213",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000213.json",
+    "startTime": 1789819201065,
+    "duration": 21,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 213
+  },
+  {
+    "id": "evt_vl00000000000214",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00214",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000214.json",
+    "startTime": 1789819201070,
+    "duration": 22.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 214
+  },
+  {
+    "id": "evt_vl00000000000215",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00215",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000215.json",
+    "startTime": 1789819201075,
+    "duration": 24,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 215
+  },
+  {
+    "id": "evt_vl00000000000216",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00216",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000216.json",
+    "startTime": 1789819201080,
+    "duration": 25.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 216
+  },
+  {
+    "id": "evt_vl00000000000217",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00217",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000217.json",
+    "startTime": 1789819201085,
+    "duration": 27,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 217
+  },
+  {
+    "id": "evt_vl00000000000218",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00218",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000218.json",
+    "startTime": 1789819201090,
+    "duration": 28.5,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 218
+  },
+  {
+    "id": "evt_vl00000000000219",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00219",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000219.json",
+    "startTime": 1789819201095,
+    "duration": 30,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 219
+  },
+  {
+    "id": "evt_vl00000000000220",
+    "traceId": "4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a",
+    "spanId": "0000000000e00220",
+    "parentSpanId": "0000000000e00001",
+    "kind": "perf.entry",
+    "name": "resource /static/tiles/000220.json",
+    "startTime": 1789819201100,
+    "duration": 98.75,
+    "tier": "browser",
+    "attributes": {
+      "entry.type": "resource"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000005",
+    "seq": 220
+  }
+]

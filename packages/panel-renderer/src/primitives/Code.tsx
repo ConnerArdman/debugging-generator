@@ -1,0 +1,356 @@
+/**
+ * @debuggen/panel-renderer - the monospace primitive.
+ *
+ * One component for every fragment of machine-authored text this product puts on a screen: a
+ * symbol name, a project-relative file path, a parameterized database statement, a request
+ * target, a stack frame, a captured attribute preview. It is used by the visualization
+ * components, by the source-location chip, by the empty/loading/error states and by the editor
+ * webview, so the whole product renders such text at one size, in one font and with one set of
+ * overflow rules.
+ *
+ * TIER 1 ATOM
+ * It imports nothing from `../layout`, `../components` or `../host`, and no workspace package; from
+ * this folder it imports only the untrusted-text helper (`./untrusted-text`), a pure function over
+ * strings rather than a component. React's types, `clsx` and that helper are its entire dependency
+ * surface. That is what lets every other primitive and every component above them use it without
+ * a cycle, and it is why this file has no notion of a panel, a query, a transport or a session.
+ *
+ * INLINE VERSUS BLOCK
+ * The default form is a single `<code>`: a phrase-level element that flows inside a sentence, a
+ * table cell or a chip, with no wrapper of its own. `block` renders `<pre><code>` instead - the
+ * `<pre>` establishes the preformatted box that scrolls or wraps, the `<code>` keeps the "this is
+ * code" semantic inside it. Both mark the same thing; only the box differs, which is exactly the
+ * distinction HTML draws between the two elements. Nothing else changes: no border, no header, no
+ * copy affordance, no line numbers.
+ *
+ * IT MUST NOT TRANSFORM WHAT IT IS GIVEN
+ * `children` is rendered straight through, with one sanctioned exception described below. No
+ * trimming, no whitespace collapsing, no re-quoting, no re-indenting, no case folding, no
+ * ellipsis, no line numbering and no syntax highlighting - this package deliberately carries no
+ * highlighting dependency, because a tokenizer that mis-lexes captured text would be
+ * indistinguishable, on screen, from data that really looked that way. Whitespace and newlines
+ * survive byte-for-byte; the block form's `white-space` handling is a stylesheet concern, not a
+ * string concern. A caller that needs a shortened value shortens it before passing it in and says
+ * so with a `title`.
+ *
+ * THE ONE EXCEPTION: DIRECTION CONTROLS ARE SHOWN, NOT OBEYED
+ * The same argument that forbids highlighting demands this. The twelve Unicode bidirectional
+ * formatting controls (U+202E RIGHT-TO-LEFT OVERRIDE and its siblings) are invisible and reorder
+ * the glyphs after them, so a statement, a path or a span name that carries one would be drawn as
+ * a sequence the capture never contained - `</td><script>` read backwards - while its
+ * `textContent` still held the truth (the "Trojan Source" class, CVE-2021-42574). Every string
+ * child, and a string `title` or `aria-label`, is therefore rendered through
+ * `formatUntrustedNode`/`formatUntrustedText` from `./untrusted-text`, which print each control as
+ * its visible escape (`\u202E`) and change no other character. That is not a transformation of
+ * meaning: it is the guarantee that the glyphs on screen are the characters captured, in the
+ * order captured. The native tooltip and the accessible name use the same definition, so they
+ * match the visible text (WCAG 2.5.3).
+ *
+ * Both forms also carry a default `dir="ltr"`, placed before the rest props so a caller can
+ * still pass its own. Machine text - SQL, a path, a URL, a span name - is left-to-right whatever
+ * the surrounding interface, and an element with a `dir` attribute is bidi-isolated by the HTML
+ * user-agent stylesheet (`[dir] { unicode-bidi: isolate }`), so right-to-left letters inside the
+ * value cannot reorder the punctuation around them, and nothing inside the value can reorder the
+ * text around the element. It is an HTML attribute, not a style: no CSS value is set here.
+ *
+ * PRIVACY: THIS IS THE END OF THE PIPELINE, NOT A STAGE IN IT (see docs/SECURITY.md)
+ * Everything reaching this component has already been redacted and truncated upstream - once in
+ * the telemetry layer's redaction pass before any event is persisted or broadcast, and again by
+ * the model provider's outbound guard. So this component performs NO redaction, and equally it
+ * must never undo any: it does not parse, re-expand, decode, re-serialise or "restore" its
+ * children, it does not log them, and it has no way to send them anywhere. Anyone tempted to add
+ * a helpful transformation here is looking at the wrong layer; redaction rules belong in the
+ * telemetry package, and shortening belongs to the caller.
+ *
+ * APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE
+ * This file declares the class names and `src/styles/components.css` implements them, resolving
+ * every visual value to a `--dg-*` token. Nothing here sets a colour, a length, a font or an
+ * inline style, and there is no literal CSS value in this file at all:
+ *
+ *   `dg-code`             the base, on both forms - the chip and tabular figures
+ *   `dg-code--block`      the preformatted box (block form only)
+ *   `dg-code--md`         the `--dg-mono-md` type role - 12/16
+ *   `dg-code--sm`         the `--dg-mono-sm` type role - 11/16
+ *   `dg-code--numeric`    marks numeric content; rendering is identical to the base
+ *   `dg-code--wrap`       wrap long content instead of scrolling it
+ *
+ * The two type roles are the only monospace sizes the design system has; both are complete `font`
+ * shorthands over `--dg-font-mono`, and because that shorthand resets `font-variant`, the
+ * stylesheet declares `font-variant-numeric` after it rather than before. Tabular figures are the
+ * default for every Code, because the design system pairs `--dg-font-mono` with `tabular-nums` for
+ * code, SQL, paths and numeric columns: the stylesheet restores them on `dg-code` after every size
+ * class, so digits line up in a column whatever the size. `dg-code--numeric` adds nothing visual
+ * on top of that default: the `numeric` prop emits it for API stability and to mark content whose
+ * digits are the point.
+ *
+ * ACCESSIBILITY
+ * The block form carries `tabIndex={0}`: a box that can scroll horizontally has to be reachable
+ * and scrollable with the keyboard alone (WCAG 2.1.1), and a `<pre>` is not focusable by default.
+ * The inline form gets no `tabIndex` - it never scrolls, and a focus stop on every identifier in
+ * a dense table would bury the real controls. No `role` is set either: `<code>` and `<pre>` carry
+ * their own semantics, and `role="code"` would only restate one of them. An accessible name is
+ * the caller's decision, passed as `aria-label`/`aria-labelledby` through the rest props; this
+ * component never invents one, because a generic name is worse than the element's own text.
+ *
+ * RENDER BEHAVIOUR
+ * A plain function component: no `memo`, no state, no effects, no context and nothing read from
+ * the document while rendering, so it is safe to render thousands of times inside a virtualized
+ * log or table and its output depends on its props alone.
+ */
+
+import clsx from 'clsx';
+
+import type { HTMLAttributes, ReactElement, ReactNode, Ref, RefCallback, RefObject } from 'react';
+
+import { formatUntrustedNode, formatUntrustedText } from './untrusted-text';
+
+/**
+ * The two monospace type roles of the design system, and deliberately the only two:
+ * `md` resolves to `--dg-mono-md` and `sm` to `--dg-mono-sm`. There is no third monospace role to
+ * select, so a caller that wants something denser or larger is asking for a token that does not
+ * exist rather than for a prop value.
+ */
+export type CodeSize = 'md' | 'sm';
+
+/**
+ * Size to class name.
+ *
+ * A `Record` over the finite union rather than a name built by interpolation: interpolation would
+ * accept any string at the type level, would hide a typo until the text rendered unstyled in a
+ * browser, and would make the class names this file declares invisible to a grep of the
+ * stylesheet. Being a total `Record` over `CodeSize` also means the lookup below yields `string`
+ * under `noUncheckedIndexedAccess`, so it needs no fallback and no non-null assertion, and adding
+ * a role to `CodeSize` is a compile error here until it is mapped.
+ */
+const SIZE_CLASS: Readonly<Record<CodeSize, string>> = {
+  md: 'dg-code--md',
+  sm: 'dg-code--sm',
+};
+
+/**
+ * Bridged ref callbacks for the block form, keyed by the caller's own ref object.
+ *
+ * Why a bridge is needed at all: the public `ref` prop is typed for `HTMLElement`, because that is
+ * the common supertype of the two elements this component can be, but the block form's root is a
+ * `<pre>`. React's `RefObject` holds a mutable `current`, which makes it invariant, so a
+ * `RefObject<HTMLElement | null>` cannot be handed to a `<pre>` - the compiler rejects it, and it
+ * is right to: the object's owner would be promised an element type it never receives. A ref
+ * *callback* has no such problem (it only ever receives an element), so an object ref is adapted
+ * into a callback that writes through to it. The caller's own `current` still ends up holding the
+ * real `<pre>`.
+ *
+ * Why the cache: React re-attaches a ref whose identity changed, detaching the old one first. A
+ * bridge built fresh on every render would therefore write `null` and then the node into the
+ * caller's ref on every single render. Caching one bridge per ref object keeps the identity stable
+ * for as long as the caller's ref is stable, which is what a ref passed straight through would
+ * have done. A `WeakMap` holds the caller's object weakly, so an unmounted consumer's ref is
+ * collectable and this module retains nothing.
+ *
+ * Callback refs need none of this and are passed through untouched, identity included.
+ */
+const BLOCK_REF_BRIDGES = new WeakMap<RefObject<HTMLElement | null>, RefCallback<HTMLPreElement>>();
+
+/**
+ * Adapts a caller's element ref for the block form's `<pre>`.
+ *
+ * @param ref The `ref` prop as given: absent, explicitly `null`, a callback or an object ref.
+ * @returns The value to put on the `<pre>`; `undefined` when no ref was supplied.
+ */
+function blockRef(ref: Ref<HTMLElement> | undefined): Ref<HTMLPreElement> | undefined {
+  // `null` is a legitimate ref value and means "no ref", exactly as `undefined` does here, and a
+  // callback ref is already usable as-is because a callback is only ever handed an element.
+  if (ref === undefined || ref === null || typeof ref === 'function') {
+    return ref;
+  }
+
+  const cached = BLOCK_REF_BRIDGES.get(ref);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const bridge: RefCallback<HTMLPreElement> = (node) => {
+    ref.current = node;
+  };
+  BLOCK_REF_BRIDGES.set(ref, bridge);
+  return bridge;
+}
+
+/**
+ * The monospace primitive's inputs.
+ *
+ * Extending `HTMLAttributes<HTMLElement>` is what makes the rest-prop passthrough below a typed
+ * contract rather than an escape hatch: callers routinely need `title` (the full value behind a
+ * visually shortened one), `id` (so a heading elsewhere can label this text), `aria-label` /
+ * `aria-describedby`, `data-*` hooks for tests, and `onClick` on an inline fragment that sits
+ * inside a larger control. All of those arrive checked, and none of them needs a prop of its own
+ * here.
+ *
+ * Every optional property states `| undefined` explicitly. `exactOptionalPropertyTypes` is on
+ * repository-wide, which distinguishes an absent property from one present and `undefined`, so
+ * without it a caller could not forward a value it computed as possibly-undefined - the common
+ * case, since these flags are usually derived from the data being rendered.
+ */
+export interface CodeProps extends HTMLAttributes<HTMLElement> {
+  /**
+   * Renders the preformatted box form, `<pre><code>`, instead of a bare inline `<code>`. Use it
+   * for content that owns a line or more of its own - a multi-line statement, a stack, the text
+   * behind a failed request - and leave it off for a fragment that belongs inside running text, a
+   * chip or a table cell.
+   *
+   * The block form is focusable so that it can be scrolled from the keyboard; see the file note
+   * on accessibility.
+   *
+   * @default false
+   */
+  block?: boolean | undefined;
+
+  /**
+   * Which monospace type role to apply: `md` for text read on its own or beside body copy, `sm`
+   * for a dense row where the surrounding interface text is already at its smallest. `md`
+   * resolves to `--dg-mono-md` (12/16) and `sm` to `--dg-mono-sm` (11/16); those are the design
+   * system's only two monospace roles.
+   *
+   * @default 'md'
+   */
+  size?: CodeSize | undefined;
+
+  /**
+   * Marks the content as numeric - a count, a duration, a size, an identifier made of digits - by
+   * adding `dg-code--numeric`.
+   *
+   * It does not change the rendering: every Code renders tabular figures, so digits occupy
+   * identical widths and a column of numbers aligns on the decimal point rather than drifting (the
+   * design system pairs the monospace family with `tabular-nums`). The prop exists for API
+   * stability and so numeric content stays identifiable in the DOM.
+   *
+   * @default false
+   */
+  numeric?: boolean | undefined;
+
+  /**
+   * Wraps content that is wider than the box instead of letting it scroll horizontally. Long
+   * statements and long request targets are routinely wider than the cell that holds them, and a
+   * horizontal scrollbar inside a table row is worse than a taller row - so a cell that shows
+   * such a value sets this, while a block the reader is expected to scan line by line does not.
+   *
+   * It carries the most weight on the block form, which is the form that scrolls: there the
+   * variant is what turns a scrolling box into a growing one. On the inline form the base layer
+   * already breaks an over-long unbroken value rather than let a panel grow a horizontal
+   * scrollbar, so the variant is asking for the preformatted wrapping behaviour - internal
+   * whitespace runs kept while lines still break - rather than rescuing the layout.
+   *
+   * @default false
+   */
+  wrap?: boolean | undefined;
+
+  /**
+   * The text to render, rendered exactly as given except that every direction control in a string
+   * is printed as its visible escape. Redeclared from the inherited attributes only to carry that
+   * guarantee: whitespace, indentation and newlines are preserved byte-for-byte and nothing here
+   * reformats, highlights or shortens them (see the file notes on transformation, direction
+   * controls and privacy). A node rather than a string so a caller may emphasise a fragment of it -
+   * never so it can nest an interactive control.
+   */
+  children?: ReactNode;
+
+  /**
+   * The rendered element: the `<code>` in the inline form, the `<pre>` in the block form - the
+   * component's own root in both cases. React 19 takes `ref` as an ordinary prop, so this
+   * component needs no `forwardRef` wrapper.
+   *
+   * Typed for `HTMLElement`, the supertype of both, which is also all a consumer can rely on
+   * without knowing which form it asked for. A measuring or scrolling consumer that needs the
+   * `<pre>` specifically already knows it passed `block`.
+   */
+  ref?: Ref<HTMLElement> | undefined;
+}
+
+/**
+ * Renders monospace text.
+ *
+ * @param props See {@link CodeProps}.
+ * @returns A `<code>`, or a `<pre><code>` when `block` is set; the root carries `dir="ltr"`
+ *   unless the caller passes its own `dir`.
+ *
+ * @example
+ * // An identifier inside running text, and a dense numeric cell.
+ * <Code>{event.name}</Code>
+ * <Code size="sm" numeric>{formatDuration(event.duration)}</Code>
+ *
+ * @example
+ * // A long value in a narrow cell wraps rather than scrolling; the untruncated value is the
+ * // element's own tooltip.
+ * <Code wrap title={value}>{value}</Code>
+ *
+ * @example
+ * // A multi-line block, named by a heading that lives outside it.
+ * <Code block aria-labelledby={headingId}>{text}</Code>
+ */
+export function Code(props: CodeProps): ReactElement {
+  const {
+    block = false,
+    size = 'md',
+    numeric = false,
+    wrap = false,
+    children,
+    className,
+    title,
+    'aria-label': label,
+    ref,
+    ...rest
+  } = props;
+
+  const sizeClass = SIZE_CLASS[size];
+
+  // What a reader sees, hovers or hears is revealed; everything else in `rest` reaches the element
+  // untouched (see the file note on direction controls). An absent attribute stays absent.
+  const shown = formatUntrustedNode(children);
+  const hint = title === undefined ? title : formatUntrustedText(title);
+  const spoken = label === undefined ? label : formatUntrustedText(label);
+
+  if (block) {
+    return (
+      // `tabIndex` and `dir` are placed before the rest props on purpose: the focusable default is
+      // what a scrollable box needs and the left-to-right isolate is what machine text needs, and a
+      // caller that has a reason to change either - a block inside a composite widget that manages
+      // its own focus order, a value known to be right-to-left prose - can still pass its own.
+      <pre
+        className={clsx(
+          'dg-code',
+          'dg-code--block',
+          sizeClass,
+          numeric && 'dg-code--numeric',
+          wrap && 'dg-code--wrap',
+          className,
+        )}
+        tabIndex={0}
+        dir="ltr"
+        title={hint}
+        aria-label={spoken}
+        ref={blockRef(ref)}
+        {...rest}
+      >
+        <code>{shown}</code>
+      </pre>
+    );
+  }
+
+  return (
+    <code
+      className={clsx(
+        'dg-code',
+        sizeClass,
+        numeric && 'dg-code--numeric',
+        wrap && 'dg-code--wrap',
+        className,
+      )}
+      dir="ltr"
+      title={hint}
+      aria-label={spoken}
+      ref={ref}
+      {...rest}
+    >
+      {shown}
+    </code>
+  );
+}

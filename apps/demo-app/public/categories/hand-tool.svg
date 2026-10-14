@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
+  <!-- Open-end spanner category glyph, used as a CSS mask by the category glyph component, so its
+       alpha is the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px.
+       Viewed on its own, currentColor resolves to the slate root colour. -->
+  <path d="M5.14 18.86 L13.6 10.4" />
+  <path d="M20.41 6.7 L19.49 7.62 A3.4 3.4 0 1 1 16.38 4.51 L17.3 3.59" />
+</svg>

@@ -1,0 +1,185 @@
+/*
+ * CartTotalsPanel - the cart's derived-totals block (items, merchandise subtotal, one line per
+ * charge the placing surface passes, the emphasised closing figure and the dispatch/delivery
+ * line).
+ *
+ * Scope, and deliberately nothing more
+ * ---------------------------------------------------------------------------------------------
+ * `CartTotalsPanel.tsx` renders this block *inside* `../ui/Card`, which is itself rendered in the
+ * cart drawer's footer row or on the `/cart` page. That places three owners around this file, and
+ * none of their properties are restated here:
+ *
+ *   - `../ui/Card.module.css` owns the surface: background, border, radius, elevation and the
+ *     outer padding rhythm (`data-pad`). This file sets no background, no border except the
+ *     total's separating hairline, no radius, no shadow and no outer padding.
+ *   - `../ui/Price.module.css` owns money typography: the mono family, weight and no-wrap
+ *     behaviour. Money always arrives through the `Price` primitive, so no `font-family` is
+ *     declared anywhere below - setting one here would fight that primitive for every figure.
+ *   - `CartDrawer.module.css` owns the slide-over: the overlay, its stacking tier and the single
+ *     scrolling region. This file therefore declares no `position`, no `z-index` and no
+ *     `overflow`, so it can never turn into a second scroll container inside the drawer.
+ *
+ * Token contract
+ * ---------------------------------------------------------------------------------------------
+ * Every colour, spacing step and type size resolves to an `--ls-*` custom property declared by
+ * `app/globals.css`, written as `var(--ls-NAME, <literal fallback>)` so the block also renders
+ * sensibly on its own. Fallback hexes are lowercase and type-size fallbacks are the pixel
+ * equivalents of the rem values in that file, which is the convention it documents; Prettier
+ * normalises CSS colours to lowercase and `prettier --check` is a blocking gate, so do not
+ * "restore" an uppercase spelling. The two dimensions the token scale does not model - the
+ * row rhythm that changes per variant and the value column's minimum width - are file-local
+ * custom properties built with `calc()` over the spacing scale, never bare pixel values.
+ *
+ * Stability over motion
+ * ---------------------------------------------------------------------------------------------
+ * Every figure in this panel is a number a shopper is checking rather than watching, and each one
+ * can change as the cart does - a subtotal, a shipping estimate, a dispatch countdown. That makes
+ * two rules absolute here:
+ *
+ *   1. No `transition` and no `animation`, on any property. A figure that changes while a
+ *      transition on colour or width is still running blends two amounts on screen and reads as
+ *      a flicker rather than as an update, so this file introduces no motion at all - and
+ *      consequently needs no reduced-motion override of its own (the baseline in
+ *      `app/globals.css` covers anything that is not declared here).
+ *      Anything added later that *does* animate must be paired with
+ *      `@media (prefers-reduced-motion: reduce)` in this file.
+ *   2. `font-variant-numeric: tabular-nums` on every cell that can hold a number, so a subtotal
+ *      gaining a digit or a countdown ticking down cannot change an advance width and reflow the
+ *      line beside it.
+ *
+ * Variants come from `data-variant` on the root (`drawer` | `page`), which the component sets.
+ * There is deliberately no second class name for a variant: one element, one class, one attribute.
+ *
+ * Which row is the closing row is the component's decision, not this file's
+ * ---------------------------------------------------------------------------------------------
+ * `.total` is the closing treatment and nothing else - a hairline, a weight and a size step - and
+ * the component puts it on whichever row closes the block: the merchandise subtotal where a
+ * surface passed no charges, the summed row where it passed some. So there is no `.subtotal` and
+ * no `.orderTotal` here; a second class for each arrangement would be two places to keep one
+ * hierarchy in step. The two classes the charge rows add - `.chargeDetail` for a quiet
+ * qualification beside a label, `.chargePending` for wording where an amount is not established -
+ * are quiet registers of the row they sit in and declare no geometry, because the row's grid
+ * already owns both columns.
+ */
+
+.root {
+  /* Row rhythm. Declared as a custom property rather than inlined so `.rows` inherits whatever
+   * the active variant chose and the two can never disagree. */
+  --totals-gap: var(--ls-space-2, 8px);
+
+  /* The value column's floor: two spacing steps of the largest size, so a short value ("Free")
+   * still occupies a readable column and the figures keep a common right edge across rows. */
+  --totals-value-min: calc(var(--ls-space-6, 32px) * 2);
+
+  display: grid;
+  /* A long product-count or delivery sentence wraps instead of widening the card's track. */
+  min-width: 0;
+  gap: var(--totals-gap);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The run of label/value lines. It repeats the root's rhythm so the rows sit closer together
+ * than the blocks around them do when a variant tightens the gap. */
+.rows {
+  display: grid;
+  min-width: 0;
+  gap: var(--totals-gap, var(--ls-space-2, 8px));
+}
+
+/* One line: label on the left, value hugging the right. `baseline` keeps a `Price` figure sitting
+ * on the same line as its label even when the two use different type sizes. */
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+}
+
+.rowLabel {
+  /* Lets a long label wrap inside the `1fr` track instead of pushing the value out of the card. */
+  min-width: 0;
+  color: var(--ls-text-muted, #475569);
+}
+
+.rowValue {
+  justify-self: end;
+  min-width: var(--totals-value-min, calc(var(--ls-space-6, 32px) * 2));
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A charge's quiet qualification beside its label - the chosen service on a freight row. One step
+ * down from the label it follows and in the same muted colour, so it reads as a note about that
+ * row rather than as a second row; it inherits the label's wrapping, because the `1fr` track is
+ * what both of them share. Tabular figures because a service name can carry a number. */
+.chargeDetail {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Wording in a charge's value column where the amount is not established yet. It sits where a
+ * figure would, so it takes the muted colour and the small step to read as a note rather than as
+ * an amount, and it keeps `tabular-nums` for the row it shares a column with. `text-wrap: balance`
+ * is deliberately absent: the column is narrow and the phrase is short, and a balanced break would
+ * shift the line as the cart's figures change beside it. */
+.chargePending {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The emphasised closing line. Weight, size and the hairline above it carry the emphasis; the
+ * hairline's width is a structural 1px rather than a spacing step, which is how every module in
+ * this workspace draws a separator. */
+.total {
+  border-top: 1px solid var(--ls-border, #cbd5e1);
+  padding-top: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 15px);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The label of the closing line takes the row's own colour instead of the muted one every other
+ * label uses. Without this, `.rowLabel` re-declares colour on the child at the same specificity
+ * as `.total` and the label paints bold grey next to a bold near-black figure - the row would pick
+ * up two of the three emphasis channels (weight, size) and drop the third. */
+.total .rowLabel {
+  color: inherit;
+}
+
+/* Small print: the dispatch/estimated-delivery line and the optional note (a unit-count echo, for
+ * instance) read as one quiet register. The dispatch line holds the value that changes most often,
+ * which is why both carry tabular figures and a fixed line height. */
+.dispatch,
+.note {
+  min-width: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+
+/* Variants
+ * ---------------------------------------------------------------------------------------------
+ * `drawer` is the default the component applies: the footer of a slide-over is short on height,
+ * so the rhythm tightens to one spacing step and the type range runs from extra-small rows up to
+ * a small total. `page` is the `/cart` surface, where the block is the page's summary column and
+ * the range runs from small rows up to the medium total inherited from `.total` above. */
+
+.root[data-variant='drawer'] {
+  --totals-gap: var(--ls-space-1, 4px);
+
+  font-size: var(--ls-text-xs, 12px);
+}
+
+.root[data-variant='drawer'] .total {
+  font-size: var(--ls-text-sm, 13px);
+}
+
+.root[data-variant='page'] {
+  --totals-gap: var(--ls-space-3, 12px);
+
+  font-size: var(--ls-text-sm, 13px);
+}

@@ -1,0 +1,296 @@
+/*
+ * ShippingOptionPicker - the checkout shipping-method chooser.
+ *
+ * The markup this dresses (see ./ShippingOptionPicker.tsx):
+ *
+ *   fieldset.root
+ *     legend.legend
+ *     ul.list
+ *       li.option
+ *         label                          <- carries no class: the row itself is the hit area
+ *           input[type="radio"].control
+ *           div.body
+ *             span.name
+ *             span.detail
+ *           Price .price
+ *     .quoting                           <- optional caption for a refreshed quote
+ *     .notice                            <- optional typographic line for a quote that failed
+ *
+ * This is a native radio group, so arrow-key navigation, roving focus and the checked state
+ * announcement all come from the browser. Nothing here hides, shrinks away or re-implements the
+ * input, and the selected row is styled from `:has(:checked)` over that real input rather than
+ * from a class the component toggles - server-rendered and hydrated markup stay identical.
+ *
+ * Every colour, space, radius and face resolves to an `--ls-*` custom property declared in
+ * `app/globals.css`, each written with the literal fallback that mirrors the declaration there so
+ * the module still renders sensibly when read on its own. Three kinds of value are literal by
+ * convention rather than by omission: the hairline border and focus-ring widths, which that
+ * stylesheet also writes as plain `1px` / `2px`; the container-query threshold at the end of the
+ * file, because a query condition is evaluated before custom properties resolve; and the unitless
+ * dimming ratio of a locked row, which is declared as a file-local custom property on `.root` -
+ * the same way the cart's own modules declare theirs - because it describes this control's states
+ * rather than the store's visual language.
+ *
+ * Deliberately not owned here: the money format, size and colour of the amount (../ui/Price), the
+ * chrome of a real error message (../ui/Alert), and the page's own rhythm (the `.ls-*` utilities
+ * in `app/globals.css`).
+ */
+
+/* The group. A fieldset brings a user-agent border, padding and an intrinsic min-content width;
+ * the last of those would stop a grid or flex parent from ever shrinking this column, which is
+ * what `min-inline-size: 0` clears. Establishing a size container here lets the rows answer to
+ * the width of the group rather than the width of the window, so the picker reads the same in a
+ * full checkout column as it does inside a narrow panel. */
+.root {
+  /* How far a locked row is dimmed. A file-local custom property, as the unitless ratios in the
+   * cart's own modules are declared, so the figure is named where it is read and the rule below
+   * says what it does rather than what it is. The row keeps its recessed tint and its
+   * `not-allowed` cursor as well: dimming alone reads as "quiet" on a pointer-less device, and the
+   * tint alone is easy to miss beside a selected row. */
+  --option-disabled-opacity: 0.55;
+
+  min-inline-size: 0;
+  container-type: inline-size;
+  margin: 0;
+  border: none;
+  padding: 0;
+}
+
+/* A real <legend>, kept in place: it is the group's accessible name and its visible heading. */
+.legend {
+  margin-block-end: var(--ls-space-2, 8px);
+  padding: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 0.8125rem);
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.list {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One selectable row: the control, the text block and the amount on three tracks. */
+.option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--ls-space-3, 12px);
+  border: 1px solid var(--ls-border, #8190a5);
+  border-radius: var(--ls-radius-md, 8px);
+  background-color: var(--ls-surface, #ffffff);
+  padding: var(--ls-space-3, 12px);
+  transition-property: background-color, border-color;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+
+/* The row's label has no class of its own, so it is addressed by type. It spans every track and
+ * repeats them with `subgrid`, which gives the row a single clickable box while the control, the
+ * text and the amount stay on the row's own columns.
+ *
+ * The height floor is the pointer-target floor of WCAG 2.5.5 / 2.5.8, and it belongs on the label
+ * rather than on `.option`: the label is the hit area, and the card's 12px of padding lies outside
+ * it, so a card can look comfortably taller than the floor while the label inside it falls short.
+ * A `min-block-size` here raises only the label's own box - the three tracks it repeats with
+ * `subgrid` stay the row's, the row's padding is unaffected, and the centred alignment keeps the
+ * control, the text block and the amount on the row's optical line. */
+.option > label {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  gap: var(--ls-space-3, 12px);
+  min-block-size: var(--ls-target-min, 44px);
+  cursor: pointer;
+}
+
+/* Hover is a pointer-only affordance, and it yields to the selected and disabled treatments
+ * below rather than painting over them.
+ *
+ * The cue is the secondary Button's, computed from the ink token in the same proportions: 24% of
+ * ink into the hairline and 8% into the surface. Swapping in the recessed surface alone is a
+ * 1.05:1 step, which a buyer cannot tell from a row at rest; the mixed border measures 4.8:1 on
+ * white against the resting hairline's 3.25:1, and the row's text keeps its contrast on the
+ * tinted fill (the muted delivery line 6.4:1, the carrier name 15.2:1). Only colours change, and
+ * both are already in `.option`'s transition list, so the row neither reflows nor gains new
+ * motion. */
+@media (hover: hover) {
+  .option:not(:has(:checked)):not(:has(:disabled)):hover {
+    border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 24%, var(--ls-border, #8190a5));
+    background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 8%, var(--ls-surface, #ffffff));
+  }
+}
+
+/* Selected. The tint and border show the chosen row at a glance; the cue that does not depend on
+ * colour is the checked radio itself, whose filled circle the browser draws and whose checked state
+ * it announces. */
+.option:has(:checked) {
+  border-color: var(--ls-accent, #f59e0b);
+  background-color: color-mix(in srgb, var(--ls-accent, #f59e0b) 10%, var(--ls-surface, #ffffff));
+}
+
+/* One ring for the row instead of two: focus lands on the input, and the row draws the indicator
+ * on its behalf, which is why the control's own outline is stood down just below. */
+.option:focus-within {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+.control:focus-visible {
+  outline: none;
+}
+
+/* Disabled wins over both hover and selected: it is declared last at equal specificity.
+ *
+ * A locked row says so three ways, because one is not enough: it recedes to the sunken surface, it
+ * is dimmed to `--option-disabled-opacity`, and the pointer over it is `not-allowed`. The rows are
+ * locked while the order is being placed - the control is genuinely inert then, and a row that
+ * looked and felt interactive while being inert is a row a buyer clicks repeatedly. The state is
+ * announced by the disabled control itself and by the group's `aria-disabled`; this is what makes
+ * it visible.
+ *
+ * `:has(:disabled)` matches a control disabled through the enclosing `<fieldset disabled>` exactly
+ * as it matches one disabled by its own attribute - `:disabled` is about the control's state, not
+ * about where the attribute sits - so the group locks as a whole. */
+.option:has(:disabled) {
+  border-color: var(--ls-border, #8190a5);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  opacity: var(--option-disabled-opacity);
+  color: var(--ls-text-muted, #475569);
+  cursor: not-allowed;
+}
+
+.option:has(:disabled) > label,
+.control:disabled {
+  cursor: not-allowed;
+}
+
+.option:has(:disabled) .name {
+  color: var(--ls-text-muted, #475569);
+}
+
+/* The native radio, sized from the type scale so the mark grows with the reader's font size.
+ * It is never hidden: it is what the keyboard drives and what assistive technology reads.
+ *
+ * The brand accent dresses the selected row above; the control keeps the interaction colour that
+ * `app/globals.css` gives every radio and checkbox, which is also this row's ring colour.
+ *
+ * The circle is 1.125rem (18px at the default root size). The pointer target is the wrapping
+ * label, which spans the whole row and carries the `--ls-target-min` floor declared on
+ * `.option > label` above, so no pointer has to find the circle itself. */
+.control {
+  inline-size: var(--ls-text-lg, 1.125rem);
+  block-size: var(--ls-text-lg, 1.125rem);
+  margin: 0;
+  accent-color: var(--ls-focus, #0f766e);
+  cursor: pointer;
+}
+
+/* The text block. `min-inline-size: 0` lets a long carrier name wrap inside its track instead of
+ * widening the row. */
+.body {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+.name {
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 0.9375rem);
+  font-weight: 500;
+  line-height: 1.35;
+  overflow-wrap: break-word;
+}
+
+/* The delivery wording. One line of it is reserved, so the row keeps its height whichever
+ * wording is shown. */
+.detail {
+  min-block-size: calc(var(--ls-text-xs, 0.75rem) * 1.5);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 0.75rem);
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+/* Placement and alignment for the amount only - its size and colour belong to ../ui/Price. The
+ * monospaced face with tabular figures is what lines the amounts up down the column. */
+.price {
+  justify-self: end;
+  align-self: center;
+  font-family: var(
+    --ls-font-mono,
+    ui-monospace,
+    'SF Mono',
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    'Liberation Mono',
+    monospace
+  );
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+  white-space: nowrap;
+}
+
+/* Caption for a quote that is on its way. `grid-column` is inert where this sits after the list
+ * and takes the full width where it sits inside a row. */
+.quoting {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  margin-block-start: var(--ls-space-2, 8px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 0.75rem);
+  line-height: 1.5;
+}
+
+/* A quote that could not be refreshed, said in one line. Typographic only: a message that needs
+ * a tone, an icon and a live region is rendered through ../ui/Alert instead. */
+.notice {
+  grid-column: 1 / -1;
+  margin-block-start: var(--ls-space-2, 8px);
+  color: var(--ls-danger, #b42318);
+  font-size: var(--ls-text-sm, 0.8125rem);
+  line-height: 1.5;
+}
+
+/* The only motion introduced above is the row's colour transition. Durations collapse rather than
+ * dropping to `none`, which matches the baseline in `app/globals.css` and keeps a `transitionend`
+ * handler firing for anyone who has asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .option {
+    transition-duration: 0.01ms;
+  }
+}
+
+/* A narrow group - the checkout column on a phone, or this picker inside a side panel - stacks
+ * the amount under the text rather than squeezing a third track. The threshold is a literal
+ * length because a container-query condition is evaluated before custom properties resolve; it is
+ * written in `rem` over the type scale's own unit so it still tracks the reader's font size. */
+@container (max-width: calc(22 * 1rem)) {
+  .option {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .option > label {
+    align-items: start;
+    row-gap: var(--ls-space-1, 4px);
+  }
+
+  .price {
+    grid-column: 2;
+    justify-self: start;
+    text-align: start;
+  }
+}

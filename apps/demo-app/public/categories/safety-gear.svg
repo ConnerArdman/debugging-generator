@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
+  <!-- Hard hat category glyph, used as a CSS mask by the category glyph component, so its alpha is
+       the shape. Keep it fill-free at the family's 1.75 stroke and legible at 16 px. Viewed on its
+       own, currentColor resolves to the slate root colour. -->
+  <path d="M4.75 16.25 A7.25 7.25 0 0 1 19.25 16.25" />
+  <path d="M2.9 16.25 H21.1" />
+  <path d="M12 9.5 V16" />
+</svg>

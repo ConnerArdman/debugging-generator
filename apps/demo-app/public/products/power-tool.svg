@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Power tools</title>
+  <!-- Every tile here shares this panel, shelf, view box and intrinsic size, so tiles referenced
+       by path swap without reflow. Colours are explicit hex, as an img inherits none. Mist stays
+       background and amber only fills outlines: neither reads on the panel alone. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="118" y="102" width="116" height="56" rx="20" stroke="#0F172A" stroke-width="8" />
+    <path d="M140 118 V140" stroke="#475569" stroke-width="6" />
+    <path d="M158 118 V140" stroke="#475569" stroke-width="6" />
+    <path d="M176 118 V140" stroke="#475569" stroke-width="6" />
+    <rect x="234" y="113" width="30" height="34" rx="8" stroke="#0F172A" stroke-width="8" />
+    <path d="M249 120 V140" stroke="#475569" stroke-width="6" />
+    <path d="M264 130 H300" stroke="#475569" stroke-width="6" />
+    <path d="M270 121 L274 139" stroke="#475569" stroke-width="6" />
+    <path d="M282 121 L286 139" stroke="#475569" stroke-width="6" />
+    <path d="M294 121 L298 139" stroke="#475569" stroke-width="6" />
+    <path d="M180 154 L168 188" stroke="#0F172A" stroke-width="8" />
+    <path d="M138 154 L126 188" stroke="#0F172A" stroke-width="8" />
+    <path d="M176 166 Q187 172 171 179" stroke="#475569" stroke-width="6" />
+    <rect x="108" y="188" width="76" height="36" rx="8" stroke="#0F172A" stroke-width="8" />
+    <rect x="120" y="198" width="52" height="14" rx="4" fill="#F59E0B" />
+  </g>
+</svg>

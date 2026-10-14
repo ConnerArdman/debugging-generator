@@ -1,0 +1,216 @@
+/*
+ * Lumen Supply - toast region (`ToastViewport`).
+ *
+ * The only fixed, z-indexed surface in `src/components/ui`: a bottom-right column of short-lived
+ * notices that floats over the storefront. `@/providers/ToastProvider` owns the queue and renders
+ * no DOM at all, so the structure styled here is the viewport's own:
+ *
+ *   .root      the fixed region (the component marks it as the live region)
+ *     .list    the queue, one list item per notice
+ *       .toast  a single notice, carrying data-tone="info|success|warning|danger"
+ *         .title    the headline, coloured by the tone
+ *         .body     the detail line
+ *         .dismiss  placement box for the `Button` that closes the notice
+ *
+ * THE LOAD-BEARING PAIR - do not "simplify" it away:
+ *   `.root { pointer-events: none }` together with `.toast { pointer-events: auto }`
+ * The region is 360px wide and parks itself exactly where the checkout summary's action column
+ * sits. Without the `none`, an all-but-invisible rectangle would swallow clicks meant for the
+ * storefront's own controls - the checkout submit among them - and the application would appear
+ * to have an intermittent "the button does nothing" fault with no cause anywhere in the control
+ * that appeared to be broken, while every automated interaction in that corner failed.
+ * The `auto` on each notice hands interaction back to the notice itself, so its dismiss control
+ * still responds.
+ *
+ * Stacking: the region reads `--ls-z-toast` (60), which `app/globals.css` declares one tier above
+ * the cart drawer's `--ls-z-drawer` (40), so a notice is never hidden behind the drawer. The tier
+ * numbers live in that one `:root` block and are never restated as literals here.
+ *
+ * SHARING THE CORNER WITH THE CART DRAWER'S FOOTER - `--ls-toast-inset-block-end`
+ * Being one tier above the drawer is what keeps a notice visible, and on its own it is also what
+ * made a notice paint over the drawer's pinned footer and its primary Checkout link for the whole
+ * five seconds the notice lived. Both surfaces are fixed to the bottom-inline-end corner, so the
+ * corner is divided by reservation rather than by stacking - lowering this region behind the drawer
+ * would break the contract above, and is not the answer.
+ *
+ * `@/components/cart/CartDrawer` publishes its footer's measured height as
+ * `--ls-toast-inset-block-end` on `document.body` for as long as its sheet is open, and both
+ * `inset-block-end` declarations below add that reservation to their own inset: the column comes to
+ * rest one spacing step above the footer, with the Checkout link fully visible and clickable
+ * beneath it. The reservation is a height and never an inline offset - at 375px the sheet is the
+ * full width of the viewport, and moving the column sideways would push notices off screen.
+ *
+ * The `0px` fallback is the load-bearing half of the contract: the drawer removes the property when
+ * it closes, and every other surface in the storefront - a catalog page, the checkout form, an
+ * empty cart, which has no drawer footer at all - never declares it, so the column keeps exactly
+ * the inset it has always had. Any rule here that sets `inset-block-end` must add the reservation
+ * the same way, or a notice will cover the footer at that breakpoint alone.
+ *
+ * Tokens: every colour, spacing step, radius, type size, shadow and stacking tier is read as
+ * `var(--ls-NAME, <literal fallback>)`, so the module renders sensibly on its own and renders the
+ * application's palette once `app/globals.css` is loaded. Hex spellings are lowercase because
+ * Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ *
+ * The only bare lengths are structural values the token scale does not model: the 1px hairline
+ * and the 3px tone accent that thickens its leading edge, the 360px width cap, and the 480px
+ * breakpoint below which the column goes edge to edge.
+ */
+
+/* The region. Fixed, inset from the bottom-inline-end corner by one large spacing step, and
+ * deliberately transparent to the pointer (see the header). The width cap is file-local because
+ * the token scale models spacing and page measures, not this component's comfortable reading
+ * width; `min()` keeps the column inside a narrow viewport without a media query.
+ *
+ * The block-end inset is that spacing step plus whatever a surface below has reserved: only the
+ * cart drawer reserves anything (its pinned footer's height, as `--ls-toast-inset-block-end` on
+ * `document.body`, and only while its sheet is open), and the `0px` fallback is what leaves every
+ * other surface's notices exactly where they have always been. See the header for the whole
+ * contract. */
+.root {
+  --toast-width: 360px;
+
+  position: fixed;
+  inset-block-end: calc(var(--ls-space-5, 24px) + var(--ls-toast-inset-block-end, 0px));
+  inset-inline-end: var(--ls-space-5, 24px);
+  z-index: var(--ls-z-toast, 60);
+  display: flex;
+  flex-direction: column;
+  width: min(var(--toast-width), calc(100vw - var(--ls-space-5, 24px) * 2));
+  pointer-events: none;
+}
+
+/* The queue itself: a list, reset to a gapped column. Newest notice last, so the column grows
+ * upward from the corner without any notice moving. */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A single notice. Two columns - the message, then the dismiss control - with the rows created by
+ * the children that are actually present, so a notice without a detail line has no empty row and
+ * a notice without a dismiss control has no empty column gap to show for it.
+ *
+ * `pointer-events: auto` is the half of the load-bearing pair that makes the notice itself
+ * clickable; the region above it stays transparent. */
+.toast {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: var(--ls-space-2, 8px);
+  row-gap: var(--ls-space-1, 4px);
+  padding: var(--ls-space-3, 12px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-inline-start-width: 3px;
+  border-inline-start-color: var(--toast-accent, var(--ls-border, #cbd5e1));
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface, #ffffff);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+  color: var(--ls-text, #0f172a);
+  /* A product code or an order reference can be one long unbroken token; wrap it rather than
+   * widening the notice past the region. */
+  overflow-wrap: break-word;
+  pointer-events: auto;
+  animation: toast-in 160ms ease-out both;
+}
+
+/* Tone. The four values are the `ToastTone` union the provider exports, matched as data
+ * attributes - there is no class-name lookup map - and each tone names its colour exactly once by
+ * re-pointing one inherited custom property, which the leading border and the title both read.
+ * When the attribute is missing the property is unset, so the `var()` fallbacks below apply: a
+ * neutral hairline accent and ink title text, which is the right way for an unknown tone to
+ * degrade. The four status colours are the ones Badge, Pill and Alert use. */
+.toast[data-tone='info'] {
+  --toast-accent: var(--ls-info, #1d4ed8);
+}
+
+.toast[data-tone='success'] {
+  --toast-accent: var(--ls-success, #0f766e);
+}
+
+.toast[data-tone='warning'] {
+  --toast-accent: var(--ls-warning, #b45309);
+}
+
+.toast[data-tone='danger'] {
+  --toast-accent: var(--ls-danger, #b42318);
+}
+
+/* The headline, in the message column. Carries the tone colour: each of the four clears 4.5:1 on
+ * `--ls-surface`, so the tone is legible text and not colour-only meaning - the wording carries
+ * the message either way. */
+.title {
+  grid-column: 1;
+  margin: 0;
+  color: var(--toast-accent, var(--ls-text, #0f172a));
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+/* The detail line, under the headline in the same column. Muted, one step down in size, and set a
+ * little looser because it is the only multi-line text in the notice. */
+.body {
+  grid-column: 1;
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.45;
+}
+
+/* Placement only. The component renders a `Button` in here and that module owns its whole
+ * appearance - size, colour, border, focus ring - so nothing here may restyle it: this class
+ * parks it in the second column beside the headline and keeps it from stretching. */
+.dismiss {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: start;
+}
+
+/* Narrow viewports. Below the breakpoint the column goes edge to edge - one small spacing step of
+ * margin on each side, the same step below - because a 360px card inset by 24px leaves too little
+ * room for the message. `width: auto` releases the cap above so the two insets decide the width,
+ * and the region stays transparent to the pointer, which matters more here than anywhere: on a
+ * narrow screen it spans the full width of whatever it is floating over.
+ *
+ * The block-end inset restates the reservation with this breakpoint's smaller step, because this
+ * is where it matters most: at this width the cart drawer's sheet is the full width of the
+ * viewport, so its footer is directly under the column rather than beside it. `inset-inline` stays
+ * a plain step - the reservation is never applied to an inline edge, since moving the column
+ * sideways on a full-width sheet would carry notices off the screen. */
+@media (max-width: 480px) {
+  .root {
+    inset-block-end: calc(var(--ls-space-3, 12px) + var(--ls-toast-inset-block-end, 0px));
+    inset-inline: var(--ls-space-3, 12px);
+    width: auto;
+    pointer-events: none;
+  }
+}
+
+/* Entrance only: a notice fades up into place. There is no exit animation on purpose - the
+ * provider drops a notice from state the moment it expires or is dismissed, so the element is
+ * gone before any exit could play, and a rule pretending otherwise would be dead code. */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--ls-space-2, 8px));
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* A reader who has asked for less motion gets the notice already in place. `animation: none`
+ * rather than a collapsed duration, because nothing here waits on `animationend`: the finished
+ * state is the resting state. This is the module's own reduced-motion rule, at its own
+ * specificity, as every module in this application that introduces motion carries. */
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+}

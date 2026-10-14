@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Debug Generator - shared TypeScript compiler options (AAP 0.3.4). Every workspace tsconfig.json under apps/* and packages/*, plus tests/tsconfig.json, extends this file. The root tsconfig.json is a solution file that references those projects, and `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) is the gate that builds them, so every referenced project must be `composite`.",
+
+  "// format": "Strict JSON, like the root tsconfig.json and every other tsconfig in this repository: both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it, so no consumer has to know which one to reach for. The rationale for each decision is therefore recorded in the `\"// …\"` string keys of this object rather than in comments. TypeScript ignores unknown TOP-LEVEL keys, which is what makes the convention safe; a `\"// …\"` key inside `compilerOptions` is a hard error instead (TS5023, \"Unknown compiler option\"), so every note about a single option lives up here under a `\"// compilerOptions.<option>\"` key and never beside the option itself.",
+
+  "// extend-only": "This file declares no `files`/`include`, so running `tsc -p tsconfig.base.json` directly answers TS18003 (\"No inputs were found\") by design. Validate it through a workspace project that extends it.",
+
+  "// compiler": "TypeScript 6.0.3, the last JavaScript-based line (AAP 0.3.1). 7.0.x is deliberately not used because ts-morph 28 and typescript-eslint 8.70 need the classic compiler API, so every option below is one 6.0.x accepts.",
+
+  "// compilerOptions.target": "Node 24.21.0, Chrome 153 and every bundler in the repo support ES2023, so nothing is downlevelled anywhere in the monorepo.",
+
+  "// compilerOptions.lib": "Deliberately no \"DOM\"/\"DOM.Iterable\" here. Browser libraries are added by the workspaces that actually run in a page or a webview - packages/panel-renderer, the browser agent of packages/telemetry, apps/chrome-extension, the webview project of apps/vscode-extension and apps/demo-app - so a Node-only package cannot reference `window` and still compile.",
+
+  "// compilerOptions.useDefineForClassFields": "ES2022 class-field semantics (already the default at this target); stated explicitly so a workspace that lowers `target` keeps the same behaviour.",
+
+  "// compilerOptions.module": "The default flavour is bundled/web: packages are emitted by tsup and the extension surfaces by Vite/esbuild. Node-targeted projects override with \"module\": \"NodeNext\", \"moduleResolution\": \"NodeNext\" - that is apps/local-service, the `./node` entry of packages/shared, the `./node/register` preload entry of packages/telemetry and the guard scripts under scripts/.",
+
+  "// compilerOptions.moduleDetection": "Every source file is a module: no accidental global scripts, and `declare global` works without a dummy import. Ambient asset declarations (`declare module \"*.module.css\"`) are unaffected.",
+
+  "// compilerOptions.verbatimModuleSyntax": "Imports are emitted exactly as written, so type-only imports must say `import type` / `export type`. This keeps the browser-agent IIFE and the MV3 bundles free of runtime imports that existed only for types.",
+
+  "// compilerOptions.isolatedModules": "Each file must be emittable in isolation - required by esbuild, Vite and tsup, which transpile file by file.",
+
+  "// compilerOptions.allowJs": "The product is TypeScript only; the few .mjs tooling scripts are linted, never compiled.",
+
+  "// compilerOptions.jsx": "React 19.3.0 automatic runtime, so .tsx files need no `import React`. Carried in the base for packages/panel-renderer, the React-facing sources of packages/telemetry and both extension UIs; apps/demo-app restates the same value locally because Next.js 16 writes `jsx: react-jsx` into a project tsconfig that omits it (\"preserve\" was the required value of earlier majors only).",
+
+  "// compilerOptions.exactOptionalPropertyTypes": "On, with `strict`, `noUncheckedIndexedAccess` and `verbatimModuleSyntax`: those four are the project's non-relaxable strictness settings and no workspace may turn one off. What it means for first-party code: an optional property that can legitimately hold `undefined` declares it - `parentSpanId?: string | undefined` - while `parentSpanId?: string` now means \"absent or a string\", never \"present and undefined\". The schema packages built on Zod-inferred types - packages/protocol, packages/telemetry, packages/panel-schema and packages/instrumentation - are unaffected: `z.string().optional()` infers `parentSpanId?: string | undefined`, so a parsed value assigns into the inferred type and into a hand-written shape that declares `| undefined` (measured with TypeScript 6.0.3 and zod 4.6.5: omitted key, explicit `undefined` and a `.parse()` result all compile). Only a hand-written optional that omits `| undefined` has to change, and that is the declaration to fix rather than a reason to relax the flag.",
+
+  "// compilerOptions.noUnusedLocals": "Paired with `eslint . --max-warnings 0`: dead code fails the typecheck gate as well, so it cannot reach a commit. Same for `noUnusedParameters`.",
+
+  "// compilerOptions.skipLibCheck": "Third-party .d.ts drift (OpenTelemetry, Prisma, @types/chrome, bippy) must not block the gate; first-party sources are still fully checked.",
+
+  "// compilerOptions.types": "NOT set. Each workspace declares its own ambient type packages (\"node\", \"chrome\", \"vscode\", \"react\", \"react-dom\") so that, for example, the Chrome extension's globals never bleed into the local service.",
+
+  "// compilerOptions.composite": "`tsc -b` needs composite projects, and every workspace is referenced by the root solution file, so `noEmit` must never appear here or in any project that extends this file: TypeScript 6.0.3 answers a referenced project with `noEmit` with \"error TS6310: Referenced project '...' may not disable emit.\" and the whole gate fails. A workspace whose framework wants to add `noEmit` (Next.js writes it into the project tsconfig) keeps it out of the file and relies on its own build for that check.",
+
+  "// compilerOptions.emitDeclarationOnly": "Shipping bundles come from tsup / esbuild / Vite / Next; `tsc -b` exists only as the typecheck gate, so it emits declarations and nothing else.",
+
+  "// compilerOptions.outDir": "`${configDir}` (TypeScript 5.5+) resolves to the directory of the *extending* config, not of this file. The substitution is load-bearing: a plain relative \"outDir\": \".tsbuild\" resolves against this file's own directory, so every workspace would emit into <repo>/.tsbuild and silently overwrite its siblings' declarations. With `${configDir}` each project emits to <workspace>/.tsbuild, which never collides with the tsup output in <workspace>/dist. `.tsbuild/` is ignored by .gitignore, .prettierignore and the ignore list in eslint.config.js; renaming it means updating all three.",
+
+  "// compilerOptions.tsBuildInfoFile": "The stamp is pinned inside the same directory instead of being left to its default. TypeScript derives the default from `outDir` plus the path from `rootDir` back to the config file, so a project whose `rootDir` is nested (for example \"src/webview\") writes its stamp *outside* its own workspace: two such projects under apps/ end up sharing `apps/tsconfig.tsbuildinfo` and then rebuild on every `tsc -b` run - with exit code 0 and no warning. Pinning it keeps every artefact of the typecheck gate inside <workspace>/.tsbuild, so the ignore lists above cover all of it. A workspace that declares a SECOND project in the same directory (only apps/vscode-extension does: tsconfig.json plus tsconfig.webview.json) must override BOTH `outDir` and `tsBuildInfoFile` in that project, for example \"outDir\": \"${configDir}/.tsbuild/webview\" and \"tsBuildInfoFile\": \"${configDir}/.tsbuild/webview/tsconfig.webview.tsbuildinfo\", because two projects sharing one output directory overwrite each other's declarations and two projects sharing one stamp never settle.",
+
+  "// compilerOptions.not-set": "NOT set: \"baseUrl\", \"paths\", \"rootDir\". No `@debuggen/*` -> `src/**` aliases: cross-package imports resolve through each package's `exports` map. Its source-first `types` condition names the package's src/ entry, which `tsc -b` replaces with the referenced project's `.tsbuild` declarations; its runtime conditions name `dist/`, which is what the runtime and the bundlers load (see the root tsconfig.json `\"// no-aliases\"` note). An alias would bypass the `exports` map, hiding a broken one and letting the acyclic package layering be violated without anything failing. `baseUrl` interacts badly with \"bundler\" resolution, and TypeScript 6.0.3 reports it as deprecated (TS5101). `rootDir` is per-workspace: each project sets \"src\" (or \".\" where the project spans src/ and test/).",
+
+  "// exclude": "Inherited by every workspace that does not declare its own `exclude`, so each entry is anchored with `${configDir}` and refers to that workspace's own directories rather than to the repository root.",
+
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "useDefineForClassFields": true,
+
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "checkJs": false,
+
+    "jsx": "react-jsx",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    "composite": true,
+    "incremental": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo"
+  },
+
+  "exclude": [
+    "${configDir}/node_modules",
+    "${configDir}/dist",
+    "${configDir}/.tsbuild",
+    "${configDir}/.next",
+    "${configDir}/coverage"
+  ]
+}

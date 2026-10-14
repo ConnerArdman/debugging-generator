@@ -1,0 +1,146 @@
+# Every gate runs through a root package.json script except the `pnpm audit` layer,
+# which is pnpm's built-in command. Every action is pinned by commit SHA. No repository
+# secret is consumed: the advisory step reads public advisories with the job's read-only
+# token, and every test uses the deterministic provider. No step caches, archives or
+# uploads `.git`.
+name: CI
+
+on:
+  push:
+    branches: [master, blitzy]
+  pull_request:
+    branches: [master, blitzy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The one VS Code build both editor tiers test, within engines.vscode ^1.125.0: the
+# extension-host suites (apps/vscode-extension/.vscode-test.mjs, verify job) and the
+# e2e window (tests/e2e/helpers/editor-host.ts, e2e job) both read it, so a new stable
+# release cannot change the editor under test between two runs of one commit.
+env:
+  VSCODE_TEST_VERSION: "1.139.0"
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Credential-free on purpose: prisma generate and next build never connect,
+      # and a credential here would need a check:secrets allowlist entry.
+      DATABASE_URL: postgresql://localhost:5432/placeholder
+      DEBUGGEN_PROVIDER: deterministic
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Blocking: any advisory at or above `low` against the frozen lockfile fails the
+      # job until it is reconciled in pnpm-workspace.yaml's advisory ledger. Kept out of
+      # `pnpm verify`, which must stay runnable offline.
+      - name: Audit dependencies
+        run: pnpm audit --audit-level=low
+
+      # Blocking, and independent of the feed `pnpm audit` reads: matches every locked
+      # version and every exact manifest pin against the committed ledger, the vendor
+      # advisory feeds it names and OSV, and warns when OSV lags a vendor advisory. The
+      # job's read-only token authenticates the reads of public advisories.
+      - name: Check vendor advisories
+        run: pnpm check:advisories --online
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Aggregate quality gate
+        run: pnpm verify
+
+      - name: Extension-host tests
+        run: xvfb-run -a pnpm test:vscode
+
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Mirrors docker-compose.yml (service name included); Compose is not invoked.
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: debuggen
+          POSTGRES_PASSWORD: debuggen
+          POSTGRES_DB: lumen_supply
+        ports: ["5432:5432"]
+        options: '--health-cmd "pg_isready -U debuggen" --health-interval 5s --health-timeout 5s --health-retries 10'
+    # DEBUGGEN_HOME is job-wide too, but the `runner` context is not available in
+    # job-level env, so the first step exports it through $GITHUB_ENV to every step
+    # after it. Nothing creates the directory: the service does, 0700, on first start.
+    env:
+      DATABASE_URL: postgresql://debuggen:debuggen@localhost:5432/lumen_supply
+      DEBUGGEN_PROVIDER: deterministic
+    steps:
+      - name: Configure DEBUGGEN_HOME
+        run: echo "DEBUGGEN_HOME=${RUNNER_TEMP:?RUNNER_TEMP is not set}/debuggen" >> "$GITHUB_ENV"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Also runs the prebuild hooks that produce the unpacked Chrome extension and the
+      # service bundle playwright.config.ts loads; Playwright starts the service itself.
+      - name: Build workspaces
+        run: pnpm build
+
+      - name: Prepare demo database
+        run: |
+          pnpm demo:migrate
+          pnpm demo:seed
+
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Browser tests
+        run: pnpm test:browser
+
+      - name: End-to-end tests
+        run: pnpm test:e2e
+
+      # always(), cancellation included: a timed-out or cancelled run's partial
+      # traces are the diagnostics most worth keeping.
+      - name: Upload Playwright report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 7

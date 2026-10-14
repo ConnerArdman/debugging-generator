@@ -1,0 +1,215 @@
+/*
+ * Select - the dropdown primitive of the Lumen Supply storefront.
+ *
+ * Consumed by exactly one file, `Select.tsx`, a thin wrapper over the native `<select>` that puts
+ * `.root` on the control and sets two data attributes on it: `data-size` ("sm" | "md") and
+ * `data-invalid` ("true" when the field is in error). Label and error copy belong to `FormField`,
+ * which renders them beside the control, so nothing here draws or reserves room for text. Every
+ * variant below is therefore selected by a data attribute; there is no class-name lookup map.
+ *
+ * Where it is used: the catalog toolbar's sort-order and page-size dropdowns and the checkout
+ * form's shipping-option dropdown.
+ *
+ * MATCHES `Input.module.css` - this is a requirement, not a preference. A select and a text field
+ * sit side by side in both of those places, so the block padding, inline-start padding, border
+ * width, radius, font size and inherited line height below are exactly Input's, which makes the
+ * two controls the same height and puts their text on one baseline. The one deliberate difference
+ * is the inline-END padding, which is widened to reserve the caret's lane (see below); the caret
+ * occupies that reserve, so the box itself is still the same size. Change a metric here only by
+ * changing it in both files.
+ *
+ * THE CARET IS DRAWN, NOT FETCHED. `appearance: none` removes the platform's own dropdown chrome,
+ * and the indicator that replaces it is two half-square `linear-gradient` background layers that
+ * abut to form a solid downward triangle:
+ *
+ *   layer 1  linear-gradient(45deg, transparent 50%, <colour> 50%)    the caret's left half
+ *   layer 2  linear-gradient(135deg, <colour> 50%, transparent 50%)   the caret's right half
+ *
+ * Layer 1 sits almost one caret-half further from the inline edge than layer 2 - one caret-half
+ * less the one-pixel overlap explained in the rule below - so the two halves share their innermost
+ * column and read as one triangle. No image reference, no SVG import, no wrapper element:
+ * a referenced image file would make this stylesheet depend on an asset under `public/` that this
+ * folder does not own, a static image import would need the image-module types from the
+ * git-ignored `next-env.d.ts` and so would fail a clean-clone typecheck, and a wrapper element
+ * would put a box between `FormField`'s label and the control it labels. The caret is sized in
+ * `em`, so it scales with the size variant instead of needing a second geometry.
+ *
+ * The native popup list is untouched: `appearance: none` restyles the closed control only, and
+ * nothing here hides, replaces or re-implements the list. The control keeps its native role,
+ * its keyboard behaviour (Enter, Space, Arrow keys, type-ahead) and its assistive-technology
+ * semantics.
+ *
+ * Tokens: every colour, spacing step, radius and font size is read as
+ * `var(--ls-NAME, <literal fallback>)`. The declarations live in `app/globals.css`; the fallbacks
+ * mirror them so this module also renders sensibly on its own - in a test harness, or in a story
+ * rendered without the global stylesheet. Hex fallbacks are lowercase because Prettier normalises
+ * CSS colours to lowercase and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  /* Caret paint and geometry, held in component-local custom properties. A state rule repaints or
+   * resizes the caret by redeclaring one of these instead of restating both gradient layers, and
+   * both values still resolve from the `--ls-*` tokens. `em` in the size is resolved against this
+   * element's own font size, which is what makes the size variants share one caret definition.
+   *
+   * The overlap is not decoration. A caret half is 0.3em wide, so the seam between the two layers
+   * almost never lands on a whole device pixel, and a browser rounds each background layer's paint
+   * rectangle on its own: measured in Chrome, the two halves of a 0.3em caret were rounded apart
+   * and left a one-device-pixel white slit down the middle of the triangle. Pulling the outer half
+   * one pixel inwards makes the halves share a column instead of meeting at an edge, which closes
+   * the seam at any device-pixel ratio. Both halves paint the same opaque colour, so the shared
+   * column is indistinguishable from the rest of the caret; the cost is a tip blunted by that one
+   * pixel, which is invisible at every size this control is used at. */
+  --select-caret-color: var(--ls-text-muted, #475569);
+  --select-caret-size: 0.3em;
+  --select-caret-overlap: 1px;
+
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  /* A select's intrinsic minimum width is its longest option. Without this it refuses to shrink as
+   * a flex item and widens the row it shares with an Input. */
+  min-width: 0;
+  /* Input's padding pair, stated as logical properties, with the inline end widened to reserve the
+   * caret's lane: the caret's inset from the inline edge, the same distance again as clear space
+   * before the text, and the half-em the caret itself is wide. A shipping-option label long enough
+   * to fill the control ends in that clear space instead of running under the caret. */
+  padding-block: var(--ls-space-2, 8px);
+  padding-inline-start: var(--ls-space-3, 12px);
+  padding-inline-end: calc(var(--ls-space-3, 12px) * 2 + 0.5em);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  /* `background-color` and the layers are declared as longhands on purpose: the `background`
+   * shorthand would reset the caret layers every time a state rule changed the fill. */
+  background-color: var(--ls-surface, #ffffff);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--select-caret-color) 50%),
+    linear-gradient(135deg, var(--select-caret-color) 50%, transparent 50%);
+  background-position:
+    right calc(var(--ls-space-3, 12px) + var(--select-caret-size) - var(--select-caret-overlap))
+      center,
+    right var(--ls-space-3, 12px) center;
+  background-size:
+    var(--select-caret-size) var(--select-caret-size),
+    var(--select-caret-size) var(--select-caret-size);
+  background-repeat: no-repeat;
+  color: var(--ls-text, #0f172a);
+  /* `font: inherit` takes the page's family, weight and line height - the last of which is the
+   * unitless 1.5 from `body`, so it scales with the size variant - and the font size that follows
+   * names the step explicitly, exactly as Input does. */
+  font: inherit;
+  font-size: var(--ls-text-md, 15px);
+  /* A selected option too long for the control is truncated rather than clipped mid-glyph. */
+  text-overflow: ellipsis;
+  /* The control opens a list rather than accepting text, so it takes the pointer cursor; the
+   * disabled rule below replaces it. */
+  cursor: pointer;
+  appearance: none;
+  /* The only motion in this module, and only on the property a hover or focus changes. Paired with
+   * the reduced-motion rule at the end of the file: `app/globals.css` collapses durations at zero
+   * specificity, which this rule would otherwise outrank. */
+  transition-property: border-color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+/* The popup list's own items. Engines differ in how much of this they honour - several ignore it
+ * outright, and that is fine: this only restates the control's own foreground and surface so an
+ * engine that does paint the list stays on palette. Deliberately nothing else, and nothing that
+ * could hide an item. */
+.root option,
+.root optgroup {
+  color: var(--ls-text, #0f172a);
+  background-color: var(--ls-surface, #ffffff);
+}
+
+/* The compact variant, for a toolbar row. One step down on both padding axes and one step down in
+ * type; the caret follows the smaller inline inset and, being sized in `em`, shrinks with the type
+ * without a second geometry.
+ *
+ * `[data-size="md"]` needs no rule: the base above IS the medium control, so a medium select and a
+ * select rendered without the attribute at all are the same size.
+ *
+ * The height floor is the one metric of this variant that is NOT simply a step down: it is the
+ * shared `--ls-control-sm`, and `Input.module.css` declares the same floor on its own `sm` rule -
+ * the matching requirement at the head of this file applies to it like every other metric, and the
+ * shared floor is what lines this control up with a `sm` field and a `sm` Button in one toolbar
+ * row. `min-block-size` raises the box without touching the padding pair, so the caret's reserved
+ * lane and its background positions below are unaffected. */
+.root[data-size='sm'] {
+  min-block-size: var(--ls-control-sm, 32px);
+  padding-block: var(--ls-space-1, 4px);
+  padding-inline-start: var(--ls-space-2, 8px);
+  padding-inline-end: calc(var(--ls-space-2, 8px) * 2 + 0.5em);
+  background-position:
+    right calc(var(--ls-space-2, 8px) + var(--select-caret-size) - var(--select-caret-overlap))
+      center,
+    right var(--ls-space-2, 8px) center;
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Hover, behind a hover-capable-pointer query so a touch tap does not leave the control looking
+ * hovered until something else is touched. `:not(:disabled)` keeps a disabled control inert. */
+@media (hover: hover) {
+  .root:hover:not(:disabled) {
+    --select-caret-color: var(--ls-text, #0f172a);
+
+    border-color: var(--ls-slate, #475569);
+  }
+}
+
+/* Focus. The ring is tighter than the application-wide one in `app/globals.css` (offset 1px rather
+ * than 2px) because this control is usually one field in a stacked form, where a wider ring would
+ * reach the field above.
+ *
+ * `:focus` and `:focus-visible` carry the same declarations in two separate rules rather than one
+ * selector list: an engine that does not understand `:focus-visible` would discard the whole list,
+ * and this control must never be focusable without a visible indicator. */
+.root:focus {
+  --select-caret-color: var(--ls-text, #0f172a);
+
+  border-color: var(--ls-focus, #0f766e);
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 1px;
+}
+
+.root:focus-visible {
+  --select-caret-color: var(--ls-text, #0f172a);
+
+  border-color: var(--ls-focus, #0f766e);
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 1px;
+}
+
+/* The error state. Declared after the focus rules, at equal specificity, so the red edge survives
+ * while the field is focused - the focus ring is an outline and stays visible beside it. The
+ * message that explains the error is `FormField`'s, never this control's. */
+.root[data-invalid='true'] {
+  border-color: var(--ls-danger, #b42318);
+}
+
+/* Disabled, last of the state rules so it wins over the error and hover states: an unavailable
+ * control should read as unavailable first. The caret dims with the rest of the control.
+ *
+ * The opacity is declared from `--ls-disabled-opacity` rather than left to the engine's own
+ * default fade for a disabled `<select>`, so this control dims by exactly the amount Button, Pill
+ * and Input dim by. An inactive control is exempt from the 4.5:1 text minimum (WCAG 1.4.3), and
+ * the recessed fill, the dimmed caret and the `not-allowed` cursor carry the state as well. */
+.root:disabled {
+  --select-caret-color: var(--ls-mist, #cbd5e1);
+
+  border-color: var(--ls-border, #cbd5e1);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  color: var(--ls-text-muted, #475569);
+  opacity: var(--ls-disabled-opacity, 0.55);
+  cursor: not-allowed;
+}
+
+/* Honour a reduced-motion preference for the one transition this module introduces. The duration
+ * collapses rather than dropping to `none`, which is this application's convention: a
+ * `transitionend` handler still fires, so nothing waiting on one can stall. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition-duration: 0.01ms;
+  }
+}

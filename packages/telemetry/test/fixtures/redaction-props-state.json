@@ -1,0 +1,222 @@
+{
+  "before": [
+    {
+      "id": "evt_2m7q4t9x1c5v8bnd",
+      "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+      "spanId": "7e14b9c3d0a625f8",
+      "parentSpanId": "9d40b7e2a615cf83",
+      "kind": "render",
+      "name": "WidgetPanel",
+      "startTime": 1789812901129.42,
+      "duration": 9.873,
+      "tier": "browser",
+      "attributes": {
+        "component": "WidgetPanel",
+        "phase": "update",
+        "renderCount": 3,
+        "changedProps": [
+          {
+            "key": "headingText",
+            "previous": { "type": "string", "preview": "Saved views", "truncated": false },
+            "next": {
+              "type": "string",
+              "preview": "Saved views for this workspace, listed by the label the team gave each one and then by the day it was last opened by anyone on the team",
+              "truncated": true
+            }
+          },
+          {
+            "key": "itemSummary",
+            "previous": {
+              "type": "object",
+              "preview": "{ label: string, note: string, tags: array }",
+              "truncated": false
+            },
+            "next": {
+              "type": "object",
+              "preview": "{ label: string, note: string, tags: array, ownerName: string, lastOpenedAt: number, visibleColumns: array, sortDirection: string, groupingMode: string }",
+              "truncated": true
+            }
+          },
+          {
+            "key": "visibleItemCount",
+            "previous": { "type": "number", "preview": "18", "truncated": false },
+            "next": { "type": "number", "preview": "24", "truncated": false }
+          },
+          {
+            "key": "onItemSelect",
+            "previous": {
+              "type": "function",
+              "preview": "[function onItemSelect]",
+              "truncated": false
+            },
+            "next": { "type": "function", "preview": "[function onItemSelect]", "truncated": false }
+          }
+        ],
+        "trigger": "props",
+        "actualDuration": 9.873,
+        "ownerChain": ["FilterPanel"],
+        "selfTime": 2.611
+      },
+      "status": "unset",
+      "producerId": "prd_h7k2m9q4t1w6z3xb",
+      "seq": 11,
+      "source": {
+        "file": "src/components/WidgetPanel.tsx",
+        "line": 34,
+        "column": 1,
+        "symbol": "WidgetPanel",
+        "resolvedBy": "react-owner",
+        "confidence": 0.6
+      }
+    },
+    {
+      "id": "evt_6h3k9n2p5r8t1wyz",
+      "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+      "spanId": "c39a5d70e28b1f46",
+      "parentSpanId": "9d40b7e2a615cf83",
+      "kind": "state",
+      "name": "ItemList hook 1",
+      "startTime": 1789812901131.055,
+      "duration": 0,
+      "tier": "browser",
+      "attributes": {
+        "component": "ItemList",
+        "hookIndex": 1,
+        "hookLabel": "state",
+        "previousValue": {
+          "type": "string",
+          "preview": "Notes kept with this saved view: the team asked for the label column to stay visible during the weekly review, so leave it pinned to the left edge",
+          "truncated": true
+        },
+        "nextValue": {
+          "type": "string",
+          "preview": "Notes kept with this saved view: the team asked for the label column and the note column to stay visible during the weekly review, pinned left",
+          "truncated": true
+        },
+        "triggerEventId": "evt_0q4m8t1zw6r3h9jd"
+      },
+      "status": "unset",
+      "producerId": "prd_h7k2m9q4t1w6z3xb",
+      "seq": 12,
+      "source": {
+        "file": "src/components/ItemList.tsx",
+        "line": 27,
+        "column": 1,
+        "symbol": "ItemList",
+        "resolvedBy": "react-owner",
+        "confidence": 0.6
+      }
+    }
+  ],
+  "after": [
+    {
+      "id": "evt_2m7q4t9x1c5v8bnd",
+      "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+      "spanId": "7e14b9c3d0a625f8",
+      "parentSpanId": "9d40b7e2a615cf83",
+      "kind": "render",
+      "name": "WidgetPanel",
+      "startTime": 1789812901129.42,
+      "duration": 9.873,
+      "tier": "browser",
+      "attributes": {
+        "component": "WidgetPanel",
+        "phase": "update",
+        "renderCount": 3,
+        "changedProps": [
+          {
+            "key": "headingText",
+            "previous": { "type": "string", "preview": "Saved views", "truncated": false },
+            "next": {
+              "type": "string",
+              "preview": "Saved views for this workspace, listed by the label the team gave each one and then by the day it was last opened by an…",
+              "truncated": true
+            }
+          },
+          {
+            "key": "itemSummary",
+            "previous": {
+              "type": "object",
+              "preview": "{ label: string, note: string, tags: array }",
+              "truncated": false
+            },
+            "next": {
+              "type": "object",
+              "preview": "{ label: string, note: string, tags: array, ownerName: string, lastOpenedAt: number, visibleColumns: array, sortDirecti…",
+              "truncated": true
+            }
+          },
+          {
+            "key": "visibleItemCount",
+            "previous": { "type": "number", "preview": "18", "truncated": false },
+            "next": { "type": "number", "preview": "24", "truncated": false }
+          },
+          {
+            "key": "onItemSelect",
+            "previous": {
+              "type": "function",
+              "preview": "[function onItemSelect]",
+              "truncated": false
+            },
+            "next": { "type": "function", "preview": "[function onItemSelect]", "truncated": false }
+          }
+        ],
+        "trigger": "props",
+        "actualDuration": 9.873,
+        "ownerChain": ["FilterPanel"],
+        "selfTime": 2.611
+      },
+      "status": "unset",
+      "producerId": "prd_h7k2m9q4t1w6z3xb",
+      "seq": 11,
+      "source": {
+        "file": "src/components/WidgetPanel.tsx",
+        "line": 34,
+        "column": 1,
+        "symbol": "WidgetPanel",
+        "resolvedBy": "react-owner",
+        "confidence": 0.6
+      },
+      "redacted": ["changedProps[0].next.preview", "changedProps[1].next.preview"]
+    },
+    {
+      "id": "evt_6h3k9n2p5r8t1wyz",
+      "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+      "spanId": "c39a5d70e28b1f46",
+      "parentSpanId": "9d40b7e2a615cf83",
+      "kind": "state",
+      "name": "ItemList hook 1",
+      "startTime": 1789812901131.055,
+      "duration": 0,
+      "tier": "browser",
+      "attributes": {
+        "component": "ItemList",
+        "hookIndex": 1,
+        "hookLabel": "state",
+        "previousValue": {
+          "type": "string",
+          "preview": "Notes kept with this saved view: the team asked for the label column to stay visible during the weekly review, so leave…",
+          "truncated": true
+        },
+        "nextValue": {
+          "type": "string",
+          "preview": "Notes kept with this saved view: the team asked for the label column and the note column to stay visible during the wee…",
+          "truncated": true
+        },
+        "triggerEventId": "evt_0q4m8t1zw6r3h9jd"
+      },
+      "status": "unset",
+      "producerId": "prd_h7k2m9q4t1w6z3xb",
+      "seq": 12,
+      "source": {
+        "file": "src/components/ItemList.tsx",
+        "line": 27,
+        "column": 1,
+        "symbol": "ItemList",
+        "resolvedBy": "react-owner",
+        "confidence": 0.6
+      },
+      "redacted": ["previousValue.preview", "nextValue.preview"]
+    }
+  ]
+}

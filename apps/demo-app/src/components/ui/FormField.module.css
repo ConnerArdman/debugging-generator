@@ -1,0 +1,113 @@
+/*
+ * FormField - the label-and-message wrapper every form control in this storefront sits inside.
+ *
+ * Used by the checkout address and contact fields and by the catalog toolbar's search, sort and
+ * category controls. `FormField.tsx` renders, in this order:
+ *
+ *   <div class={styles.root}>
+ *     <label class={styles.label} for={controlId}>            Label text
+ *       <span class={styles.required} aria-hidden="true">*</span>     (only when required)
+ *     </label>
+ *     {children}                                              the caller's own control
+ *     <p class={styles.hint}  id={hintId}>...</p>             (optional)
+ *     <p class={styles.error} id={errorId} role="alert">...</p>   (optional)
+ *     <p class={styles.counter} id={countId}>118/120 characters</p>  (optional, near the bound)
+ *   </div>
+ *
+ * The control references the two message ids through `aria-describedby`, so the messages are
+ * announced with the control rather than read as loose paragraphs. That wiring lives in the
+ * component; this file only has to make sure the boxes it produces stack in the right order with
+ * the right rhythm, which is the whole reason the wrapper exists.
+ *
+ * Division of labour, stated once so it is not re-litigated per field:
+ *
+ *   * This module styles the wrapper, the label, the required marker and the two message
+ *     paragraphs - nothing else. It declares no `input`, `select` or `textarea` rule and adds no
+ *     margin to its children: `Input.module.css` and `Select.module.css` own the control's own
+ *     box, border, padding and focus ring, and a control dropped in by a caller keeps whatever
+ *     appearance it arrived with.
+ *   * Spacing is `gap` on `.root` alone. Because the gap belongs to the container, showing or
+ *     hiding a hint or an error changes the column's height by exactly that message's own height
+ *     plus one gap and never alters the control's metrics - no collapsing margins, no reflow of
+ *     the field above, and no jump in the control's position as a value is validated.
+ *
+ * The error message is deliberately text-only: bold, in the danger colour, with no icon, no
+ * `::before` glyph and no background image. The application's only icon family is the six-glyph
+ * category set, so an alert mark here would either restate `Alert`'s treatment or add an asset
+ * dependency this folder does not take - and the wording alone has to carry the message anyway,
+ * since colour is never the sole indicator of a problem.
+ *
+ * Every colour, space and type size is read as `var(--ls-TOKEN, <literal fallback>)`. The values
+ * are declared in `app/globals.css`; the fallbacks mirror them so this module also renders
+ * sensibly on its own. Hex spellings are lowercase because Prettier normalises CSS colours and
+ * `pnpm format:check` is a blocking gate - do not "restore" the uppercase form.
+ */
+
+/* The field column. `min-width: 0` lets it shrink inside a flex row or a grid track instead of
+ * being held open by a long hint, which is what keeps a two-column checkout form from widening. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The label sits directly above the control. `cursor: pointer` is honest here: the label always
+ * carries `for`, so clicking it focuses the control. */
+.label {
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+/* The required marker after the label text. Decorative reinforcement only - requiredness reaches
+ * assistive technology through the control's own `required` attribute, and the component hides
+ * this span from the accessibility tree, so no reader hears a stray asterisk. */
+.required {
+  margin-inline-start: var(--ls-space-1, 4px);
+  color: var(--ls-danger, #b42318);
+  font-weight: 600;
+}
+
+/* Supporting guidance under the control: a format example, a units note. Muted, and measured at
+ * 7.5:1 against the surface it appears on. The margin reset is explicit because this is a `<p>`
+ * and a field must not depend on the global reset having run. */
+.hint {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.4;
+}
+
+/* The validation message. Same metrics as the hint, so a field that swaps one for the other keeps
+ * its rhythm, with weight and colour carrying the emphasis (6.4:1 against the surface). */
+.error {
+  margin: 0;
+  color: var(--ls-danger, #b42318);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* The character counter of a bounded field, shown only as its allowance runs out. Same metrics as
+ * the hint, because it is the same kind of remark about the field rather than a problem with it;
+ * `tabular-nums` keeps the figure from shuffling sideways as it counts, and `text-align: end`
+ * places it under the trailing edge of the control where the caret is when it matters. */
+.counter {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-align: end;
+}
+
+/* Past the bound. The counter takes the error's treatment, because at that point it is stating the
+ * same thing the message above it states - how far over the value is - and the two read as one
+ * remark. The message is still what carries the meaning: colour is never the only signal. */
+.counter[data-over='true'] {
+  color: var(--ls-danger, #b42318);
+  font-weight: 600;
+}

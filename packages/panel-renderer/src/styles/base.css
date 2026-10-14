@@ -1,0 +1,409 @@
+/*
+ * @debuggen/panel-renderer — src/styles/base.css
+ *
+ * The reset and element-level base layer of the in-repo design system. It is
+ * part two of the three parts that `tsup.config.ts` concatenates, in exactly
+ * this order, into the single shipped stylesheet `dist/styles.css`:
+ *
+ *   1. src/tokens/tokens.css      GENERATED from src/tokens/tokens.ts by
+ *                                 scripts/build-tokens.mjs. Declares every
+ *                                 `--dg-*` custom property three times: under
+ *                                 `:root` (the dark set, which is the product
+ *                                 default), under `[data-theme="light"]` and
+ *                                 under `[data-theme="high-contrast"]`.
+ *   2. src/styles/base.css        THIS FILE. The reset, the document surface,
+ *                                 the element-level defaults, focus, scrolling,
+ *                                 reduced motion and two global utilities.
+ *   3. src/styles/components.css  Every primitive, layout and component rule.
+ *
+ * Both consumers — the Chrome DevTools panel and the VS Code webview — import
+ * the assembled stylesheet exactly once, through this package's
+ * `./styles.css` export condition. There is no second stylesheet and no
+ * component in this package ships inline visual styles, so these three files
+ * are the complete visual implementation of the product.
+ *
+ * ## What the cascade position obliges
+ *
+ * Tokens are already declared when these rules run, so `var(--dg-*)` may be
+ * used freely — but NO `--dg-*` property may be declared or re-declared here.
+ * The token stylesheet is asserted byte-for-byte against a regeneration of
+ * src/tokens/tokens.ts, and a token that is declared in two places has no
+ * single source of truth.
+ *
+ * The component rules come after this file, so anything a component must be
+ * able to override is written at the lowest practical specificity: element
+ * defaults use `:where(...)`, which contributes zero specificity, so a single
+ * class in components.css always wins without needing a longer selector.
+ * The one deliberate exception is the reduced-motion block at the end, which
+ * has to beat component animations and is therefore the only place in this
+ * package where `!important` is sanctioned.
+ *
+ * ## Zero hardcoded values
+ *
+ * Every colour, spacing, radius, shadow, font, focus ring, stacking level,
+ * proportion, stroke and extent resolves to a `var(--dg-*)` token. The only
+ * literals permitted anywhere in this package are `0`, `none`, `auto`,
+ * `inherit`, `currentColor` and `transparent`, so every number other than
+ * zero is a token: no declaration below writes a length of any unit, a
+ * percentage, a ratio, a factor, an angle or a bare line-height, and no
+ * hexadecimal or functional colour notation — not even inside the reset. A
+ * value with no token has no legal way to be expressed: add it to the token
+ * source, never inline it here. `src/tokens/tokens.test.ts` fails on any
+ * number other than zero written in a declaration value of either authored
+ * stylesheet, and on any border-width keyword.
+ *
+ * ## Relationships are tokens and keywords, never numbers
+ *
+ * A value that only relates a box to its container or to its siblings is a
+ * design decision like any other, and is written the same way:
+ *
+ * - A share of the containing block is a proportion token:
+ *   `--dg-size-full` for a box that fills or is capped at its container,
+ *   `--dg-size-half` for an inset that meets itself in the middle, and
+ *   `--dg-radius-round` for the radius that turns a square into a circle.
+ * - Flexing is written with keywords. `flex: auto` grows and shrinks from the
+ *   content size and `flex: none` holds it; a rule that needs another basis or
+ *   no growth follows the keyword with only that longhand (`flex-basis: 0`,
+ *   `flex-grow: 0`), and a weighted split pane takes its basis, weight and
+ *   grow scale from the split-layout tokens.
+ * - A grid item that spans every track names the lines its grid declares —
+ *   `grid-column: full` against a template bracketed by
+ *   `[full-start] … [full-end]` — and never counts lines. A subgrid inherits
+ *   those names, so its items span the same way.
+ * - Drawn chart geometry is the SVG stroke tokens: `--dg-stroke-width-*` for
+ *   a weight and `--dg-stroke-dash-*` for a dash pattern.
+ * - A component extent — a scroll cap, the floor of a state box, a loading
+ *   silhouette, a tooltip's or a search field's widest, a chart's legible
+ *   minimum — is its own token, a multiple of a space step stated once in the
+ *   token table. A space step pulled the other way (an inward focus ring, a
+ *   bleed into a cell's padding) is `--dg-space-inverse-*`.
+ * - A duration and a rotation are motion tokens, and so is the extent of the
+ *   shimmer gradient a skeleton sweeps.
+ * - A glyph box takes `--dg-icon-size`, which is font-relative in the token
+ *   table itself, and the clip box of `.dg-visually-hidden` takes
+ *   `--dg-hidden-box-size`.
+ * - An edge's weight is its role: a hairline is `--dg-border-width-hairline`
+ *   and an emphasis edge `--dg-border-width-marker`, so no `thin`, `medium` or
+ *   `thick` keyword appears in a border or outline declaration.
+ * - A share of a grid's spare width is a `--dg-column-share-*` token, and the
+ *   unit of a measured number is `--dg-pixel-unit`.
+ *
+ * ## Type roles
+ *
+ * The seven type-role tokens are COMPLETE `font` shorthands that already carry
+ * weight, size, line-height and the family, so a rule sets a role with one
+ * declaration — `font: var(--dg-text-md);`, `font: var(--dg-mono-md);`.
+ * components.css follows the same form. `font-variant-numeric` cannot ride
+ * inside a `font` shorthand and the shorthand resets it, so contexts that want
+ * tabular figures declare `font-variant-numeric: tabular-nums` immediately
+ * after the shorthand, as the monospace rule below does.
+ *
+ * ## Naming contract implemented by components.css
+ *
+ *   dg-<block>              a component or primitive root
+ *   dg-<block>__<element>   a part of that block
+ *   dg-<block>--<variant>   a variant of that block
+ *   dg-is-<state>           a state, always written coupled to a block in CSS
+ *                           (`.dg-row.dg-is-selected`), never on its own
+ *   --dgc-<role>            a component-scoped custom property that a TSX
+ *                           component sets inline for values only it knows
+ *                           (a computed offset, a lane colour). Always
+ *                           consumed with a token fallback, for example
+ *                           `background: var(--dgc-lane-fill, var(--dg-kind-render))`.
+ *
+ * There is no third namespace. Motion durations and easing are design tokens
+ * like every other value — `--dg-motion-duration`, `--dg-motion-easing` and
+ * `--dg-shimmer-duration` — so this file declares no custom property at all
+ * and consumes no constant the token table does not govern.
+ *
+ * The `dg-` prefix on every class keeps these rules from colliding with the
+ * chrome of either host document, which is also why the element-level rules
+ * below stay conservative.
+ *
+ * ## Theming is pure cascade
+ *
+ * A theme is selected by the `data-theme` attribute, written on the panel root
+ * by the layout shell and defined once in src/tokens/theme.ts. Its three
+ * values match the token stylesheet's selectors, and the dark set is served
+ * from `:root`, so it applies with no attribute at all. Consequently not a
+ * single rule in this file is theme-specific: changing that one attribute is
+ * sufficient to restyle every surface, and nothing here depends on JavaScript.
+ * Host variables (the editor's or the browser's own custom properties) are
+ * never referenced; translating a host signal into a theme belongs to the
+ * consumers.
+ *
+ * ## Accessibility rules that outrank appearance
+ *
+ * Keyboard focus is always indicated, and always by `--dg-focus-ring`, so the
+ * high-contrast theme's thicker ring is inherited by construction. The global
+ * `:focus-visible` rule below draws it on the focused element itself. For a
+ * text field or picker, whose native control is borderless inside a visible
+ * box, components.css draws that same ring on the field box — the field's
+ * visible edge — instead of on the control; the ring moves, it is never
+ * removed. De-emphasis is expressed with the muted text and subtle border
+ * tokens, never with `opacity`, which would silently invalidate the contrast
+ * ratios the token test pins.
+ *
+ * Layout is out of scope here: no page scaffolding, no flex or grid
+ * containers, no spacing beyond zeroing user-agent defaults. Spacing and
+ * alignment belong to the layout primitives in components.css.
+ */
+
+/* ==========================================================================
+ * Reset
+ *
+ * Only the user-agent defaults these surfaces actually meet. Element defaults
+ * are written with `:where(...)` so their specificity is zero and any
+ * component rule — or either host document — overrides them with a single
+ * class.
+ * ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* User-agent margins and padding are typographic decisions this design system
+ * makes with the layout primitives instead, so they start from nothing. List
+ * markers are deliberately NOT stripped: the semantics stay intact and the
+ * components that render marker-free lists opt out themselves. */
+:where(h1, h2, h3, h4, h5, h6, p, ul, ol, dl, dd, figure, pre, blockquote, fieldset, legend) {
+  margin: 0;
+  padding: 0;
+}
+
+/* An ordered list that keeps its numbering draws the numerals inside its own
+ * box. The reset above removes the user-agent inline-start padding an
+ * `outside` marker is drawn in, so an outside numeral would hang past the
+ * list's edge — over a card's hairline, or out of a scroll container's clip
+ * in a narrow panel. Inside, every numeral stays visible at any width with no
+ * length to choose. A list that opts out of markers with `list-style: none` is
+ * unaffected: the shorthand resets the position along with the type. */
+:where(ol) {
+  list-style-position: inside;
+}
+
+/* The user-agent fieldset border is a system colour no token can express, so it
+ * is removed rather than recoloured; a bordered group is a component decision. */
+:where(fieldset) {
+  border: 0;
+}
+
+/* Form controls do not inherit typography from the document in any browser, and
+ * their user-agent chrome carries colours from outside the token system. Both
+ * are reset here so the primitives in components.css style them from scratch.
+ * `cursor` is deliberately left untouched: it is per-control behaviour. */
+:where(button, input, select, textarea, optgroup) {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+}
+
+/* Replaced and drawn content: block layout removes the inline baseline gap, and
+ * the full-size cap keeps a wide asset inside its container. */
+:where(img, svg, canvas) {
+  display: block;
+  max-width: var(--dg-size-full);
+}
+
+[hidden] {
+  display: none;
+}
+
+/* The data-table primitive builds on collapsed borders, so row and header rules
+ * are single hairlines rather than doubled cell borders. */
+:where(table) {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+/* ==========================================================================
+ * Document surface and typography
+ *
+ * The product owns the surface in both hosts: each imports this stylesheet at
+ * the root of a document it controls, so the page background, the default text
+ * colour and the default type role are set here at normal specificity rather
+ * than left to the host. Every other rule in this section is `:where(...)` and
+ * therefore freely overridable.
+ * ========================================================================== */
+
+/* A relational anchor, and the reason the `min-height` below is meaningful:
+ * `--dg-size-full` is a percentage, and a percentage min-height resolves
+ * against nothing unless the root box has a definite height. */
+html {
+  height: var(--dg-size-full);
+}
+
+html,
+body {
+  /* Relational, so a short panel still paints the surface to the viewport. */
+  min-height: var(--dg-size-full);
+  background: var(--dg-surface-base);
+  color: var(--dg-text-primary);
+  /* Type roles are complete `font` shorthands; this is the interface body role. */
+  font: var(--dg-text-md);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Statements, URLs and file paths are routinely longer than their column, and
+   * a panel must not grow a horizontal scrollbar because of one of them. */
+  overflow-wrap: break-word;
+  /* Document scrollbars, matched to the theme (see also the `.dg-scroll`
+   * helper, which carries the same pair for nested scroll containers). */
+  scrollbar-width: thin;
+  scrollbar-color: var(--dg-border-strong) var(--dg-surface-base);
+}
+
+/* The document inset. The user-agent body margin is a length no token governs,
+ * and because it sits outside the full-height `min-height` box above it made
+ * every document one margin taller than its viewport, so a panel whose content
+ * fits still showed a scrollbar. A token padding inside the border box
+ * replaces it: the inset comes from the spacing scale and the surface fits the
+ * viewport exactly. A host that composes its own body box (the VS Code webview)
+ * resets both declarations in its own stylesheet. */
+body {
+  margin: 0;
+  padding: var(--dg-space-3);
+}
+
+/* Code, statements, paths and numeric columns. The `font` shorthand resets
+ * `font-variant`, so tabular figures are declared after it — that ordering is
+ * required, not stylistic. */
+:where(code, pre, kbd, samp) {
+  font: var(--dg-mono-md);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One heading role for every level; the heading primitive refines the visual
+ * level per use while the document keeps a correct outline. */
+:where(h1, h2, h3, h4, h5, h6) {
+  font: var(--dg-heading);
+  color: var(--dg-text-primary);
+}
+
+:where(a) {
+  color: var(--dg-accent);
+  text-decoration: none;
+}
+
+/* Underline on hover rather than a colour change, so the affordance does not
+ * depend on colour alone. Written without a `hover` media query because the
+ * only media query this package permits is the reduced-motion one below, and a
+ * text-decoration change cannot stick on a touch device the way a background
+ * change can. */
+:where(a):hover {
+  text-decoration: underline;
+}
+
+::selection {
+  background: var(--dg-accent-muted);
+  color: var(--dg-text-primary);
+}
+
+::placeholder {
+  color: var(--dg-text-muted);
+}
+
+/* A divider drawn in the hairline edge weight, the token every rule and
+ * divider in the design system shares. */
+:where(hr) {
+  border: 0;
+  border-top: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+}
+
+/* ==========================================================================
+ * Focus, scrolling and motion
+ * ========================================================================== */
+
+/* The ring is the token, so the high-contrast theme's thicker ring needs no
+ * rule of its own. `:focus-visible` means a keyboard user sees the ring and a
+ * pointer click does not. The ring is never removed: the one rule that moves
+ * it is the field rule in components.css, which draws this same token at this
+ * same offset on the field box — the visible edge — rather than on the
+ * borderless native control inside it. */
+:focus-visible {
+  outline: var(--dg-focus-ring);
+  outline-offset: var(--dg-space-0);
+}
+
+/* Only the user-agent ring for pointer focus is dropped — deliberately
+ * narrowed to `:focus:not(:focus-visible)` so no keyboard focus can lose its
+ * indicator. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Scroll containers opt in to themed scrollbars with this helper; the rules
+ * that apply it live with the components that scroll. */
+.dg-scroll {
+  overflow: auto;
+  /* A nested list must not scroll the panel once it reaches its own end. */
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dg-border-strong) var(--dg-surface-base);
+}
+
+/* The only media query in this package, and the only sanctioned `!important`.
+ * Both are necessary: component rules are concatenated after this file, so
+ * without `!important` a component's own `transition` or `animation` would win
+ * and the preference would be ignored. Responsiveness is intrinsic and belongs
+ * to the layout primitives, so no length-bearing media query is used anywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ==========================================================================
+ * Global utilities
+ *
+ * These two classes, plus the `.dg-scroll` helper above, are the only classes
+ * this layer defines. Every other class belongs to components.css.
+ * ========================================================================== */
+
+/* Content removed from the visual surface but kept in the accessibility tree:
+ * a table caption a sighted reader infers from the header row, the accessible
+ * name of an icon-only control, a live region's status text.
+ *
+ * `clip-path` does the hiding, so the text stays rendered and announced: an
+ * inset of `--dg-size-half` from every side meets itself in the middle and
+ * leaves no visible area at all. `overflow` clips it, `white-space` stops a
+ * long string from reflowing the clip box, and the `--dg-hidden-box-size`
+ * square — font-relative — bounds the out-of-flow box so it can never extend a
+ * scrollable area: tokens throughout, never the absolute hairline or
+ * far-off-canvas idioms. */
+.dg-visually-hidden {
+  position: absolute;
+  inline-size: var(--dg-hidden-box-size);
+  block-size: var(--dg-hidden-box-size);
+  clip-path: inset(var(--dg-size-half));
+  overflow: hidden;
+  white-space: nowrap;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+/* An icon is a font-relative square that takes its colour from its context, so
+ * it scales with the type role around it and needs no size or colour of its
+ * own: its square is the `--dg-icon-size` token, which is `1em` resolved
+ * against the icon's own font. `fill` and `stroke` are intentionally not set:
+ * the icon library's own `currentColor` attributes resolve through `color`,
+ * which leaves a component free to use either a stroked or a filled glyph.
+ *
+ * `flex: none` keeps it from stretching inside a layout primitive, and
+ * `pointer-events: none` makes it inert — an icon is decoration or a label,
+ * and an interactive icon is one placed inside a button. */
+.dg-icon {
+  flex: none;
+  inline-size: var(--dg-icon-size);
+  block-size: var(--dg-icon-size);
+  color: currentColor;
+  pointer-events: none;
+}

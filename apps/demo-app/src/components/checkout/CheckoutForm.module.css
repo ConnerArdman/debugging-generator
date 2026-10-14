@@ -1,0 +1,313 @@
+/*
+ * Lumen Supply - checkout form layout.
+ *
+ * Imported by one file, its sibling `CheckoutForm.tsx`
+ * (`import styles from './CheckoutForm.module.css';`). Next.js supplies the CSS Modules typing,
+ * so there is no declaration file beside this one.
+ *
+ * What this stylesheet owns: the form's arrangement. The reset that lets the field groups sit
+ * inside the one `<fieldset>` the form locks while an order is in flight, the vertical rhythm of
+ * those titled groups, the two-column field grid and the single point at which it becomes one
+ * column, the placement of the error-summary, shipping, failure, placed-order, confirmation and
+ * submit regions, and the pieces of type it draws itself - the caption beside the place-order
+ * control, the link out of the placed-order notice (which the error summary's entries share) and
+ * the summary's lead and list - plus the indicator that shows where focus landed when the receipt
+ * replaced the fields.
+ *
+ * What it deliberately does not own - each of these belongs to the module of the component that
+ * renders the element, and none of their properties is restated here:
+ *
+ *   ../ui/FormField.module.css   label typography, the required marker, the hint and error lines
+ *   ../ui/Input.module.css       field chrome, focus ring, the invalid appearance
+ *   ../ui/Select.module.css      the same, for a dropdown
+ *   ../ui/Alert.module.css       the tone treatment of the failure notice
+ *   ../ui/Button.module.css      button chrome, sizes and states
+ *   ../ui/Card.module.css        the surface `./OrderConfirmation` renders on
+ *   ./CheckoutButton.module.css  the width, accent and caption of the place-order control
+ *   ./ShippingOptionPicker.module.css  the fieldset reset and the option rows
+ *
+ * `app/globals.css` declares every `--ls-*` custom property and is authored alongside this file,
+ * so each `var()` below carries the literal fallback the token contract publishes and the module
+ * renders sensibly on its own. Lengths the scale does not model are a `calc()` over it, held in a
+ * file-local custom property rather than written inline as a bare number.
+ */
+
+.root {
+  /* The one border width in this file: a quarter of the smallest spacing step, so the hairline
+   * stays on the scale instead of introducing a length of its own. */
+  --checkout-rule-width: calc(var(--ls-space-1, 4px) / 4);
+  /* The field grid and the submit row measure themselves against this element rather than the
+   * window: the checkout page may place an order-summary column beside the form, which makes the
+   * form's own inline size the width that decides how its rows should sit. */
+  container-type: inline-size;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-6, 32px);
+}
+
+/* The group that holds every field of the order, which the form disables while a submission is in
+ * flight. It is a `<fieldset>`, because that is the one element whose disabled state reaches every
+ * control inside it, and this rule is the reset that makes it invisible as a box.
+ *
+ * Two halves. The first removes what a fieldset arrives with - the browser's border, its padding,
+ * its margin and the `min-inline-size: min-content` that would otherwise stop the field grid
+ * shrinking with the column. The second lays the groups out in the same direction and at the same
+ * 32px step as `.root`'s column. The vertical rhythm, the hairline `.section + .section` draws
+ * between consecutive groups (siblings inside this fieldset) and the field grid's container query
+ * all hold: `.root` keeps `container-type`, and a fieldset establishes no containment of its own,
+ * so `.grid` resolves against the form. No `legend` is rendered: each group states its own subject
+ * in the heading it already has, and a second caption here would be the form naming the same thing
+ * twice.
+ *
+ * Nothing about the disabled appearance is declared here. `../ui/Input.module.css` and
+ * `../ui/Select.module.css` each carry their own `:disabled` treatment, which is what a reader
+ * sees, and `disabled` is what assistive technology is told. */
+.fields {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: var(--ls-space-6, 32px);
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+/* A titled group - the shipping address, the contact details - as one quiet column. */
+.section {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Consecutive groups get a hairline as well as the stack gap above, which is what makes a long
+ * form scannable without giving any group a surface, a heavier border or a heading rule of its
+ * own. The first group needs none: the page's own heading already sits above it. */
+.section + .section {
+  border-block-start: var(--checkout-rule-width, 1px) solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-5, 24px);
+}
+
+/* A group's heading. The component renders a real heading element here; this class sets its size
+ * and the space beneath it, and the reading order of the form conveys the structure on its own.
+ *
+ * The leading is the shared `--ls-leading-heading` rather than a ratio of this file's own. It read
+ * 1.3 while the checkout's order-review panel and both dashboard headings took the 1.25 of the
+ * element baseline, so one heading role - the same 18px/600/ink `<h2>` - stood 23.4px tall here and
+ * 22.5px two columns away. */
+.sectionTitle {
+  margin-block-end: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
+}
+
+/* The field rows. `minmax(0, 1fr)` rather than `1fr` is what keeps a long value - a street
+ * address, an order reference - inside its column instead of widening the track; `align-items:
+ * start` keeps a field whose error message has appeared from stretching the field beside it. */
+.grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  row-gap: var(--ls-space-4, 16px);
+  column-gap: var(--ls-space-3, 12px);
+}
+
+/* A field that takes the whole row: the street address, the email. */
+.fieldWide {
+  grid-column: 1 / -1;
+}
+
+/* The shipping group's body. Spacing only - the picker draws its own rows. */
+.shipping {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Where a submission failure is announced, directly above the submit row so a message that
+ * appears moves that row and nothing else. Colour, border and tone are the alert's own. */
+.failure {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  /* Room above the notice when it is scrolled or focused into view, so it does not land flush
+   * against the top edge of the scroll port. */
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* Where the state of the cart is announced when it is not a state the submit row can quote - a
+ * cart the storefront could not read. It sits between the submission notice and the submit row,
+ * beside the control it disables, and takes the same spacing as that notice so a form showing both
+ * reads as one column rather than two. Colour, border and tone are the alert's own. */
+.cartNotice {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* Why the place-order control is unavailable, directly above it. Muted and small: it is the same
+ * kind of remark as a field's hint rather than a failure - the notices above it carry the tone
+ * treatments - and it sits in the flow so that its appearing moves the submit row and nothing
+ * else. `max-width` holds the sentence to a readable measure on a wide form, where the field grid
+ * is two columns and this line would otherwise run the whole width. */
+.outstanding {
+  --checkout-outstanding-measure: calc(var(--ls-space-6, 32px) * 18);
+  max-width: var(--checkout-outstanding-measure, 576px);
+  margin-block: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.5;
+}
+
+/* The error summary a refused validation pass shows at the top of the fields, and the element focus
+ * moves to when it appears. Placement only, as for the notices above: the alert inside owns the
+ * tone, border and padding. The scroll margin gives it the same room the failure notice takes when
+ * it is focused into view. */
+.errorSummary {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* The sentence under the summary's heading: how many problems there are. Body copy at the notice's
+ * own size, with the list's rhythm beneath it. */
+.errorSummaryLead {
+  margin-block: 0 var(--ls-space-2, 8px);
+}
+
+/* The problems, one link per line. A real list so a screen reader announces how many entries
+ * there are; the marker is kept, because each entry is a separate problem and the bullets are what
+ * make a wrapped entry read as one item rather than two. The indent is one spacing step so the
+ * markers sit inside the alert's padding. Each link wears `.noticeLink`, the form's one link
+ * treatment, so the entries read as links by their underline rather than by colour. */
+.errorSummaryList {
+  display: grid;
+  gap: var(--ls-space-1, 4px);
+  margin: 0;
+  padding-inline-start: var(--ls-space-4, 16px);
+}
+
+/* Where an order this tab placed but never showed a receipt for is named, at the top of the form.
+ * It takes the same placement as the two notices above so a form showing any of them keeps one
+ * rhythm, and it leads the column because a buyer who has an order already is not reading the
+ * fields underneath it. Colour, border and tone are the alert's own. */
+.orderNotice {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* The route out of that notice - the order history - as an underlined link rather than a button,
+ * because it navigates. The ink carries the text and the brand accent carries the underline, which
+ * is the pairing `app/globals.css` documents for that token; the global `a` reset removes the
+ * browser's own underline, so the line is declared here.
+ *
+ * The accent colour is never the only thing marking the link: the text is underlined and sits at
+ * full strength on this surface, and it takes the --ls-focus ring when focused. */
+.noticeLink {
+  border-radius: var(--ls-radius-sm, 4px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  text-decoration-line: underline;
+  text-decoration-color: var(--ls-accent, #f59e0b);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+/* Hover is gated so a touch device does not keep the hovered appearance after a tap. */
+@media (hover: hover) {
+  .noticeLink:hover {
+    text-decoration-color: var(--ls-text, #0f172a);
+  }
+}
+
+/* What replaces the fields once the order is placed. The confirmation renders its own surface, so
+ * this is the rhythm between its blocks and nothing more - plus the two properties that make this
+ * element the place focus lands when the receipt arrives, since the control the buyer pressed has
+ * left the document by then. The scroll margin keeps it off the top edge of the scroll port when it
+ * is scrolled into view, exactly as the failure notice above takes it. */
+.confirmation {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* The landing indicator, and only for a reader who is navigating by keyboard: `app/globals.css`
+ * draws the application's one ring on `:focus-visible` and removes it for a focus that is not, so a
+ * buyer who placed the order with the pointer sees nothing here at all.
+ *
+ * It is restated rather than inherited for one reason: the element is a plain container the width
+ * of the column, so the global ring would sit 2px outside the receipt's card and read as a stray
+ * line around the page. Offsetting it by the smallest spacing step and rounding it to the card's
+ * own radius makes the same ring read as what it is - the region a reader has just been moved to -
+ * and the colour, width and behaviour are the global contract's, untouched. */
+.confirmation:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+  border-radius: var(--ls-radius-lg, 12px);
+}
+
+/* The footer. The place-order control leads it and is the only thing on the line until there is
+ * room for a second item - a reassurance line, a returns note - beside it, at which point the
+ * control still takes the larger share. Both widths are basis values rather than breakpoints, so
+ * the row rearranges itself at exactly the width its own contents run out of room. */
+.submitRow {
+  --checkout-submit-basis: calc(var(--ls-space-6, 32px) * 8);
+  --checkout-submit-aside-basis: calc(var(--ls-space-6, 32px) * 5);
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-3, 12px);
+  margin-block-start: var(--ls-space-4, 16px);
+}
+
+.submitRow > :first-child {
+  min-width: 0;
+  flex-grow: 2;
+  flex-shrink: 1;
+  flex-basis: var(--checkout-submit-basis, 256px);
+}
+
+.submitRow > :first-child ~ * {
+  min-width: 0;
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: var(--checkout-submit-aside-basis, 160px);
+}
+
+/* The line beside the place-order control, quoting what is about to be ordered. It is a caption
+ * about the control next to it rather than body copy, so it takes the caption treatment every other
+ * hint in this form takes - one step down the type scale, in the muted ink - and the same line
+ * height the live region under the control uses, so the two lines sit on one rhythm when both are
+ * on screen. Its own module rather than the button's: that stylesheet's caption is the control's
+ * live region, centred under a full-width control, and a CSS Module class does not cross files. */
+.submitCaption {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.4;
+}
+
+/* The form's single breakpoint: below it a row has no room for two labelled controls, so the grid
+ * becomes one column.
+ *
+ * A container-query condition is resolved before the cascade, which is why the length is a
+ * `calc()` over the 32px spacing step (32px x 16) instead of `var(--ls-space-6, 32px)` - a custom
+ * property cannot be substituted into the condition, and a bare 512px would put a length in this
+ * file that answers to nothing. The query is unnamed on purpose: `.root` is the only containment
+ * context between `.grid` and the page, so nearest-container resolution is unambiguous, and a
+ * container name is a custom identifier that a CSS Modules pipeline may or may not scope. The
+ * submit row needs no rule here: its items reach their basis width and wrap to full-width lines
+ * by themselves. */
+@container (max-width: calc(32px * 16)) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

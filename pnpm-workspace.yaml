@@ -1,0 +1,256 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm >=10 reads its settings from this file, NOT from .npmrc, so the three
+# settings the project requires - strict engine checking, automatic peer
+# installation and pre/post lifecycle scripts - live here.
+# (.npmrc keeps the same keys for npm and for older pnpm versions.)
+engineStrict: true
+autoInstallPeers: true
+# Run pre*/post* lifecycle scripts, which three hooks depend on: the
+# apps/chrome-extension `prebuild`/`predev` copy the browser-agent bundle
+# (scripts/copy-agent.mjs), the packages/panel-renderer `prebuild` regenerates
+# tokens.css, and apps/demo-app runs `prisma generate` from both `prebuild` and
+# `pretypecheck`. `true` is also pnpm's default, so this line changes no
+# behaviour today; it is what makes the requirement observable (`pnpm config get
+# enablePrePostScripts` prints it) and holds it against a future default flip,
+# which .npmrc cannot do - pnpm 12.4.2 does not read that file's npm-style
+# `enable-pre-post-scripts`, and setting this key to `false` here is what
+# actually skips the three hooks.
+enablePrePostScripts: true
+
+# NODE_OPTIONS for every script pnpm runs, which is where the one measured memory
+# requirement lives so that no script has to carry a runtime flag or a path into
+# node_modules. `pnpm lint` is exactly `eslint . --max-warnings 0`, and
+# its type-aware pass holds every project's TypeScript program in one process: on
+# the full tree it aborts with "JavaScript heap out of memory" under Node 24's
+# default ~4 GiB heap and completes with this 8 GiB ceiling. A ceiling is not an
+# allocation - a process that never approaches 4 GiB behaves exactly as before.
+#
+# pnpm replaces NODE_OPTIONS with this value rather than merging it, so the
+# inherited value is spliced back in through `${NODE_OPTIONS}`, which pnpm expands
+# from the environment when it reads this file: `--trace-warnings`, `--inspect` or a
+# developer's own `--import` still reach every script, and a caller's own
+# `--max-old-space-size` wins because Node applies the last occurrence. Unset, it
+# expands to nothing. The product code that launches instrumented dev servers
+# (apps/local-service/src/dev-server/launcher.ts, scripts/dev-instrumented.mjs)
+# appends its `--import` of the telemetry preload to whatever arrives here, and
+# never replaces it.
+nodeOptions: "--max-old-space-size=8192 ${NODE_OPTIONS}"
+
+# Dependency lifecycle scripts stay blocked unless they are allowlisted here, so
+# every entry below is a deliberate permission for third-party code to run at
+# install time and the list is kept to the packages that need one. `allowBuilds`
+# is the only live allowlist under the pinned pnpm 12.4.2: it replaced
+# `onlyBuiltDependencies` in pnpm 11, and that key has been silently ignored
+# since, so it is deliberately not carried here as a fallback. `pnpm install` is
+# what keeps this list complete, and it needs no separate audit step: a
+# dependency that declares an install script and is not named here fails the
+# install outright - `Error: ERR_PNPM_IGNORED_BUILDS`, `Ignored build scripts:
+# <name>@<version>`, exit 1 - so adding or upgrading a dependency either
+# installs clean or tells you exactly which entry to add below, with a rationale
+# like the ones above. What pnpm applied is readable back from
+# node_modules/.modules.yaml, which carries `allowBuilds` and `pendingBuilds`
+# after every install and an `ignoredBuilds` array only when a script was
+# skipped. `pnpm ignored-builds` is NOT that check - it reports the ignored set
+# alone, and for the empty set (this repository's state) it prints "Cannot
+# identify as no node_modules found" even with node_modules installed, so it can
+# neither enumerate nor reconcile the list below - and `pnpm approve-builds`
+# only edits it interactively, failing `IO error: not a terminal` off a TTY.
+allowBuilds:
+  # postinstall places the Prisma engine binaries the CLI needs for
+  # `pnpm demo:generate` (`prisma generate`), which `build` and `typecheck` run first.
+  "@prisma/engines": true
+  # postinstall installs the signing binary `@vscode/vsce` needs to package the VSIX.
+  "@vscode/vsce-sign": true
+  # postinstall (`node install.js`) puts the platform esbuild binary in place. 0.28.2 is
+  # the root devDependency used by the extension and agent bundlers, and the `overrides`
+  # block below holds tsup's transitive copy at that same version, so exactly one
+  # esbuild version is resolved and one binary is installed.
+  esbuild: true
+  # preinstall runs the Prisma CLI's platform check before any `prisma` command.
+  prisma: true
+
+# Deliberately absent: @prisma/client, @prisma/instrumentation, playwright,
+# @playwright/test and @vscode/vsce declare no install script at their pinned
+# versions, and Playwright's browsers are fetched by an explicit
+# `playwright install` step rather than at install time.
+
+# Supply-chain install policy. The advisory ledger below answers whether a locked
+# version is known to be vulnerable; this section answers the question a worm
+# release poses before any advisory exists: was this version published minutes
+# ago, or through a weaker publishing path than the releases before it? Both
+# checks run when a resolution picks a version, and again on every
+# `pnpm install --frozen-lockfile`, which verifies each lockfile entry against
+# them before linking anything ("Verifying lockfile against supply-chain
+# policies", 808 entries today), so a hand-edited or foreign lockfile cannot
+# carry a version past them. They complement the advisory gates and do not
+# replace them: `pnpm audit --audit-level=low` and `pnpm check:advisories
+# --online` remain the blocking advisory steps of the `verify` job in
+# .github/workflows/ci.yml.
+#
+# Refuse any version published less than 1440 minutes (one day) ago. The day is
+# the window in which the registry and a package's maintainers detect and pull a
+# compromised release - the pattern of the 2026 npm worm campaigns, the TanStack
+# compromise of May 2026 among them - before an install here can pick it up. 1440
+# is also pnpm's built-in default, and is set explicitly all the same because the
+# built-in value is non-strict: when no version old enough satisfies a range, the
+# immature one is installed anyway and silently recorded in
+# `minimumReleaseAgeExclude`. An explicit value makes the gate strict, so such a
+# pick fails a non-interactive install ("do not meet the minimumReleaseAge
+# constraint") and asks for approval at a terminal, rather than widening the
+# exclusion list unreviewed. npm reads the same cutoff, in days, from
+# `min-release-age` in .npmrc.
+minimumReleaseAge: 1440
+# What an explicit `minimumReleaseAge` already implies under pnpm 12.4.2. Declared
+# so the requirement is observable (`pnpm config get minimumReleaseAgeStrict`
+# prints it) and holds against a future change of default - the reasoning given
+# for `enablePrePostScripts` above.
+minimumReleaseAgeStrict: true
+# Fail the install with ERR_PNPM_TRUST_DOWNGRADE when a version was published
+# through a weaker path than a release of the same package published before it:
+# without the provenance attestation or the trusted-publisher (CI OIDC) identity
+# that earlier release carried. That is the shape of a release pushed with a
+# stolen token, which a compromised account can publish but cannot attest as the
+# project's own CI. It does not catch a hijacked CI pipeline, whose releases carry
+# valid provenance (the May 2026 TanStack releases did); the cooldown above is the
+# control for that case.
+trustPolicy: no-downgrade
+# Refuse git and tarball-URL resolutions for transitive dependencies: they bypass
+# the registry, and with it every check in this section. pnpm's default since v11,
+# declared for the same reason as `minimumReleaseAgeStrict`; the lockfile carries
+# no git or tarball resolution today.
+blockExoticSubdeps: true
+# Reviewed trust-downgrade exceptions: versions `no-downgrade` rejects that were
+# each verified as legitimate before being accepted. Every entry is an exact
+# `name@version`, never a bare name or a range - a bare name exempts every past
+# and future version of the package, including the compromised release this
+# policy exists to stop. An entry is removed when its version leaves the
+# installed graph. A new ERR_PNPM_TRUST_DOWNGRADE is investigated - who published
+# the version, the package's provenance history, and its tarball against the
+# neighbouring trusted release - before an entry is added here with the same
+# kind of justification.
+#
+# Deliberately absent: `trustPolicyIgnoreAfter`, which exempts every version
+# published more than N minutes ago and so neutralises `no-downgrade` for the
+# whole existing graph; and `trustLockfile`, which skips the lockfile
+# verification pass that enforces this section on `pnpm install --frozen-lockfile`.
+trustPolicyExclude:
+  # Arrives via tsup@8.5.1 and via mocha@11.8.0 (@vscode/test-cli); build- and
+  # test-time only. Published 2024-12-18 by its maintainer paulmillr without
+  # provenance, as 4.0.2 was two days earlier, after 4.0.0 and 4.0.1 carried it -
+  # that is the downgrade. Legitimate: on the registry for 21 months, gitHead
+  # 1182965a0d3d884f15db423009262778ddba0ac4, and 5.0.0 later moved to trusted
+  # publishing. Reviewed 2026-09-27.
+  - chokidar@4.0.3
+  # The AAP 0.3.2 pin: the apps/demo-app devDependency and the @prisma/client
+  # peer. Its `preinstall` runs at install time because `allowBuilds` permits it.
+  # Published 2026-08-25T12:47:51Z by `prismabot` (bot-npm@prisma.io, the account
+  # that published 6.0.0-6.19.0) with no provenance, whereas 7.0.0-7.9.1 and
+  # every other 7.10.0 family package (@prisma/client, @prisma/engines,
+  # @prisma/config, @prisma/adapter-pg, @prisma/instrumentation) went out through
+  # GitHub Actions trusted publishing within the same half hour - that is the
+  # downgrade. Reviewed against the registry: the tarball's sha512 is the lockfile
+  # integrity; the install-time code (scripts/preinstall-entry.js and
+  # preinstall/index.js) is byte-identical to the trusted 7.9.1; package.json
+  # differs from 7.9.1 only in version, build commit and dependency bumps; all ten
+  # build/query_compiler_*_bg.*.wasm files (postgresql, sqlite and mysql among
+  # them) are byte-identical to the wasm embedded in the trusted
+  # @prisma/client@7.10.0; build/cli.js references engines hash
+  # 0edf323efd1d98336f3f0a68684b56f689b900d3, the @prisma/engines-version of the
+  # trusted @prisma/engines@7.10.0; no new external host appears, and no known
+  # worm marker is present. Drop this entry once a trusted-published version is
+  # pinned. Reviewed 2026-09-27.
+  - prisma@7.10.0
+  # Arrives via @crxjs/vite-plugin@2.7.1 (an AAP 0.3.2 pin; crxjs 3.0.0 still pins
+  # it exactly); build-time only. Published 2026-02-22T06:17Z by lead maintainer
+  # lukastaegert, without provenance, as the 2.x backport of the CVE-2026-27606
+  # fix; 3.30.0 went out the same day from the same account. 4.x uses trusted
+  # publishing (4.58.0 on 2026-02-20, for one) - that is the downgrade.
+  # Legitimate: the integrity matches the lockfile, and gitHead
+  # d17ae15336a45c3c59b2a4aacac2b14186035d28 matches the upstream v2.80.0 tag.
+  # Reviewed 2026-09-27.
+  - rollup@2.80.0
+  # Arrives via @babel/core@7.29.7 and its @babel/helper-compilation-targets,
+  # which eslint-plugin-react-hooks 7.1.1 and next (through styled-jsx's
+  # @babel/core peer) pull in; build- and lint-time only. Published 2023-07-10 by
+  # npm CLI team member lukekarrys as the 6.x backport of the CVE-2022-25883 ReDoS
+  # fix, without the provenance that 7.5.1-7.5.4 carried through npm-cli-ops -
+  # that is the downgrade. Legitimate: the maintainers' own security backport, on
+  # the registry for over three years. Reviewed 2026-09-27.
+  - semver@6.3.1
+
+# Transitive resolutions this workspace forces, and the advisory ledger for the
+# installed dependency graph: one entry per advisory that `pnpm audit` reported
+# against a version some upstream range resolved to, each naming the advisory it
+# closes and the path the vulnerable copy arrived by. None of them can be fixed in
+# a manifest, because none of the five is a dependency any workspace declares at
+# the vulnerable version - they are pulled in by prisma, by @vscode/test-cli's
+# mocha and by tsup - so the frozen dependency inventory (AAP 0.3.2) is unchanged
+# by this block: `diff` and `esbuild` are forced to exactly the versions
+# packages/instrumentation and the root manifest already pin, which collapses each
+# of those to a single resolved version, and the other three are transitive-only.
+#
+# Exact versions, as every manifest pin is exact: a range would let the installed
+# graph drift between two installs of one commit. The policy these entries
+# implement is that the graph carries no known-vulnerable version - an advisory is
+# closed by an entry here, by an upgrade of the package that owns the range, or by
+# an explicit review recorded alongside it, never by being left to a warning. So
+# adding or upgrading a dependency means re-running `pnpm audit` and reconciling
+# this block with what it reports; an entry whose upstream range has moved past the
+# patched version stops being load-bearing and should be deleted, and the same
+# command proves that either way.
+#
+# THE GATE THAT ENFORCES THIS: the committed lockfile audits clean, and every
+# lockfile change is re-checked by
+#
+#   pnpm audit --audit-level=low
+#
+# which runs as the blocking "Audit dependencies" step of the `verify` job in
+# .github/workflows/ci.yml, directly after `pnpm install --frozen-lockfile`. Any
+# advisory at or above `low` fails that job until it is reconciled here. It is
+# deliberately NOT a root script and not part of the `verify` script: the root
+# script list and the `verify` chain are fixed (README.md, "Testing and quality
+# gates"), and `verify` must stay runnable offline, which an audit call is not -
+# so run the same command locally before pushing a dependency change. A reviewed
+# advisory - one accepted rather than eliminated - is recorded here beside the
+# overrides as a comment carrying its GHSA id, the reason it is accepted and the
+# date, so the exception is reviewable in the pull request that adds it; there is
+# none today.
+overrides:
+  # GHSA-ggr8-5vv4-36mx (high): stack exhaustion when merging recursive object
+  # graphs, patched in 8.0.0. Arrives as prisma -> @prisma/config -> deepmerge-ts,
+  # which every `prisma generate` loads, so it is in the path of `pnpm build` and
+  # `pnpm typecheck` through `demo:generate`. 8.0.2 keeps the `deepmerge` named
+  # export @prisma/config destructures and the same dual CJS/ESM entry points.
+  deepmerge-ts: "8.0.2"
+  # GHSA-73rr-hh4g-fpgx (low): denial of service in `parsePatch`/`applyPatch`,
+  # patched in 8.0.3. Arrives as @vscode/test-cli -> mocha -> diff@7, the diff the
+  # Mocha reporter renders for a failed assertion. 9.0.0 is the version
+  # packages/instrumentation pins for its unified modification diffs (AAP 0.3.2),
+  # so this leaves one copy in the graph, and it still exports the `createPatch`
+  # and `diffWordsWithSpace` entry points that reporter calls.
+  diff: "9.0.0"
+  # GHSA-g7r4-m6w7-qqqr (low): arbitrary file read from the development server on
+  # Windows, affecting 0.27.3 - 0.28.0 and patched in 0.28.1. Arrives twice through
+  # tsup (directly and through bundle-require). 0.28.2 is the root devDependency
+  # (AAP 0.3.2) that apps/vscode-extension/esbuild.mjs and the two telemetry
+  # bundlers already run, so tsup builds against the same esbuild the rest of the
+  # repository does.
+  esbuild: "0.28.2"
+  # GHSA-3f6p-5ww8-9rcr (high): authentication-plugin downgrade to
+  # mysql_clear_password leaking plaintext credentials, patched in 3.22.0; and
+  # GHSA-rgwj-5xj2-c3m3 (moderate): unbounded zlib inflate in the compressed
+  # protocol handler, patched in 3.23.1. Arrives as prisma -> mysql2, the CLI's
+  # MySQL connector, which this project never uses - the demo speaks to PostgreSQL
+  # through @prisma/adapter-pg - but the copy is installed all the same.
+  mysql2: "3.24.4"
+  # GHSA-5c6j-r48x-rmvq (high): remote code execution via `RegExp.flags` and
+  # `Date.prototype.toISOString`, patched in 7.0.3; and GHSA-qj8w-gfj5-8c6v
+  # (moderate): CPU-exhaustion denial of service from crafted array-like objects,
+  # patched in 7.0.5. Arrives as @vscode/test-cli -> mocha -> serialize-javascript,
+  # which Mocha uses to hand run options to its worker pool under `--parallel`.
+  # 7.1.1 keeps the single-function `serialize(value, options)` API that call site
+  # uses and requires Node >= 20, satisfied by the pinned Node 24.21.0.
+  serialize-javascript: "7.1.1"

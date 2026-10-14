@@ -1,0 +1,308 @@
+[
+  {
+    "id": "evt_0q4m8t1zw6r3h9jd",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "a4f17c2e9b035d68",
+    "kind": "interaction",
+    "name": "click button",
+    "startTime": 1789812900000,
+    "duration": 1175.402,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click",
+      "target.selector": "#widget-panel-load",
+      "target.tagName": "button",
+      "target.text": "Load items",
+      "componentChain": ["FilterPanel", "WidgetPanel"],
+      "interactionId": 4217,
+      "inputDelay": 1.604,
+      "processingStart": 1789812900002.118,
+      "processingEnd": 1789812900010.545
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 1,
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 11
+  },
+  {
+    "id": "evt_5n2k7v9b1x4c6ptl",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "7c53e1a08d2f4b91",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "function",
+    "name": "handleWidgetClick",
+    "startTime": 1789812900002.118,
+    "duration": 6.309,
+    "tier": "browser",
+    "attributes": {
+      "symbol": "handleWidgetClick",
+      "module": "src/components/WidgetPanel.tsx",
+      "actionId": "act_k3n7q1v5x9b2d6fh",
+      "async": false
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 2,
+    "source": {
+      "file": "src/components/WidgetPanel.tsx",
+      "line": 48,
+      "column": 3,
+      "symbol": "handleWidgetClick",
+      "endLine": 63,
+      "resolvedBy": "patch",
+      "confidence": 1
+    },
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 12
+  },
+  {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"],
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 13
+  },
+  {
+    "id": "evt_1r6y4u8i3o9p2akn",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "2e6a71f4c09b38d5",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "perf.longtask",
+    "name": "longtask",
+    "startTime": 1789812900003.5,
+    "duration": 107.5,
+    "tier": "browser",
+    "attributes": {
+      "attribution": "window",
+      "blockingTime": 57.5
+    },
+    "status": "unset",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 4,
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 14
+  },
+  {
+    "id": "evt_7t0e9w2q4r6y8ufb",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "9d40b7e2a615cf83",
+    "parentSpanId": "a4f17c2e9b035d68",
+    "kind": "commit",
+    "name": "React commit",
+    "startTime": 1789812901124.86,
+    "duration": 47.126,
+    "tier": "browser",
+    "attributes": {
+      "phase": "update",
+      "renderCount": 12,
+      "rootName": "#app-root"
+    },
+    "status": "unset",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 5,
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 15
+  },
+  {
+    "id": "evt_3g5h1j7k9l0z2xcv",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "5a83c19fe7204db6",
+    "parentSpanId": "9d40b7e2a615cf83",
+    "kind": "render",
+    "name": "ItemList",
+    "startTime": 1789812901128.34,
+    "duration": 12.418,
+    "tier": "browser",
+    "attributes": {
+      "component": "ItemList",
+      "phase": "update",
+      "renderCount": 4,
+      "changedProps": [
+        {
+          "key": "items",
+          "previous": { "type": "array", "preview": "Array(0)", "truncated": false },
+          "next": { "type": "array", "preview": "Array(24)", "truncated": false }
+        },
+        {
+          "key": "onSelect",
+          "previous": { "type": "function", "preview": "function onSelect", "truncated": false },
+          "next": { "type": "function", "preview": "function onSelect", "truncated": false }
+        }
+      ],
+      "trigger": "props",
+      "actualDuration": 12.418,
+      "ownerChain": ["WidgetPanel"],
+      "selfTime": 3.204
+    },
+    "status": "unset",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 6,
+    "source": {
+      "file": "src/components/ItemList.tsx",
+      "line": 27,
+      "column": 1,
+      "symbol": "ItemList",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    },
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 16
+  },
+  {
+    "id": "evt_9b4n6m8q1w3e5rty",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "c7e204b91a63f85d",
+    "parentSpanId": "b18d9047e35ca2f6",
+    "kind": "http.server",
+    "name": "GET /api/items",
+    "startTime": 1789812900021.76,
+    "duration": 1096.284,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.route": "/api/items",
+      "http.status_code": 200,
+      "next.route": "/api/items",
+      "next.span_type": "BaseServer.handleRequest"
+    },
+    "status": "ok",
+    "producerId": "prd_c5v8n2b6m0q4w9jt",
+    "seq": 1,
+    "redacted": ["url"],
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 17
+  },
+  {
+    "id": "evt_2z8x6c4v0b1n3mfs",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "1f9b62d5a08e4c37",
+    "parentSpanId": "c7e204b91a63f85d",
+    "kind": "route.handler",
+    "name": "executing api route (app) /api/items",
+    "startTime": 1789812900024.912,
+    "duration": 1090.44,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "http.route": "/api/items",
+      "next.route": "/api/items",
+      "next.span_type": "AppRouteRouteHandlers.runHandler",
+      "symbol": "GET"
+    },
+    "status": "ok",
+    "producerId": "prd_c5v8n2b6m0q4w9jt",
+    "seq": 2,
+    "source": {
+      "file": "app/api/items/route.ts",
+      "line": 14,
+      "column": 8,
+      "symbol": "GET",
+      "resolvedBy": "route-map",
+      "confidence": 0.9
+    },
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 18
+  },
+  {
+    "id": "evt_6d1f3g5h7j9k0lpw",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "84c0d3fa5b71e926",
+    "parentSpanId": "1f9b62d5a08e4c37",
+    "kind": "function",
+    "name": "loadItems",
+    "startTime": 1789812900031.204,
+    "duration": 1078.51,
+    "tier": "server",
+    "attributes": {
+      "symbol": "loadItems",
+      "module": "src/server/services/items.service.ts",
+      "actionId": "act_p8r2t6y0u4i9o3as",
+      "async": true
+    },
+    "status": "ok",
+    "producerId": "prd_c5v8n2b6m0q4w9jt",
+    "seq": 3,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 34,
+      "column": 3,
+      "symbol": "loadItems",
+      "endLine": 58,
+      "resolvedBy": "patch",
+      "confidence": 1
+    },
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 19
+  },
+  {
+    "id": "evt_4a7s2d9f1g3h5jkz",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "6b2f8e91d4a07c53",
+    "parentSpanId": "84c0d3fa5b71e926",
+    "kind": "db.query",
+    "name": "SELECT items",
+    "startTime": 1789812900036.881,
+    "duration": 1042.219,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT id, name, unit_price FROM items WHERE category_id = $1 AND archived = $2 ORDER BY name LIMIT $3",
+      "db.rowCount": 24,
+      "db.operation": "SELECT",
+      "db.name": "appdb",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_c5v8n2b6m0q4w9jt",
+    "seq": 4,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 41,
+      "column": 22,
+      "symbol": "loadItems",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    },
+    "sessionId": "ses_k9m3q7t1w5z8b2df",
+    "captureId": "cap_p4s8v2y6a0c3e7gj",
+    "ingestSeq": 20
+  }
+]

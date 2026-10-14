@@ -1,0 +1,157 @@
+/*
+ * Lumen Supply - product gallery.
+ *
+ * The CSS Module for `ProductGallery.tsx`: one large stage image and, beneath it, a horizontally
+ * scrolling strip of thumbnail buttons, one per image. It is the only stylesheet that styles
+ * that component, and it styles nothing else.
+ *
+ * Token contract: every colour, spacing step and radius below is read as
+ * `var(--ls-NAME, <literal fallback>)`. The declarations live once, in `app/globals.css`; the
+ * fallbacks here mirror them so the component renders sensibly on a bare page that never loaded
+ * that stylesheet, and renders the application's palette inside the application. When the two
+ * ever disagree, the declaration in `globals.css` is what paints.
+ *
+ * Beyond the structural literals a stylesheet cannot tokenise - a zero, a percentage, a border
+ * or outline width - two values are deliberately spelled out. The `4 / 3` frame ratio is the
+ * intrinsic ratio of the committed `public/products/*.svg` assets (each `400 x 300`), and
+ * `4.5rem` is the thumbnail track width, in `rem` so the strip grows with the reader's browser
+ * font size. Both are geometry this component owns, not palette the application shares.
+ *
+ * Why the thumbnail rules name the strip and its list item as well as the thumbnail: the
+ * thumbnail class lands on the shared `Button` (ghost variant), whose own module sets padding,
+ * background and border colour from `.root[data-size='…']` and `.root[data-variant='…']` rules.
+ * Each of those weighs one class plus one attribute, so a lone `.thumb` sits below them and
+ * `.thumbs .thumb` merely ties them - a tie is broken by stylesheet order, and a frame that
+ * silently inherits the button's 8px/16px text padding shrinks its own artwork to under a third
+ * of the frame. Naming the list item adds the one type selector that settles it outright, and it
+ * is simply true of the markup: a `<ul>` may contain nothing but `<li>`. The button's hover
+ * treatment stays above these rules, and so stays the button's to define.
+ */
+
+/* The gallery as a whole: stage above strip. `min-width: 0` lets the scrolling strip below stay
+ * inside its column instead of widening the page grid it sits in. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* The main image frame. The ratio is declared rather than inherited from the file, so the box is
+ * reserved before the image arrives and the page never shifts when the reader picks a different
+ * thumbnail; with images switched off the empty frame still holds its place and the `alt` text
+ * reads inside it. `position: relative` makes the frame the containing block for anything a
+ * later revision overlays on it (a zoom affordance, a stock ribbon). */
+.stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-lg, 12px);
+  background: var(--ls-surface-sunken, #f8fafc);
+}
+
+/* `contain` rather than `cover`: these are line-art product drawings, and cropping one loses the
+ * part of the drawing that identifies the part. */
+.image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* The thumbnail strip. It scrolls sideways rather than wrapping, so a product with a dozen
+ * images keeps the page's vertical rhythm. Smooth scrolling is what moves the strip when `Tab`
+ * reaches a thumbnail that is out of view - the reduced-motion rule below turns exactly that
+ * off, at this rule's own specificity, because the baseline in `globals.css` carries none.
+ *
+ * The padding is load-bearing on all four sides, and replaces the list indent a `<ul>` starts
+ * with. `overflow-x: auto` computes `overflow-y` to `auto` as well, which makes the strip a
+ * scroll container that clips at its padding box: the focus ring below is drawn two pixels
+ * outside a thumbnail's border box, so on any side where the strip reserves no room the ring is
+ * cut off - with no padding it loses its top segment on every thumbnail and its outer segment on
+ * the first and last. One spacing step clears the ring's four pixels of reach, and the bottom
+ * step is also the room the horizontal scrollbar needs to stay clear of the frames above it. */
+.thumbs {
+  display: flex;
+  margin: 0;
+  padding: var(--ls-space-1, 4px);
+  gap: var(--ls-space-2, 8px);
+  overflow-x: auto;
+  list-style: none;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ls-mist, #cbd5e1) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thumbs {
+    scroll-behavior: auto;
+  }
+}
+
+/* One thumbnail frame: geometry and selection only. Colour, type and hover belong to the ghost
+ * button underneath it. The fixed track width plus `flex: 0 0 auto` is what gives the strip
+ * something to scroll, and `position: relative` makes the frame the containing block for the
+ * absolutely positioned text the control carries for screen readers - without it that text is
+ * laid out against the page, escapes both this frame and the strip's scroll container, and adds
+ * its offset to the document's scrollable width. */
+.thumbs li .thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 4.5rem;
+  aspect-ratio: 4 / 3;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface, #ffffff);
+}
+
+/* The selected thumbnail. The inset outline is a shape the unselected frames do not have, so the
+ * selection survives being read in greyscale, and it survives forced colours too, where a
+ * background swap would be repainted away. Colour is not carrying this alone in any case: the
+ * component marks the same thumbnail with `aria-pressed` and names it in hidden text.
+ *
+ * The border and the inset outline are both drawn in --ls-accent-strong, the token `globals.css`
+ * assigns to an accent line that marks a state. The frame is the visible mark of the selection,
+ * so it must clear the 3:1 non-text minimum (WCAG 1.4.11) against the colours on either side of
+ * it: the white page and thumbnail surface (5.0:1) and the #f8fafc panel the product artwork is
+ * drawn on (4.8:1). The amber --ls-accent is a fill colour and measures about 2.1:1 on both, so
+ * it does not draw this frame. */
+.thumbs li .thumb[aria-pressed='true'] {
+  border-color: var(--ls-accent-strong, #b45309);
+  outline: 2px solid var(--ls-accent-strong, #b45309);
+  outline-offset: -2px;
+}
+
+/* Keyboard focus. Declared after the selected state so a focused thumbnail shows the ring even
+ * when it is the selected one, and offset outwards so the ring and the frame never draw on the
+ * same pixels. An element has only one outline, so focusing the selected thumbnail replaces its
+ * inset ring; the strong-accent frame underneath is what still marks it as the current image. */
+.thumbs li .thumb:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* Forced colours repaint every border and outline with the system palette, so the strong-accent
+ * frame and the teal ring arrive in the same colour and neither the selection nor the difference
+ * between the two states survives on colour. Two adjustments keep them legible: the system
+ * highlight names the selection deliberately rather than by accident, and the selected frame
+ * carries twice the border weight - a thickness focus cannot repaint away, which is what tells a
+ * focused selected thumbnail from a focused unselected one. The frame's outer box is unchanged,
+ * so nothing shifts around it. */
+@media (forced-colors: active) {
+  .thumbs li .thumb[aria-pressed='true'] {
+    border-width: 2px;
+    outline-color: Highlight;
+  }
+}
+
+.thumbImage {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}

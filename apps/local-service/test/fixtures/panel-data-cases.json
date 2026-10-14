@@ -1,0 +1,963 @@
+{
+  "description": "Table-driven expectations for POST /sessions/:id/panel-data, interpreted by apps/local-service/test/integration/panel-data.test.ts. Every expected number is derived from the fixtures a case names (all in this folder) and the documented resolver contract of apps/local-service/src/panels/data.ts and packages/protocol/src/http.ts, and each case's `derivation` states how. A mismatch with the running service is therefore a finding against the service, never a reason to edit a fixture or a number here. `constants` mirrors DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT and DATA_QUERY_DEFAULT_OFFSET of packages/panel-schema/src/nodes/query.ts: the suite must assert it equals the imported constants, so a changed constant fails loudly here instead of silently weakening a case. `caseFields` defines the keys of a case and `vocabulary` the closed set of `expect` keys; an `expect` key absent from `vocabulary` is a defect in this file.",
+  "constants": {
+    "defaultLimit": 200,
+    "maxLimit": 5000,
+    "defaultOffset": 0
+  },
+  "caseFields": {
+    "name": "Unique kebab-case identifier of the case.",
+    "ingest": "Fixture files ingested, in order, into one capture of one session before the query runs. Two lists are either identical (one shared capture) or disjoint, so every capture fits in one store; the store refuses an event id already stored under another session, so a fixture must never be ingested twice into one store.",
+    "query": "The request body, sent verbatim.",
+    "surface": "Optional. \"resolver\" marks a query that protocol's request schema (dataQuerySchema, limit at most DATA_QUERY_MAX_LIMIT) refuses: over HTTP the suite must observe 400 with code PROTOCOL_INVALID_MESSAGE, and `expect` applies to PanelDataResolver.resolve called with the same query. Absent means `expect` applies to the HTTP response.",
+    "expect": "Assertions over the DataResult, using only the keys of `vocabulary`. The result's `source` always equals the query's.",
+    "derivation": "How every expected value follows from the ingested fixtures and the documented contract."
+  },
+  "vocabulary": {
+    "paged": "true: an array-valued source; the response carries total, limit, offset and nextOffset. false: trace, componentTree or graph; the response carries none of those four keys.",
+    "total": "response.total: items the filtered source holds, counted before limit and offset.",
+    "count": "Length of the response's payload array, the field named after the source.",
+    "hasNextOffset": "true: response.nextOffset is an integer. false: response.nextOffset is null. The key is present either way, because protocol's dataPageShape declares it required and nullable and null marks the last page.",
+    "nextOffset": "The integer response.nextOffset must equal. Given only with hasNextOffset true.",
+    "firstId": "id of the first payload row.",
+    "lastId": "id of the last payload row.",
+    "orderedIds": "ids of every payload row, in response order. Given only for pages small enough to list.",
+    "groups": "Partial row descriptors for an aggregate source, matched as a set: groups.length equals count and each descriptor matches exactly one distinct row. Each key names a field of the row type and is compared by deep equality, except occurrenceIds, which is compared with the ids of the row's occurrences, in order. Row order is asserted only by orderedIds, firstId and lastId.",
+    "values": "metrics only: one entry per payload value, in response order, which must be METRIC_IDS order. Each entry gives id and available; value, when given, must equal the response's value exactly. available false also requires the response's value key to be absent.",
+    "nodeCount": "componentTree: response.componentTree.nodeCount. graph: response.graph.nodes.length.",
+    "maxDepth": "componentTree: response.componentTree.maxDepth.",
+    "origin": "componentTree: response.componentTree.origin.",
+    "nodeKinds": "graph: the distinct kind values of response.graph.nodes, listed in DEPENDENCY_NODE_KINDS order and compared as that exact list.",
+    "deferTo": "A fixture in this folder holding the full expectation of the case; the suite applies that file's assertions to the response instead of restating them here."
+  },
+  "cases": [
+    {
+      "name": "spans-default-limit-first-page",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "sort": "start_asc"
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 200,
+        "hasNextOffset": true,
+        "nextOffset": 200,
+        "firstId": "evt_vl00000000000001",
+        "lastId": "evt_vl00000000000200"
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. No limit or offset is sent, so the defaults 200 and 0 apply: rows 1-200 in start order, total 220 counted before paging, and nextOffset 0 + 200 = 200 because 20 rows remain."
+    },
+    {
+      "name": "spans-second-page-is-last",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "sort": "start_asc",
+        "offset": 200
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 20,
+        "hasNextOffset": false,
+        "firstId": "evt_vl00000000000201",
+        "lastId": "evt_vl00000000000220"
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. offset 200 with the default limit 200 returns the remaining rows 201-220; 200 + 20 = 220 is not below total, so nextOffset is null. Together with the first page this visits every id exactly once."
+    },
+    {
+      "name": "spans-limit-at-maximum",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "sort": "start_asc",
+        "limit": 5000
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 220,
+        "hasNextOffset": false,
+        "firstId": "evt_vl00000000000001",
+        "lastId": "evt_vl00000000000220"
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. limit 5000 equals DATA_QUERY_MAX_LIMIT and is accepted by the request schema; it exceeds the 220 rows, so one page holds them all and nextOffset is null."
+    },
+    {
+      "name": "spans-limit-above-maximum-is-clamped",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "sort": "start_asc",
+        "limit": 6000
+      },
+      "surface": "resolver",
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 220,
+        "hasNextOffset": false,
+        "firstId": "evt_vl00000000000001",
+        "lastId": "evt_vl00000000000220"
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. limit 6000 exceeds DATA_QUERY_MAX_LIMIT: dataQuerySchema refuses it over HTTP (400), while resolvePaging clamps it to 5000 rather than failing, so the resolver answers successfully with all 220 rows, a limit echo of 5000 and nextOffset null."
+    },
+    {
+      "name": "spans-default-sort-is-duration-desc",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "limit": 2
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 2,
+        "hasNextOffset": true,
+        "nextOffset": 2,
+        "orderedIds": ["evt_vl00000000000001", "evt_vl00000000000220"]
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. With no sort the spans source orders duration_desc (DEFAULT_SORT_BY_SOURCE): evt_vl00000000000001 (1400 ms) then evt_vl00000000000220 (98.75 ms), the two unique longest durations. Start order would have given evt_vl00000000000002 second."
+    },
+    {
+      "name": "spans-count-desc-ranks-by-name-group",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "spans",
+        "sort": "count_desc",
+        "limit": 2
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 2,
+        "hasNextOffset": true,
+        "nextOffset": 2,
+        "orderedIds": ["evt_vl00000000000001", "evt_vl00000000000002"]
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. count_desc on a flat record list ranks each row by the size of its operation-name group, then the name in UTF-8 byte order, then the id. All 220 names are distinct, so every group has one row and the name decides: 'click TrailList refresh' (evt_vl00000000000001) sorts before 'resource /static/tiles/000002.json' (evt_vl00000000000002). The requested sort is applied, never replaced by the spans default duration_desc, which would have given evt_vl00000000000220 second."
+    },
+    {
+      "name": "events-count-only-page",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "limit": 0
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 0,
+        "hasNextOffset": false
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. limit 0 is an explicit count-only request: no rows, the real total 220, and nextOffset null because a page that returned nothing is the last page."
+    },
+    {
+      "name": "events-offset-past-end",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "offset": 300
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 0,
+        "hasNextOffset": false
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. offset 300 lies past the 220 rows: an empty page, not an error, with total still 220 and nextOffset null."
+    },
+    {
+      "name": "events-tie-block-start-asc",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "sort": "start_asc",
+        "limit": 5,
+        "offset": 100
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 5,
+        "hasNextOffset": true,
+        "nextOffset": 105,
+        "orderedIds": [
+          "evt_vl00000000000101",
+          "evt_vl00000000000102",
+          "evt_vl00000000000103",
+          "evt_vl00000000000104",
+          "evt_vl00000000000105"
+        ]
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. Positions 100-109 in start order hold the tie block evt_vl00000000000101-110, which share startTime 1789819200505 and duration 12.5, so only the secondary key id ascending orders them. offset 100, limit 5 therefore returns the first five ids of the block, and nextOffset is 100 + 5 = 105."
+    },
+    {
+      "name": "events-tie-block-duration-desc",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "sort": "duration_desc",
+        "limit": 10,
+        "offset": 164
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 10,
+        "hasNextOffset": true,
+        "nextOffset": 174,
+        "orderedIds": [
+          "evt_vl00000000000101",
+          "evt_vl00000000000102",
+          "evt_vl00000000000103",
+          "evt_vl00000000000104",
+          "evt_vl00000000000105",
+          "evt_vl00000000000106",
+          "evt_vl00000000000107",
+          "evt_vl00000000000108",
+          "evt_vl00000000000109",
+          "evt_vl00000000000110"
+        ]
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. Exactly 164 events last longer than 12.5 ms and no other event lasts exactly 12.5 ms, so under duration_desc positions 164-173 are the ten tie-block events, ordered by id ascending. nextOffset is 164 + 10 = 174 because 46 rows remain."
+    },
+    {
+      "name": "events-duration-desc-head",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "sort": "duration_desc",
+        "limit": 3
+      },
+      "expect": {
+        "paged": true,
+        "total": 220,
+        "count": 3,
+        "hasNextOffset": true,
+        "nextOffset": 3,
+        "orderedIds": ["evt_vl00000000000001", "evt_vl00000000000220", "evt_vl00000000000039"]
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. The unique maximum is evt_vl00000000000001 (1400 ms), then the unique evt_vl00000000000220 (98.75 ms); five events tie at 60 ms (evt_vl00000000000039, evt_vl00000000000079, evt_vl00000000000119, evt_vl00000000000159, evt_vl00000000000199) and id ascending puts evt_vl00000000000039 third."
+    },
+    {
+      "name": "events-filter-kinds-narrows-total",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "sort": "start_asc",
+        "filter": {
+          "kinds": ["perf.entry"]
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 219,
+        "count": 200,
+        "hasNextOffset": true,
+        "nextOffset": 200,
+        "firstId": "evt_vl00000000000002",
+        "lastId": "evt_vl00000000000201"
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. The kinds filter removes the one interaction, evt_vl00000000000001, before counting: total is 219, not 220, and the first default page holds the 200 perf.entry rows evt_vl00000000000002-201 in start order."
+    },
+    {
+      "name": "events-empty-unknown-trace",
+      "ingest": ["telemetry-volume-paging.json"],
+      "query": {
+        "source": "events",
+        "filter": {
+          "traceId": "ffffffffffffffffffffffffffffffff"
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 0,
+        "count": 0,
+        "hasNextOffset": false
+      },
+      "derivation": "telemetry-volume-paging.json holds 220 browser events, evt_vl00000000000001 to evt_vl00000000000220, whose (startTime, id) order is their file order; none is an error or state kind, so the spans source keeps all 220. Every event belongs to trace 4a6c8e0a2c4e6a8c0e2a4c6e8a0c2e4a, so a traceId filter naming another trace matches nothing: a successful empty page with total 0 and nextOffset null, never an error (AAP 0.5.5)."
+    },
+    {
+      "name": "trace-cross-tier",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "trace",
+        "filter": {
+          "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e"
+        }
+      },
+      "expect": {
+        "paged": false,
+        "deferTo": "panel-data-expected-trace-tree.json"
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. A trace is one value, so it carries no page. The traceId filter selects the cross-tier trace only; the perf/errors events belong to another trace and cannot appear in it, so panel-data-expected-trace-tree.json (9 nodes rooted at span 0000000000000a01, one flagged orphan) applies unchanged."
+    },
+    {
+      "name": "graph-cross-tier-trace",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "graph",
+        "filter": {
+          "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e"
+        }
+      },
+      "expect": {
+        "paged": false,
+        "nodeCount": 8,
+        "nodeKinds": ["ui-event", "function", "api", "service", "database"]
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. The traceId filter keeps the 9 cross-tier events. Participants collapse by class, tier and identity: the two db.query spans share the database class, the db tier and the span name pg.query, so they form one node, and the other seven events are distinct participants: 8 nodes. The render is identified by its component, ConditionsPanel; no ancestor of it rendered in the slice, so it keeps hanging from its span parent, the fetch. KIND_TO_DEPENDENCY_NODE_KIND maps interaction and commit to ui-event, render and function to function, fetch and http.server to api, route.handler to service and db.query to database; no http.client span exists, so external is absent. A graph is one value and carries no page."
+    },
+    {
+      "name": "spans-filter-tier-server",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "spans",
+        "sort": "duration_desc",
+        "filter": {
+          "tier": "server"
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 3,
+        "count": 3,
+        "hasNextOffset": false,
+        "orderedIds": ["evt_ct00000000000003", "evt_ct00000000000004", "evt_ct00000000000005"]
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. Four events are server tier: http.server evt_ct00000000000003 (1100.25 ms), route.handler evt_ct00000000000004 (1094.5 ms), function evt_ct00000000000005 (1080 ms) and server.error evt_pe00000000000008. The spans source excludes the instant error and state kinds, so server.error is not a span: total 3, longest first."
+    },
+    {
+      "name": "spans-filter-min-duration-inclusive",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "spans",
+        "sort": "duration_desc",
+        "filter": {
+          "minDuration": 1100.25
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 3,
+        "count": 3,
+        "hasNextOffset": false,
+        "orderedIds": ["evt_ct00000000000001", "evt_ct00000000000002", "evt_ct00000000000003"]
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. minDuration keeps durations of at least 1100.25 ms: the interaction evt_ct00000000000001 (1175 ms), the fetch evt_ct00000000000002 (1112.375 ms) and the http.server span evt_ct00000000000003 (exactly 1100.25 ms, kept because the bound is inclusive). The next longest, route.handler at 1094.5 ms and the perf/errors interaction at 1000 ms, fall below it."
+    },
+    {
+      "name": "events-filter-single-kind",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "events",
+        "sort": "start_asc",
+        "filter": {
+          "kinds": ["perf.longtask"]
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 3,
+        "count": 3,
+        "hasNextOffset": false,
+        "orderedIds": ["evt_pe00000000000005", "evt_pe00000000000006", "evt_pe00000000000010"]
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. Only telemetry-perf-errors.json has perf.longtask events: evt_pe00000000000005 (start +120 ms), evt_pe00000000000006 (+340.5 ms) and evt_pe00000000000010 (+700 ms), in start order."
+    },
+    {
+      "name": "metrics-cross-tier-and-perf",
+      "ingest": ["telemetry-trace-cross-tier.json", "telemetry-perf-errors.json"],
+      "query": {
+        "source": "metrics"
+      },
+      "expect": {
+        "paged": true,
+        "total": 14,
+        "count": 14,
+        "hasNextOffset": false,
+        "values": [
+          {
+            "id": "total_duration",
+            "available": true,
+            "value": 1179
+          },
+          {
+            "id": "frontend_duration",
+            "available": true,
+            "value": 78.25
+          },
+          {
+            "id": "backend_duration",
+            "available": true,
+            "value": 1100.25
+          },
+          {
+            "id": "database_duration",
+            "available": true,
+            "value": 952.75
+          },
+          {
+            "id": "render_count",
+            "available": true,
+            "value": 1
+          },
+          {
+            "id": "unchanged_render_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "render_trigger_unknown_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "request_count",
+            "available": true,
+            "value": 2
+          },
+          {
+            "id": "query_count",
+            "available": true,
+            "value": 2
+          },
+          {
+            "id": "transferred_bytes",
+            "available": true,
+            "value": 24384
+          },
+          {
+            "id": "blocking_time",
+            "available": true,
+            "value": 91.5
+          },
+          {
+            "id": "duplicate_request_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "long_task_count",
+            "available": true,
+            "value": 3
+          },
+          {
+            "id": "error_count",
+            "available": true,
+            "value": 4
+          }
+        ]
+      },
+      "derivation": "telemetry-trace-cross-tier.json (9 events of trace 7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e: 4 browser, 3 server, 2 db) and telemetry-perf-errors.json (11 events of trace 3e5a7c9e0b2d4f6a8c0e2a4c6e8a0c2e: 10 browser, 1 server) share one capture. One value per METRIC_IDS member, in that order; 14 fit the default page, so nextOffset is null. Offsets below are from 1789819200000, the earliest start. total_duration: latest end is the commit evt_ct00000000000008 at +1175.5 + 3.5 = +1179. backend_duration: union of the server spans [12.5, 1112.75], [16, 1110.5], [20.75, 1100.75] and the zero-length server.error = 1100.25. database_duration: [28.5, 969] (940.5) plus the disjoint orphan [1000, 1012.25] (12.25) = 952.75. frontend_duration: the browser union [0, 1175] plus [1175.5, 1179] = 1178.5, minus the server union inside it = 78.25. render_count 1: the single render evt_ct00000000000007, triggered by props, so 0 unchanged and 0 unknown. request_count 2: the fetches evt_ct00000000000002 and evt_pe00000000000009. query_count 2: two db.query spans with different statements, one execution each. transferred_bytes 24384: 2048 on evt_ct00000000000002 plus the unclaimed resource entries 18240 (evt_pe00000000000003) and 4096 (evt_pe00000000000004); available, because some candidates reported a size. blocking_time 91.5: long tasks of 72, 118.5 and 51 ms block 22 + 68.5 + 1 ms beyond the 50 ms threshold. duplicate_request_count 0: the two requests differ. long_task_count 3. error_count 4: error evt_pe00000000000007 and evt_pe00000000000011, server.error evt_pe00000000000008, and the failed fetch evt_pe00000000000009 (status error, 503)."
+    },
+    {
+      "name": "renders-by-render-count",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "renders",
+        "sort": "count_desc"
+      },
+      "expect": {
+        "paged": true,
+        "total": 4,
+        "count": 4,
+        "hasNextOffset": false,
+        "orderedIds": [
+          "render:TrailCard",
+          "render:ConditionsPanel",
+          "render:TrailFilterProvider",
+          "render:TrailList"
+        ],
+        "groups": [
+          {
+            "id": "render:TrailCard",
+            "component": "TrailCard",
+            "renderCount": 12,
+            "triggers": {
+              "props": 3,
+              "state": 2,
+              "context": 4,
+              "unchanged": 2,
+              "unknown": 1
+            },
+            "unchangedRenderCount": 2,
+            "unknownTriggerCount": 1,
+            "phaseCounts": {
+              "mount": 1,
+              "update": 11
+            },
+            "changedPropKeys": ["difficulty", "distanceKm", "trailName"]
+          },
+          {
+            "id": "render:ConditionsPanel",
+            "component": "ConditionsPanel",
+            "renderCount": 6,
+            "triggers": {
+              "props": 2,
+              "state": 1,
+              "context": 2,
+              "unchanged": 1,
+              "unknown": 0
+            },
+            "unchangedRenderCount": 1,
+            "unknownTriggerCount": 0,
+            "phaseCounts": {
+              "mount": 1,
+              "update": 5
+            },
+            "changedPropKeys": ["report"]
+          },
+          {
+            "id": "render:TrailFilterProvider",
+            "component": "TrailFilterProvider",
+            "renderCount": 4,
+            "triggers": {
+              "props": 0,
+              "state": 4,
+              "context": 0,
+              "unchanged": 0,
+              "unknown": 0
+            },
+            "unchangedRenderCount": 0,
+            "unknownTriggerCount": 0,
+            "phaseCounts": {
+              "mount": 1,
+              "update": 3
+            },
+            "changedPropKeys": []
+          },
+          {
+            "id": "render:TrailList",
+            "component": "TrailList",
+            "renderCount": 3,
+            "triggers": {
+              "props": 1,
+              "state": 0,
+              "context": 2,
+              "unchanged": 0,
+              "unknown": 0
+            },
+            "unchangedRenderCount": 0,
+            "unknownTriggerCount": 0,
+            "phaseCounts": {
+              "mount": 1,
+              "update": 2
+            },
+            "changedPropKeys": []
+          }
+        ]
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. One RenderStat per component, id render:<component>; commits are structural and never counted. Render events are written by their last two digits NN of evt_rs000000000000NN. TrailCard renders 12 times (06, 13-16, 20, 21, 25, 26, 31-33): props at 06, 13, 14; state at 15, 16; context at 20, 21, 25, 26; unchanged at 31, 32; unknown at 33; changed props difficulty (13), distanceKm and trailName (14). ConditionsPanel 6 (07, 18, 19, 22, 28, 34): props 07, 18; state 19; context 22, 28; unchanged 34; changed prop report (18). TrailFilterProvider 4 (04, 11, 23, 30), all state. TrailList 3 (05, 12, 24): props 05; context 12, 24. Each component's first render has phase mount and the rest update. The four counts are distinct, so count_desc fixes the order without the id tie-breaker."
+    },
+    {
+      "name": "renders-filter-component",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "renders",
+        "filter": {
+          "component": "TrailCard"
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 1,
+        "count": 1,
+        "hasNextOffset": false,
+        "orderedIds": ["render:TrailCard"],
+        "groups": [
+          {
+            "id": "render:TrailCard",
+            "component": "TrailCard",
+            "renderCount": 12
+          }
+        ]
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. The component filter keeps only events whose component attribute is TrailCard, which are its 12 renders; the aggregate over them is one RenderStat."
+    },
+    {
+      "name": "renders-empty-unknown-component",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "renders",
+        "filter": {
+          "component": "UnobservedWidget"
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 0,
+        "count": 0,
+        "hasNextOffset": false
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. No event names the component UnobservedWidget, so the filtered slice is empty and the aggregate has no rows: a successful empty page with total 0 and nextOffset null, never an error (AAP 0.5.5)."
+    },
+    {
+      "name": "component-tree-last-commit",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "componentTree"
+      },
+      "expect": {
+        "paged": false,
+        "nodeCount": 6,
+        "maxDepth": 3,
+        "origin": "commit-snapshot"
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. The last commit, evt_rs00000000000029, carries the serialized componentTree attribute, so the snapshot comes from it (origin commit-snapshot) rather than from owner chains: TrailFilterProvider (depth 0) > TrailList (1) > three keyed TrailCard instances cascade-ridge, larch-meadow and juniper-saddle (2), the first holding ConditionsPanel (3). That is 6 nodes and a maximum depth of 3. A tree is one value and carries no page."
+    },
+    {
+      "name": "state-transitions-chronological",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "stateTransitions"
+      },
+      "expect": {
+        "paged": true,
+        "total": 5,
+        "count": 5,
+        "hasNextOffset": false,
+        "orderedIds": [
+          "evt_rs00000000000002",
+          "evt_rs00000000000008",
+          "evt_rs00000000000009",
+          "evt_rs00000000000017",
+          "evt_rs00000000000027"
+        ],
+        "groups": [
+          {
+            "id": "evt_rs00000000000002",
+            "component": "TrailFilterProvider",
+            "hookIndex": 0,
+            "hookLabel": "useState:difficulty",
+            "changed": true,
+            "triggerEventId": "evt_rs00000000000001",
+            "triggerKind": "interaction"
+          },
+          {
+            "id": "evt_rs00000000000008",
+            "component": "TrailFilterProvider",
+            "hookIndex": 2,
+            "hookLabel": "useState:region",
+            "changed": true,
+            "triggerEventId": "evt_rs00000000000001",
+            "triggerKind": "interaction"
+          },
+          {
+            "id": "evt_rs00000000000009",
+            "component": "TrailFilterProvider",
+            "hookIndex": 3,
+            "hookLabel": "useState:openTrailsOnly",
+            "changed": true,
+            "triggerEventId": "evt_rs00000000000001",
+            "triggerKind": "interaction"
+          },
+          {
+            "id": "evt_rs00000000000017",
+            "component": "TrailCard",
+            "hookIndex": 1,
+            "hookLabel": "useState:status",
+            "changed": true,
+            "triggerEventId": "evt_rs00000000000016",
+            "triggerKind": "render"
+          },
+          {
+            "id": "evt_rs00000000000027",
+            "component": "TrailCard",
+            "hookIndex": 0,
+            "hookLabel": "useState:report",
+            "changed": false,
+            "triggerEventId": "evt_rs00000000000026",
+            "triggerKind": "render"
+          }
+        ]
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. One row per state event, its id being the event id, in start order (the default for this source). Each row's trigger is the event its triggerEventId names: the interaction evt_rs00000000000001 for the three TrailFilterProvider transitions, and the renders evt_rs00000000000016 and evt_rs00000000000026 for the two TrailCard ones. evt_rs00000000000027 is the one row with changed false: both of its value summaries have type unknown and an empty preview, so the producer reported no describable transition."
+    },
+    {
+      "name": "metrics-without-transfer-sizes",
+      "ingest": ["telemetry-renders-state.json"],
+      "query": {
+        "source": "metrics"
+      },
+      "expect": {
+        "paged": true,
+        "total": 14,
+        "count": 14,
+        "hasNextOffset": false,
+        "values": [
+          {
+            "id": "total_duration",
+            "available": true,
+            "value": 620
+          },
+          {
+            "id": "frontend_duration",
+            "available": true,
+            "value": 620
+          },
+          {
+            "id": "backend_duration",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "database_duration",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "render_count",
+            "available": true,
+            "value": 25
+          },
+          {
+            "id": "unchanged_render_count",
+            "available": true,
+            "value": 3
+          },
+          {
+            "id": "render_trigger_unknown_count",
+            "available": true,
+            "value": 1
+          },
+          {
+            "id": "request_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "query_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "transferred_bytes",
+            "available": false
+          },
+          {
+            "id": "blocking_time",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "duplicate_request_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "long_task_count",
+            "available": true,
+            "value": 0
+          },
+          {
+            "id": "error_count",
+            "available": true,
+            "value": 0
+          }
+        ]
+      },
+      "derivation": "telemetry-renders-state.json holds 34 browser events of one trace: 1 interaction, 3 commits, 25 renders and 5 state transitions. total_duration 620: every event starts at or after the interaction at 1789819200000 and ends by its end at +620. frontend_duration 620: the browser union is that same span, with no server tier to subtract; backend and database are 0 with no server or db events. render_count 25, unchanged 3 (TrailCard evt_rs00000000000031 and evt_rs00000000000032, ConditionsPanel evt_rs00000000000034) and unknown 1 (evt_rs00000000000033), disjoint by construction. No request, query, long task or error exists, so those counts are 0. transferred_bytes is available false with no value: nothing in the capture reported a transfer size, and an unmeasured metric is never published as 0 (AAP 0.6.6)."
+    },
+    {
+      "name": "requests-duplicates-by-request-key",
+      "ingest": ["telemetry-requests-queries.json"],
+      "query": {
+        "source": "requests",
+        "sort": "count_desc"
+      },
+      "expect": {
+        "paged": true,
+        "total": 5,
+        "count": 5,
+        "hasNextOffset": false,
+        "groups": [
+          {
+            "occurrenceIds": [
+              "evt_rq00000000000002",
+              "evt_rq00000000000003",
+              "evt_rq00000000000004",
+              "evt_rq00000000000005"
+            ],
+            "groupedBy": "request-key",
+            "method": "GET",
+            "url": "/api/trail-report?trailId=?",
+            "path": "/api/trail-report",
+            "count": 4,
+            "duplicateCount": 3,
+            "hasDuplicates": true,
+            "initiators": [
+              "src/components/ConditionsPanel.tsx:36:24",
+              "src/components/TrailCard.tsx:49:30"
+            ],
+            "statusCodes": [200],
+            "errorCount": 0,
+            "transferredBytes": 8192
+          },
+          {
+            "occurrenceIds": ["evt_rq00000000000006"],
+            "groupedBy": "request-key",
+            "method": "GET",
+            "url": "/api/trail-report?trailId=?",
+            "path": "/api/trail-report",
+            "count": 1,
+            "duplicateCount": 0,
+            "hasDuplicates": false,
+            "initiators": ["src/components/TrailCard.tsx:49:30"],
+            "statusCodes": [200],
+            "errorCount": 0,
+            "transferredBytes": 1536
+          },
+          {
+            "occurrenceIds": ["evt_rq00000000000007"],
+            "groupedBy": "request-key",
+            "method": "GET",
+            "url": "/api/trail-report?trailId=?",
+            "path": "/api/trail-report",
+            "count": 1,
+            "duplicateCount": 0,
+            "hasDuplicates": false,
+            "initiators": ["src/components/TrailCard.tsx:49:30"],
+            "statusCodes": [200],
+            "errorCount": 0,
+            "transferredBytes": 1408
+          },
+          {
+            "occurrenceIds": ["evt_rq00000000000008"],
+            "groupedBy": "request-key",
+            "method": "GET",
+            "url": "/api/trail-conditions?window=?",
+            "path": "/api/trail-conditions",
+            "count": 1,
+            "duplicateCount": 0,
+            "hasDuplicates": false,
+            "initiators": ["src/components/ConditionsPanel.tsx:36:24"],
+            "statusCodes": [500],
+            "errorCount": 1,
+            "transferredBytes": 320
+          },
+          {
+            "occurrenceIds": ["evt_rq00000000000009"],
+            "groupedBy": "request-key",
+            "method": "GET",
+            "url": "/api/trail-conditions?window=?",
+            "path": "/api/trail-conditions",
+            "count": 1,
+            "duplicateCount": 0,
+            "hasDuplicates": false,
+            "initiators": ["src/components/ConditionsPanel.tsx:36:24"],
+            "statusCodes": [200],
+            "errorCount": 0,
+            "transferredBytes": 3072
+          }
+        ]
+      },
+      "derivation": "telemetry-requests-queries.json holds 15 events of one trace: 1 interaction, 7 fetch and 1 xhr requests, 1 server http.client call and 5 db.query statements. Requests group by the pre-redaction request_key computed at ingest, so requests that differ only in a query value stay apart even though redaction gives them one display URL. The request kinds are fetch and xhr, so the http.client call is not a row. Events are written by their last two digits NN of evt_rq000000000000NN. The four byte-identical GET /api/trail-report?trailId=cascade-ridge requests (02-05, started within 21 ms, inside the 1000 ms duplicate window) form one group: count 4, one window of 4, so duplicateCount 4 - 1 = 3; initiated from TrailCard.tsx:49:30 (02, 04) and ConditionsPanel.tsx:36:24 (03, 05); 4 x 2048 = 8192 bytes. trailId=granite-basin (06) and trailId=juniper-flats (07) differ from it and from each other only in the query value: two further single-occurrence groups, although all three redact to /api/trail-report?trailId=?. Grouping by the redacted URL would have produced one group of 6. window=7d (08, fetch, 500, one failure) and window=30d (09, xhr) are two more single groups. Group ids derive from the per-session request_key, so the order of the four count-1 groups is not asserted; only the set is."
+    },
+    {
+      "name": "requests-largest-group-first",
+      "ingest": ["telemetry-requests-queries.json"],
+      "query": {
+        "source": "requests",
+        "sort": "count_desc",
+        "limit": 1
+      },
+      "expect": {
+        "paged": true,
+        "total": 5,
+        "count": 1,
+        "hasNextOffset": true,
+        "nextOffset": 1,
+        "groups": [
+          {
+            "occurrenceIds": [
+              "evt_rq00000000000002",
+              "evt_rq00000000000003",
+              "evt_rq00000000000004",
+              "evt_rq00000000000005"
+            ],
+            "count": 4,
+            "duplicateCount": 3,
+            "hasDuplicates": true
+          }
+        ]
+      },
+      "derivation": "telemetry-requests-queries.json holds 15 events of one trace: 1 interaction, 7 fetch and 1 xhr requests, 1 server http.client call and 5 db.query statements. Requests group by the pre-redaction request_key computed at ingest, so requests that differ only in a query value stay apart even though redaction gives them one display URL. Of the 5 groups only the duplicated trailId=cascade-ridge group has count 4; every other has count 1, so count_desc puts it first whatever the session's request_key values are. limit 1 returns it alone, and nextOffset is 0 + 1 = 1 with 4 groups remaining."
+    },
+    {
+      "name": "requests-filter-min-duration-narrows-subjects",
+      "ingest": ["telemetry-requests-queries.json"],
+      "query": {
+        "source": "requests",
+        "filter": {
+          "minDuration": 30
+        }
+      },
+      "expect": {
+        "paged": true,
+        "total": 1,
+        "count": 1,
+        "hasNextOffset": false,
+        "groups": [
+          {
+            "occurrenceIds": [
+              "evt_rq00000000000002",
+              "evt_rq00000000000004",
+              "evt_rq00000000000005"
+            ],
+            "count": 3,
+            "duplicateCount": 2,
+            "hasDuplicates": true,
+            "initiators": [
+              "src/components/ConditionsPanel.tsx:36:24",
+              "src/components/TrailCard.tsx:49:30"
+            ]
+          }
+        ]
+      },
+      "derivation": "telemetry-requests-queries.json holds 15 events of one trace: 1 interaction, 7 fetch and 1 xhr requests, 1 server http.client call and 5 db.query statements. Requests group by the pre-redaction request_key computed at ingest, so requests that differ only in a query value stay apart even though redaction gives them one display URL. minDuration 30 narrows the requests themselves: only evt_rq00000000000002 (31.5 ms), evt_rq00000000000004 (30.25 ms) and evt_rq00000000000005 (41.75 ms) last at least 30 ms, and all three share the cascade-ridge request_key. The other five requests (28, 27.5, 24.75, 18.5 and 22.25 ms) fall away, leaving one group of 3 with one window of 3, so duplicateCount 2, still initiated from both components."
+    },
+    {
+      "name": "queries-grouped-by-normalized-statement",
+      "ingest": ["telemetry-requests-queries.json"],
+      "query": {
+        "source": "queries",
+        "sort": "count_desc"
+      },
+      "expect": {
+        "paged": true,
+        "total": 2,
+        "count": 2,
+        "hasNextOffset": false,
+        "groups": [
+          {
+            "occurrenceIds": [
+              "evt_rq00000000000011",
+              "evt_rq00000000000012",
+              "evt_rq00000000000013"
+            ],
+            "normalizedStatement": "select trail_id, snow_depth_cm from trail_conditions where trail_id = ?",
+            "system": "postgresql",
+            "executionCount": 3,
+            "totalDurationMs": 650.75,
+            "totalRowCount": 364,
+            "errorCount": 0
+          },
+          {
+            "occurrenceIds": ["evt_rq00000000000014", "evt_rq00000000000015"],
+            "normalizedStatement": "select trail_id, snow_depth_cm from trail_conditions where trail_id in (?)",
+            "system": "postgresql",
+            "executionCount": 2,
+            "totalDurationMs": 95.5,
+            "totalRowCount": 48,
+            "errorCount": 0
+          }
+        ]
+      },
+      "derivation": "telemetry-requests-queries.json holds 15 events of one trace: 1 interaction, 7 fetch and 1 xhr requests, 1 server http.client call and 5 db.query statements. Requests group by the pre-redaction request_key computed at ingest, so requests that differ only in a query value stay apart even though redaction gives them one display URL. The five db.query statements form 2 groups. evt_rq00000000000011, evt_rq00000000000012 and evt_rq00000000000013 run the same trail_id = $1 statement: executionCount 3, 22.5 + 18 + 610.25 = 650.75 ms, 12 + 12 + 340 = 364 rows. evt_rq00000000000014 (IN ($1, $2, $3)) and evt_rq00000000000015 (IN ($1)) differ only in the length of the IN list, which normalisation collapses to IN (?): executionCount 2, 44 + 51.5 = 95.5 ms, 36 + 12 = 48 rows. Rows are never captured, only db.rowCount."
+    }
+  ]
+}

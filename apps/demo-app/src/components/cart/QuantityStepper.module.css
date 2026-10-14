@@ -1,0 +1,158 @@
+/*
+ * QuantityStepper - the cart's quantity control.
+ *
+ * Four classes, and deliberately no more: `.root` (the inline group), `.label` (the control's
+ * visually-hidden label), `.field` (the numeric input) and `.status` (the small hint under it).
+ * QuantityStepper.tsx reads exactly those four off this module, so a name here is a contract, not
+ * a detail.
+ *
+ * Ownership boundary with the primitives, which is why this file is short:
+ *
+ *   - `Input.module.css` owns the field's chrome - border, radius, padding, background and its
+ *     `data-invalid` appearance. Nothing here restates any of it, so the two never fight over the
+ *     cascade and a change to the primitive reaches this control for free.
+ *   - `app/globals.css` owns the one focus indicator for the whole application - a 2px
+ *     `--ls-focus` ring, shown for keyboard interaction. This file declares no focus rule of its
+ *     own and removes none.
+ *   - `Button.module.css` owns the - and + controls' appearance. This file only sets the gap
+ *     between them and the field.
+ *
+ * What is left is this control's own job: keep the field narrow and its digits from shifting as
+ * the value changes, keep the hidden label out of the flex arithmetic, and carry the two states
+ * the component reports on the root element - `data-busy` while a quantity change is in flight,
+ * `data-invalid` while the entered value is out of range.
+ *
+ * Every value resolves to a custom property. The shared `--ls-*` tokens are read in
+ * `var(--ls-NAME, <literal fallback>)` form, matching the contract app/globals.css documents: the
+ * fallback mirrors the value declared there, so this module also renders sensibly in isolation
+ * (a component test, a Storybook-style harness) where globals.css is absent. The three values
+ * this control needs that the shared scale has no token for - the field's width, the busy
+ * opacity, the busy transition - are declared once as file-local properties on `.root` below and
+ * read through `var()` everywhere else, so no bare literal escapes a declaration or a fallback.
+ *
+ * Quotes are single and hex is lowercase because Prettier 3.9.8 normalises CSS that way and
+ * `pnpm format:check` is a blocking gate - do not "restore" double quotes or uppercase hex.
+ */
+
+/* The inline group: [-] [field] [+] with the hidden label and the optional hint.
+ *
+ * `--qty-field-width` is built from the spacing scale rather than written as a length, because
+ * this scale has no width token: two 32px steps give a 64px box, which holds four tabular
+ * monospace digits inside the padding Input.module.css applies and still reads as a compact
+ * stepper next to the line item's price. It is declared here, on the group, so the field inherits
+ * it and a cart row that needs a wider stepper can override one property instead of restyling
+ * the field.
+ *
+ * `position: relative` makes the group the containing block of `.status`, which is placed out of
+ * flow beneath it (see that rule): the group's box is then exactly the three controls, whether or
+ * not the hint is showing. It declares no `z-index`, so it opens no stacking context. */
+.root {
+  --qty-field-width: calc(var(--ls-space-6, 32px) * 2);
+  --qty-busy-opacity: 0.6;
+  --qty-busy-transition: opacity 150ms ease-out;
+
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  transition: var(--qty-busy-transition);
+}
+
+/* A quantity change is in flight: the group dims and the pointer says so. Nothing is disabled
+ * from here - the component disables the controls it owns, which is what actually stops a second
+ * submission; this is the visible half of that state. */
+.root[data-busy='true'] {
+  cursor: progress;
+  opacity: var(--qty-busy-opacity);
+}
+
+/* `cursor` inherits, but the user agent's own rule for a text-entry input wins over an inherited
+ * value, so the group's progress cursor stops at the field - which is the one part of the group a
+ * reader is most likely to be pointing at while the change is in flight. Restating it on the
+ * field closes that gap. The - and + controls are left alone: their cursor belongs to the button
+ * primitive, and the component disables them for the duration. */
+.root[data-busy='true'] .field {
+  cursor: progress;
+}
+
+/* Honour a reduced-motion preference with this module's own rule at this module's own
+ * specificity, as every animated module in this application does. globals.css collapses
+ * durations at zero specificity as a backstop; the decision for the motion introduced here
+ * belongs here, and for a state that dims a control the right treatment is no transition at all
+ * rather than a fast one. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}
+
+/* The label element. It carries only visually-hidden text (`../ui/VisuallyHidden`), so it must
+ * cost nothing: `display: contents` keeps it out of the group's flex arithmetic entirely, which
+ * matters because a flex item consumes a `gap` even when it paints nothing. Size, colour and
+ * spacing are deliberately absent - the hidden text needs none of them, and declaring them here
+ * would be the one way this class could disturb the row. */
+.label {
+  display: contents;
+}
+
+/* The numeric input.
+ *
+ * Only width, alignment and numerals: `flex: none` pins the box so a tight cart row shrinks
+ * around the stepper instead of squeezing it, and the monospace face with `tabular-nums` gives
+ * every digit the same advance width, so 1 -> 9 -> 12 changes the number without moving the
+ * field, the buttons beside it or the price that follows. The width falls back to the same
+ * token arithmetic as the declaration on `.root`, so a field rendered without the group wrapper
+ * is still the right size. */
+.field {
+  width: var(--qty-field-width, calc(var(--ls-space-6, 32px) * 2));
+  flex: none;
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  /* The custom - and + controls are the only stepping affordance, so the user agent's own
+   * spinners are suppressed: `textfield` covers Firefox (and is why the prefixed property is
+   * kept), the two pseudo-elements below cover WebKit and Blink. The input keeps
+   * `type="number"`, so the numeric keypad, `min`/`max`/`step` validation and the arrow keys all
+   * still work. */
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.field::-webkit-outer-spin-button,
+.field::-webkit-inner-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+/* The hint under the control - the reason an entry was refused, and what the cart still holds. The
+ * screen-reader echo of the committed quantity is a visually-hidden node inside the same element,
+ * so this box paints nothing until an entry is out of range.
+ *
+ * Out of flow, beneath the group and aligned with its leading edge. As an in-flow flex item the
+ * hint widened the group the moment it appeared, which pushed the field, the + control, the line
+ * total and the whole row sideways by the width of its text; positioned here, showing it moves
+ * none of them. `nowrap` keeps it one line - it is wider than the group, and wrapping inside a box
+ * the group's width would stack it into the row below - and the line height is stated so the
+ * room it occupies under the group is a known quantity: one spacing step of air plus one 12px
+ * line at 1.4, about 21px. `CartLineRow.module.css` reserves that room in the row's narrow
+ * arrangement, where the stepper sits on the row's last line; in the wide one the details column
+ * beside it is already deeper than the stepper and its hint together. */
+.status {
+  position: absolute;
+  inset-block-start: calc(100% + var(--ls-space-1, 4px));
+  inset-inline-start: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+/* Out-of-range value. `Input` already renders the field's invalid appearance from its own
+ * `data-invalid`, so the group adds no border, ring or background of its own and changes exactly
+ * one thing: the hint turns to the danger colour, which measures 6.6:1 on the page surface and so
+ * clears WCAG AA as text. Colour is not carrying the meaning alone - the hint's wording and the
+ * input's own `aria-invalid` state say it too. */
+.root[data-invalid='true'] .status {
+  color: var(--ls-danger, #b42318);
+}

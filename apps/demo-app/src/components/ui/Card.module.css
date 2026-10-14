@@ -1,0 +1,158 @@
+/*
+ * Card - the surface container of the Lumen Supply storefront: catalog product cards, the
+ * checkout order summary, the dashboard KPI cards.
+ *
+ * Consumed only by `./Card.tsx`, which renders
+ *
+ *   <div class="root" data-pad="sm|md|lg" [data-interactive="true"]>
+ *     [ <div class="head"> ... </div> ]
+ *       <div class="body"> ... </div>
+ *     [ <div class="foot"> ... </div> ]
+ *   </div>
+ *
+ * and forwards the caller's own class alongside `.root`. `data-pad` is always present (the
+ * component defaults it); `data-interactive` appears only when the card is meant to look
+ * clickable. Variants are therefore read from those attributes and never from a class-name
+ * lookup, so a caller cannot ask for a step this file does not define.
+ *
+ * What this file owns is the surface and nothing else: background, hairline border, corner
+ * radius, elevation, the internal padding rhythm and the interactive affordance. Grid
+ * placement, width, aspect ratio, stickiness and outer spacing belong to the consuming
+ * group's own module, applied through `className` - which is why no `width`, `height`,
+ * `margin`, `position` or grid template appears below. A card that sized or placed itself
+ * would fight the catalog grid that lays out roughly four dozen of it.
+ *
+ * `min-width: 0` on each box here is load-bearing rather than decorative. A card is a grid
+ * or flex item whose automatic minimum size is its content's min-content width, so one long
+ * unbroken industrial SKU would otherwise widen its track and push the whole catalog row
+ * out of shape. Zeroed, that SKU wraps (the document sets `overflow-wrap: break-word`) or
+ * truncates in the caller's own rule instead.
+ *
+ * Typography is deliberately absent: the card sets `color` so its content inherits a
+ * readable foreground, and every size, weight and family comes from the content itself.
+ *
+ * Every value reads `var(--ls-TOKEN, <literal fallback>)`. The tokens are declared once, in
+ * `app/globals.css`, and the fallbacks mirror that file so this module still renders
+ * correctly in isolation. Hex is lowercase and the shadow alpha carries no trailing zero
+ * because Prettier normalises both spellings and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  /* The rhythm between the optional slots and the body. A gap rather than a margin, so a
+   * card rendering only its body gets no stray space at either end. */
+  gap: var(--ls-space-3, 12px);
+  /* The md step, restated here so a card that somehow arrives without `data-pad` still has
+   * its inset rather than none. */
+  padding: var(--ls-space-4, 16px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface, #ffffff);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.06));
+  color: var(--ls-text, #0f172a);
+}
+
+/* Padding steps. `sm` suits a dense KPI tile, `md` a product card, `lg` a summary panel
+ * that carries a heading and a total. */
+.root[data-pad='sm'] {
+  padding: var(--ls-space-2, 8px);
+}
+
+.root[data-pad='md'] {
+  padding: var(--ls-space-4, 16px);
+}
+
+.root[data-pad='lg'] {
+  padding: var(--ls-space-5, 24px);
+}
+
+/* The optional head slot: its content, then a breath of air, then the hairline that divides
+ * it from the body. The body's matching breath comes from the `gap` above, so the divider
+ * ends up centred between the two instead of hugging one of them. The rule sits inside the
+ * card's padding, so the divider is inset with the rest of the content. */
+.head {
+  min-width: 0;
+  padding-block-end: var(--ls-space-3, 12px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* The body absorbs the slack, which is what makes a row of cards with unequal content end
+ * flush: the grid stretches every card to the tallest in the row and this box takes the
+ * difference, leaving a foot pinned to the bottom edge. */
+.body {
+  min-width: 0;
+  flex: 1;
+}
+
+/* The foot mirrors the head, divider on the leading side. */
+.foot {
+  min-width: 0;
+  padding-block-start: var(--ls-space-3, 12px);
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* The interactive affordance.
+ *
+ * `Card.tsx` sets `data-interactive="true"` as a visual signal only - the real control is
+ * the link or button the caller places inside - so everything below is appearance, and a
+ * card without the attribute has no hover or focus treatment whatsoever. That silence is
+ * deliberate: the catalog renders roughly four dozen cards at once and a hover response on
+ * a box that does nothing reads as a bug.
+ *
+ * There is deliberately no `cursor: pointer` here. The card itself is not a target - it
+ * takes no click handler, no `role` and no tab stop - so a pointer cue spanning the whole
+ * surface would promise that the artwork, the product code and the price can be clicked,
+ * and none of them answers a press. The cue belongs to the elements that do answer one,
+ * and each of them already carries it: `Button.module.css` declares `cursor: pointer` on
+ * the control, and a link is a pointer by the browser's own default. What the attribute
+ * signals instead is that the card *contains* something to act on, which is what the
+ * border tint and the lift below say without claiming a target the box has not got.
+ *
+ * Only `box-shadow` and `border-color` ever change, so no geometry moves and a pointer
+ * crossing the grid never reflows the page.
+ *
+ * The change is not gated behind `(hover: hover)`: it is decorative, a hover that sticks on
+ * a touch device costs a reader nothing, and the gate would drop the affordance entirely
+ * for any browser that reports no hovering pointer. */
+.root[data-interactive='true'] {
+  transition:
+    box-shadow 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+.root[data-interactive='true']:hover {
+  border-color: var(--ls-accent, #f59e0b);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+}
+
+/* Focus inside the card, marked with the hover treatment rather than with a ring.
+ *
+ * Every focusable thing this application puts inside a card draws its own indicator - the
+ * document's `:focus-visible` rule in `app/globals.css` covers anything that declares
+ * nothing, and `Button.module.css`, `Pill.module.css` and the catalog tile's own link rule
+ * each refine it - so an outline on the card as well would paint a second ring concentric
+ * with the first, in the same colour at a different offset. Two rings for one focused element
+ * tell a reader there are two things focused, and the outer one is the wrong shape: it
+ * surrounds a box that cannot be focused at all.
+ *
+ * So the card answers focus with exactly what it answers a hover with: the accent hairline
+ * and one step of elevation, which places the focused control's own ring in a card that has
+ * visibly come forward without adding an indicator of its own. It is also the same pair of
+ * properties the transition above already covers, so the two states arrive alike, and
+ * neither affects the layout. */
+.root[data-interactive='true']:focus-within {
+  border-color: var(--ls-accent, #f59e0b);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+}
+
+/* This module's own reduced-motion rule, at its own specificity. The document collapses
+ * durations with a zero-specificity universal rule; this states what the card does about
+ * the one transition it introduces - the hover result still applies, it simply arrives at
+ * once instead of easing in. */
+@media (prefers-reduced-motion: reduce) {
+  .root[data-interactive='true'] {
+    transition: none;
+  }
+}

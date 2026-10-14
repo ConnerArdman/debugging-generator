@@ -1,0 +1,31 @@
+{
+  "name": "@debuggen/chrome-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manifest V3 Chrome extension contributing the Debug Generator DevTools panel.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "prebuild": "node ../../scripts/copy-agent.mjs",
+    "predev": "node ../../scripts/copy-agent.mjs",
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project chrome-extension"
+  },
+  "dependencies": {
+    "@debuggen/panel-renderer": "workspace:*",
+    "@debuggen/panel-schema": "workspace:*",
+    "@debuggen/protocol": "workspace:*",
+    "@debuggen/shared": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "2.7.1",
+    "@debuggen/telemetry": "workspace:*",
+    "@types/chrome": "0.3.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  }
+}

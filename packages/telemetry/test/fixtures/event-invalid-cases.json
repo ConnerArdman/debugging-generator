@@ -1,0 +1,437 @@
+{
+  "traceIdTooShort": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e61",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "spanIdWrongLength": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "startTimeRelativePerformanceNow": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1234.567,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "startTimeSeconds": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "unknownKind": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "http.request",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "tierNotAllowedForKind": {
+    "id": "evt_3g5h1j7k9l0z2xcv",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "5a83c19fe7204db6",
+    "kind": "render",
+    "name": "ItemList",
+    "startTime": 1789812901128.34,
+    "duration": 12.418,
+    "tier": "db",
+    "attributes": {
+      "component": "ItemList",
+      "phase": "update",
+      "renderCount": 4,
+      "trigger": "props",
+      "actualDuration": 12.418,
+      "ownerChain": ["WidgetPanel"],
+      "selfTime": 3.204
+    },
+    "status": "unset",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 6,
+    "source": {
+      "file": "src/components/ItemList.tsx",
+      "line": 27,
+      "column": 1,
+      "symbol": "ItemList",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    }
+  },
+  "unknownStatus": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "OK",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "negativeDuration": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": -1.5,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "unknownExtraField": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"],
+    "level": "info"
+  },
+  "ingressCarriesSessionId": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"],
+    "sessionId": "ses_q3m8v1k6r9t2w5zb"
+  },
+  "missingProducerId": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "allZeroTraceId": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "00000000000000000000000000000000",
+    "spanId": "b18d9047e35ca2f6",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "allZeroSpanId": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "0000000000000000",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  },
+  "allZeroParentSpanId": {
+    "id": "evt_8w3j5s0d2f7g1hqm",
+    "traceId": "3f9c1d7a4b82e6053c18d94fa7b2e610",
+    "spanId": "b18d9047e35ca2f6",
+    "parentSpanId": "0000000000000000",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900006.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_h7k2m9q4t1w6z3xb",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  }
+}

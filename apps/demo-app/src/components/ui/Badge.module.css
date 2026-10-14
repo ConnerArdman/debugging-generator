@@ -1,0 +1,174 @@
+/*
+ * Lumen Supply - the status label.
+ *
+ * The stylesheet for this folder's smallest primitive: the short, coloured label that names a
+ * state. It marks stock on product detail, an order's status in the order history and a
+ * low-stock row on the inventory dashboard. Its component renders one `<span>`, puts
+ * `styles.root` on it, sets `data-tone` and `data-size`, and optionally nests one empty
+ * `styles.dot` before the label text - so `root` and `dot` are the only two class names this
+ * file may export, and the five tones and two sizes below are selected entirely by those two
+ * attributes.
+ *
+ * WHY ATTRIBUTES AND NOT A CLASS PER VARIANT
+ * A variant class would have to be looked up as `styles[tone]`, which this repository's
+ * `noUncheckedIndexedAccess` types as `string | undefined` and which hides a typo until the
+ * label renders unstyled in a browser. `data-tone` is a value the component's own prop union
+ * already constrains, and it is visible in the elements tree while debugging, which is what
+ * this application exists to be.
+ *
+ * HOW A TONE IS CARRIED, AND WHY THERE IS NO TINT RAMP
+ * Every tone paints the same recessed surface and changes only its text and border colour. The
+ * shared token set names one value per status and no light tint of it, so a tinted background
+ * would mean inventing five more colours here - which the pill, the alert and the toast region
+ * would then each have to reproduce to look like part of the same family, leaving five
+ * unshared literals in the storefront's vocabulary and four copies of every future change.
+ * Border plus text on `--ls-surface-sunken` needs none of that and keeps each tone's label at
+ * the contrast its token was chosen for. A tinted variant, if it is ever wanted, belongs in
+ * the token set as a ramp that all four components read.
+ *
+ * Colour is never the only carrier of meaning: the component always renders a textual label,
+ * the optional dot is `aria-hidden` decoration, and the label stays ordinary text in the
+ * accessibility tree.
+ *
+ * TOKEN CONTRACT
+ * Values come from the `--ls-*` custom properties that `app/globals.css` declares, always as
+ * `var(--ls-NAME, <literal fallback>)`: the fallback mirrors the declaration there, so this
+ * label renders correctly inside the application and sensibly on its own. Hex fallbacks are
+ * lowercase because Prettier normalises CSS colours and `pnpm format:check` is a blocking
+ * gate. Bare literals appear only where the token set models nothing - the hairline border
+ * width, the dot's `em` multiple and its `50%` radius, the font weight and the unitless line
+ * height.
+ *
+ * One consequence of that contract is worth stating where it applies: the type scale is
+ * declared in `rem` and its fallbacks are the pixel sizes those tokens render at the default
+ * 16px root, which is the whole folder's convention. Inside the application the label
+ * therefore honours a reader's enlarged browser font size, and a label cut off from the token
+ * layer keeps the fixed size instead - the same trade every module here makes.
+ *
+ * Every selector starts with `.root` on purpose: CSS Modules in this application are compiled
+ * in pure mode, where a selector that contains no local class is a build error, and anchoring
+ * each variant to the class also keeps it one specificity step above the base rule.
+ *
+ * No motion is declared here - nothing fades, slides or pulses - so there is deliberately no
+ * reduced-motion rule to pair with one.
+ */
+
+/*
+ * The label itself, in its default `neutral` tone: quiet enough to sit in a dense table row
+ * without competing with the data beside it.
+ *
+ * `inline-flex` is what lets the optional dot sit on the text's line with a real gap rather
+ * than a space character, and `vertical-align: middle` is what keeps the box steady when it
+ * does: a flex container takes its baseline from its first item, so with a dot in front the
+ * label would otherwise hang lower than the same label without one. Middle alignment is
+ * independent of the children and gives both forms the same seat on the line.
+ *
+ * `line-height: 1` makes the height a function of the type size and the block padding alone,
+ * which is what keeps every tone in a row exactly as tall as its neighbours.
+ *
+ * The type size stated here is the compact one, and the size rules further down are what raise
+ * it: the component always sends a size, so this value is the floor a label keeps when the
+ * attribute is missing - the class used on its own, or markup that predates the attribute -
+ * rather than the size a caller normally sees.
+ */
+.root {
+  display: inline-flex;
+  align-items: center;
+  /* The gap only ever separates the dot from the label; a label on its own has no gap to
+   * collapse, because it is the single child. */
+  gap: var(--ls-space-1, 4px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-sm, 4px);
+  /* Logical padding, so the inline sides are the ones a size variant below re-states. */
+  padding-block: var(--ls-space-1, 4px);
+  padding-inline: var(--ls-space-2, 8px);
+  background: var(--ls-surface-sunken, #f8fafc);
+  color: var(--ls-text-muted, #475569);
+  vertical-align: middle;
+  /* The global stylesheet declares the full system stack on `body` and this label inherits it
+   * inside the application; the fallback names that stack's leading and generic entries so the
+   * module also reads correctly rendered on its own. */
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 600;
+  line-height: 1;
+  /* A status label is two or three words that belong on one line; the components that place it
+   * give it room rather than letting it wrap mid-phrase. */
+  white-space: nowrap;
+}
+
+/*
+ * The tones. This block is the folder's canonical palette - the pill, the alert and the toast
+ * region name the same four status tokens with the same fallbacks - so it is written out in
+ * full, one rule per tone, rather than folded into a shorthand that reads well but hides which
+ * colour a state actually gets.
+ *
+ * `neutral` repeats what `.root` already declares. It is stated anyway: the five tones then
+ * read as one table, and a label whose tone attribute is absent or unrecognised still paints
+ * the neutral pair from the base rule.
+ */
+
+/* The neutral border is the storefront's shared hairline and a decorative boundary; the label's
+ * text carries the state. */
+.root[data-tone='neutral'] {
+  border-color: var(--ls-border, #cbd5e1);
+  color: var(--ls-text-muted, #475569);
+}
+
+.root[data-tone='info'] {
+  border-color: var(--ls-info, #1d4ed8);
+  color: var(--ls-info, #1d4ed8);
+}
+
+.root[data-tone='success'] {
+  border-color: var(--ls-success, #0f766e);
+  color: var(--ls-success, #0f766e);
+}
+
+.root[data-tone='warning'] {
+  border-color: var(--ls-warning, #b45309);
+  color: var(--ls-warning, #b45309);
+}
+
+.root[data-tone='danger'] {
+  border-color: var(--ls-danger, #b42318);
+  color: var(--ls-danger, #b42318);
+}
+
+/*
+ * The sizes. Both are stated explicitly, and neither touches a colour, so a tone rule above
+ * and a size rule here apply to the same element without either overriding the other.
+ *
+ * `sm` is the compact form for a table cell or a card corner: the smaller type with the inline
+ * padding pulled in one step. `md` is the default the component passes when a caller says
+ * nothing, and the one to read beside body copy - the same padding as the base rule with the
+ * type size a step up. Block padding is shared, so the two forms differ in height by exactly
+ * the difference between the two type sizes.
+ */
+.root[data-size='sm'] {
+  padding-inline: var(--ls-space-1, 4px);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+.root[data-size='md'] {
+  padding-inline: var(--ls-space-2, 8px);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/*
+ * The optional leading dot: an empty, `aria-hidden` element whose only job is to repeat the
+ * tone as a shape, which helps the eye group rows of the same status in a long table.
+ *
+ * It is sized in `em`, so it tracks whichever type size the size variant above settled on, and
+ * filled with `currentColor`, so it follows the tone with no rule of its own per tone - the two
+ * choices that keep this block outside the palette table above. `flex: none` stops it being
+ * squeezed to nothing when a long label meets a narrow container, and it stays well inside the
+ * text's line box, so a label with a dot is exactly as tall as one without.
+ */
+.dot {
+  flex: none;
+  border-radius: 50%;
+  inline-size: 0.5em;
+  block-size: 0.5em;
+  background: currentColor;
+}

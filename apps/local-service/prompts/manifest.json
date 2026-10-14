@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "stages": {
+    "understand": { "current": "v002", "available": ["v001", "v002"] },
+    "investigate": { "current": "v002", "available": ["v001", "v002"] },
+    "plan": { "current": "v002", "available": ["v001", "v002"] },
+    "analyze": { "current": "v002", "available": ["v001", "v002"] },
+    "generate-panel": { "current": "v002", "available": ["v001", "v002"] },
+    "followup": { "current": "v002", "available": ["v001", "v002"] }
+  }
+}

@@ -1,0 +1,152 @@
+/*
+ * Lumen Supply - the horizontal scroll region a wide table sits in.
+ *
+ * The CSS Module for `Scroller.tsx`, and nothing else: it is imported by that one sibling and
+ * imports nothing itself. The component measures its own overflow and writes it onto its root
+ * element as `data-overflow`, and every conditional rule below reads that attribute - so what is
+ * shown follows what is actually true of the box at that width, not a breakpoint guessed in
+ * advance.
+ *
+ * CLASS CONTRACT - which element each class belongs on, because a CSS Module fails silently on a
+ * name that does not match:
+ *
+ *   .frame     the component's root `<div>`. Carries `data-overflow`, whose four values are
+ *              `none` (nothing to scroll), `end` (content continues past the end edge),
+ *              `start` (content continues before the start edge) and `both`.
+ *   .viewport  the positioned box the scrollport and its two edge fades share.
+ *   .region    the scrollport: the element that scrolls, takes focus and carries the accessible
+ *              name. The placing module composes its own class alongside this one for surface
+ *              details such as a radius.
+ *   .fade      one of the two edge gradients, selected by `data-edge="start"` / `"end"`.
+ *   .hint      the sentence under the scrollport, shown only while there is somewhere to scroll.
+ *
+ * WHAT THIS FILE MAY CONTAIN
+ * Every value resolves to an `--ls-*` custom property declared in `app/globals.css`, written in
+ * `var(--ls-NAME, <literal fallback>)` form so the module renders sensibly on its own and renders
+ * the application's palette in the application. The only bare literals are the keywords (`0`,
+ * `none`, `auto`, `transparent`), the `2px` of the application's focus ring - `globals.css` writes
+ * that ring as `outline: 2px solid var(--ls-focus)` and this module only refines it - percentages,
+ * and the fade's transition duration.
+ *
+ * MOTION
+ * The fades cross-fade rather than appearing abruptly, which is the only motion here.
+ * `app/globals.css` reduces every transition in the application to 0.01ms under
+ * `prefers-reduced-motion: reduce`, so this module needs no reduced-motion rule of its own; the
+ * fades then switch instantly, which is the correct behaviour rather than a degraded one.
+ *
+ * WHAT BELONGS TO SOMEONE ELSE
+ *   - The surface. A card owns background, border, radius and padding; the placing module hands
+ *     this component the class that matches its own surface.
+ *   - The content. The scrollport is a box: what scrolls inside it is the caller's, and no rule
+ *     here reaches into it.
+ */
+
+/* Root: the scrollport and its hint in one column. Geometry only, and `min-inline-size: 0` so the
+ * column can shrink inside a page grid track instead of forcing the track wider than the
+ * viewport - which is the whole premise of scrolling the content rather than the page. */
+.frame {
+  display: flex;
+  min-inline-size: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The containing block for the two fades, which are positioned against the scrollport's edges
+ * rather than against the column - the hint below must not be covered by them. */
+.viewport {
+  position: relative;
+  min-inline-size: 0;
+}
+
+/* The scrollport itself.
+ *
+ * Only `overflow-x` is declared: CSS computes the other axis to `auto` when one axis is not
+ * `visible`, which makes this element the scrollport a table's sticky head cells stick to. The
+ * head cells therefore hold their position whenever an ancestor bounds this box's block size, and
+ * sit harmlessly at the top of the content when nothing does.
+ *
+ * `max-inline-size: 100%` can only cap against a measure that is already bounded, so this box
+ * needs a containing block whose own inline size does not come from its contents: a wrapper that
+ * sizes to its contents grows to the content instead, and then the *page* takes the horizontal
+ * scrollbar while this box is left with nothing to scroll. `.frame` above holds up that end of the
+ * bargain, and so does the page shell this application mounts on every route. */
+.region {
+  max-inline-size: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+/* The application's focus ring, refined rather than replaced: the same colour and width as the
+ * baseline in `globals.css`, offset by one spacing step. The region is focusable because a
+ * scrollable region a keyboard cannot reach is unreachable, and offsetting the ring *outward* is
+ * load-bearing: an inset ring is drawn inside the scrollport, where opaque sticky head cells paint
+ * over it and leave a gap in the indicator the height of the header band (measured in Chrome -
+ * this box is not a stacking context, so a head cell's `z-index` resolves further up the tree and
+ * the cell paints after the box it sits in). Outside the border box nothing can paint over the
+ * ring, and one step clears the internal padding of any card the region sits in. */
+.region:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+}
+
+/* An edge gradient: the page's own surface fading to nothing over one wide spacing step, so the
+ * content appears to pass under the edge instead of stopping at it. It is the *at rest* signal
+ * that there is more to see - a scrollbar is no signal at all where the platform draws overlay
+ * bars, which measure zero pixels until a pointer moves (measured in Chrome: `offsetHeight -
+ * clientHeight` is 0 at every viewport).
+ *
+ * `aria-hidden` on the element and `pointer-events: none` here: it is a decoration, it must not
+ * swallow a click or a drag meant for the row beneath it, and it has nothing to announce that the
+ * hint below does not say in words. Both fades are always rendered and their opacity is what
+ * changes, so nothing is inserted or removed as the reader scrolls. */
+.fade {
+  position: absolute;
+  z-index: var(--ls-z-sticky, 1);
+  inset-block: 0;
+  inline-size: var(--ls-space-5, 24px);
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+
+.fade[data-edge='start'] {
+  inset-inline-start: 0;
+  background-image: linear-gradient(to right, var(--ls-surface, #ffffff), transparent);
+}
+
+.fade[data-edge='end'] {
+  inset-inline-end: 0;
+  background-image: linear-gradient(to left, var(--ls-surface, #ffffff), transparent);
+}
+
+/* Each fade is shown exactly when content continues past the edge it sits on, which is what makes
+ * it information rather than decoration: at rest against the start of a scrollable region only the
+ * end fade is visible, in the middle both are, and a region with nothing to scroll shows neither. */
+.frame[data-overflow='start'] .fade[data-edge='start'],
+.frame[data-overflow='both'] .fade[data-edge='start'] {
+  opacity: 1;
+}
+
+.frame[data-overflow='end'] .fade[data-edge='end'],
+.frame[data-overflow='both'] .fade[data-edge='end'] {
+  opacity: 1;
+}
+
+/* The sentence under the scrollport. A fade says *that* there is more; this says what to do about
+ * it, and it is the part a reader can search for, a screen reader announces as the region's
+ * description, and a keyboard user needs in order to know the keys work at all. Small and muted:
+ * it is an instruction about the furniture, not part of the data. */
+.hint {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.4;
+}
+
+/* Nothing to scroll, nothing to say. `display: none` rather than a visual hiding, so the sentence
+ * leaves the accessibility tree too and the region's description is empty exactly when the
+ * instruction would be wrong. */
+.frame[data-overflow='none'] .hint {
+  display: none;
+}

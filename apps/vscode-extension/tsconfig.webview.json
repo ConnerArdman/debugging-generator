@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Webview project of apps/vscode-extension: the React app rendered in the webview iframe, which has a DOM but no Node and no `vscode` module. tsconfig.json is the extension-host project; `tsc -b tsconfig.json tsconfig.webview.json` builds both, and the root solution references both.",
+
+  "// format": "Strict JSON, so notes are top-level `\"// …\"` keys, which TypeScript ignores; inside `compilerOptions` such a key is an error (TS5023).",
+
+  "// compilerOptions.emit": "Declaration-only emit into .tsbuild/webview with its own stamp, so this project never shares an output directory or .tsbuildinfo with the host project. tsc never writes dist/: `vite build` and esbuild.mjs own it, and the VSIX ships it.",
+
+  "// compilerOptions.rootDir": "\"src\", the common root of src/webview/** and src/webview-messages.ts.",
+
+  "// compilerOptions.lib": "ES2023 plus DOM and DOM.Iterable; `lib` replaces the base array, so ES2023 is repeated.",
+
+  "// compilerOptions.types": "Empty, so no @types package is ambient: Node globals (`process`, `Buffer`) and the `vscode` namespace do not type-check here. An explicit `import … from \"vscode\"` would still resolve through @types/vscode; it stays out by design, because the webview reaches the host only through the message union in src/webview-messages.ts, posted via `acquireVsCodeApi()`. React's types arrive through imports and the automatic JSX runtime.",
+
+  "// compilerOptions.stylesheets": "The stylesheet imports type-check through src/webview/assets.d.ts, which declares the module '@debuggen/panel-renderer/styles.css' and the pattern '*/styles.css'. The pattern admits any specifier ending in /styles.css; other stylesheet and asset specifiers, such as './other.css', stay errors. No `allowJs`, `types` or `paths` widening is involved.",
+
+  "// compilerOptions.module": "`module`/`moduleResolution` are not overridden: bundler resolution matches Vite's resolver, and relative specifiers are extensionless.",
+
+  "// compilerOptions.not-set": "No `paths`/`baseUrl`: workspace packages resolve through the pnpm symlink and each package's `exports` map. Vite follows its runtime conditions into dist/; tsc follows its source-first `types` condition to src/ (docs/ARCHITECTURE.md §3).",
+
+  "// include": "src/webview/**/*.ts and *.tsx: the React app and its colocated suites, so every file the Vitest project `vscode-extension-webview` runs is type-checked here. Plus the literal path src/webview-messages.ts, the message union this project shares with the host project.",
+
+  "// exclude": "`exclude` replaces the base list, so the output and vendor directories are repeated.",
+
+  "// references": "shared, protocol and panel-renderer; they order the build, and `tsc -b` type-checks this program against their .tsbuild declarations, so `pnpm typecheck` never reads a stale dist/. This is the only project in the workspace that sees panel-renderer's tokens and primitives. Do not extend the list: the webview never talks to the service, the host relays for it.",
+
+  "extends": "../../tsconfig.base.json",
+
+  "compilerOptions": {
+    "composite": true,
+
+    "rootDir": "src",
+
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "${configDir}/.tsbuild/webview",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/webview/tsconfig.webview.tsbuildinfo",
+
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+
+    "types": []
+  },
+
+  "include": ["src/webview/**/*.ts", "src/webview/**/*.tsx", "src/webview-messages.ts"],
+
+  "exclude": ["dist", ".tsbuild", "node_modules", ".vscode-test"],
+
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/protocol" },
+    { "path": "../../packages/panel-renderer" }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Extension-host project of debug-generator: the Node side of this workspace. src/webview/** runs in the webview iframe and is the program of tsconfig.webview.json, which keeps DOM globals out of host code and Node globals out of the webview. `tsc -b tsconfig.json tsconfig.webview.json` builds both, and the root solution references both.",
+
+  "// format": "Strict JSON, so notes are top-level `\"// …\"` keys, which TypeScript ignores; inside `compilerOptions` such a key is an error (TS5023).",
+
+  "// compilerOptions.emit": "`composite` with declaration-only emit into the base's `${configDir}/.tsbuild` paths; tsconfig.webview.json moves its output and stamp to .tsbuild/webview, so the two projects never share either. tsc never writes dist/: esbuild.mjs and `vite build` own it, and the VSIX ships it.",
+
+  "// compilerOptions.rootDir": "\".\" because the inputs span src/, test/ and vite.config.mts; \"src\" would reject the last two (TS6059).",
+
+  "// compilerOptions.lib": "ES2023 only, the base's set restated so the host boundary is explicit: `window`, `document` and the other DOM globals do not type-check in host code. `lib` replaces the inherited array, so the webview project names ES2023 again beside DOM.",
+
+  "// compilerOptions.types": "\"node\" and \"vscode\". @types/node is a root devDependency; do not add it to this manifest. @types/vscode 1.125.0 matches the `engines.vscode` floor, so no API newer than the oldest supported editor type-checks.",
+
+  "// compilerOptions.types.not-listed.mocha": "\"mocha\" is not listed: @types/mocha is not a dependency of this workspace, and the copy inside @vscode/test-cli is unreachable from `types` (TS2688). Instead, each suite under test/suite/*.test.ts declares the Mocha globals it uses (`describe`, `it`, `before`, `after`, `beforeEach`, `afterEach`) locally, with module-scoped `declare function` statements.",
+
+  "// compilerOptions.module": "`module`/`moduleResolution` are not overridden: sources are authored as ESM under bundler resolution, and esbuild.mjs emits the CommonJS bundle VS Code loads (package.json has no \"type\": \"module\"). NodeNext would make these files CommonJS, where `import`/`export` syntax fails under the inherited `verbatimModuleSyntax`. Relative specifiers are extensionless. Keep `await` inside functions: esbuild cannot lower top-level `await` into a CommonJS bundle.",
+
+  "// compilerOptions.not-set": "No `paths`/`baseUrl`: workspace packages resolve through the pnpm symlink and each package's `exports` map. esbuild follows its runtime conditions into dist/; tsc follows its source-first `types` condition to src/ (docs/ARCHITECTURE.md §3).",
+
+  "// include": "src/**/*.ts (host modules and their colocated Vitest suites), test/**/*.ts (the @vscode/test-cli suites, type-checked here, bundled by esbuild.mjs and run in a real editor rather than by Vitest) and vite.config.mts, which is `.mts` so that it is ESM under this CommonJS package manifest (see its header). esbuild.mjs and .vscode-test.mjs are plain ESM: linted, never compiled.",
+
+  "// exclude": "`exclude` replaces the base list, so dist, .tsbuild and node_modules are repeated. src/webview/** belongs to the webview project alone. src/webview-messages.ts is deliberately in both projects: it is the environment-neutral message union both halves import, and each project emits it into its own directory, so do not relocate or duplicate it. test/fixtures/** is a workspace the suites open at runtime, not program input; .vscode-test is @vscode/test-electron's working directory.",
+
+  "// references": "shared and protocol only; they order the build, and `tsc -b` type-checks this program against their .tsbuild declarations, so `pnpm typecheck` never reads a stale dist/. panel-renderer belongs to the webview project. No apps/* reference: esbuild.mjs bundles the local service outside the type system, and the host reaches it over HTTP and WebSocket through @debuggen/protocol.",
+
+  "extends": "../../tsconfig.base.json",
+
+  "compilerOptions": {
+    "composite": true,
+
+    "rootDir": ".",
+
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo",
+
+    "lib": ["ES2023"],
+
+    "types": ["node", "vscode"]
+  },
+
+  "include": ["src/**/*.ts", "test/**/*.ts", "vite.config.mts"],
+
+  "exclude": [
+    "src/webview/**",
+    "test/fixtures/**",
+    "dist",
+    ".tsbuild",
+    ".vscode-test",
+    "node_modules"
+  ],
+
+  "references": [{ "path": "../../packages/shared" }, { "path": "../../packages/protocol" }]
+}

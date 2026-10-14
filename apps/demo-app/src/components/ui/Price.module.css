@@ -1,0 +1,129 @@
+/*
+ * Price - the money figure of the Lumen Supply storefront.
+ *
+ * Used by catalog cards, product detail, cart lines, checkout totals, order history and the
+ * dashboard's inventory-value column, and styled for the densest of those: a column of figures.
+ * Prices in this application are integer cents rendered by one formatter, so the single job of
+ * this file is to make every figure occupy the same advance width - monospaced digits plus
+ * `font-variant-numeric: tabular-nums` - and a ten-row cart or order table then lines up on the
+ * decimal with no per-cell alignment work anywhere else in the tree.
+ *
+ * Contract with `Price.tsx`, which is the only consumer:
+ *
+ *   - It composes `styles.root` onto a single `<span>`; `root` is therefore the only class this
+ *     module exports, and every variation below is an attribute rule on that same element.
+ *   - `data-size` is always present and is `sm`, `md` or `lg`. `md` is the base declaration, so
+ *     it deliberately has no rule of its own: a second declaration of the same size would be one
+ *     more place to drift.
+ *   - `data-tone` is always present and is `default`, `muted` or `accent`. `default` is the base.
+ *   - `data-strike` is `true` for a compare-at figure and is absent otherwise, so `[data-strike]`
+ *     never matches a current price.
+ *
+ * Deliberately absent:
+ *
+ *   - No `::before`/`::after` currency glyph. The currency symbol, the group separator and the
+ *     decimal mark all come from `formatPriceLabel` in `@/lib/format`, which pins the locale and
+ *     currency so server output and hydrated output are byte-identical. A glyph injected from CSS
+ *     would be a second, unpinned formatter that no test could see and no locale could move.
+ *   - No `line-height`. The figure is inline text and the row that hosts it - a table cell, a
+ *     cart line, a checkout total - owns the vertical rhythm; declaring one here would give that
+ *     row two competing owners.
+ *   - No animation and no transition: a number that moves while a reader is comparing it is
+ *     harder to read, not livelier.
+ *
+ * Every colour, font family and type size is read as `var(--ls-TOKEN, <literal fallback>)`. The
+ * tokens are declared once, in `app/globals.css`; the fallbacks mirror those values so this
+ * module also renders correctly in isolation (a component test, a static harness). Hex is
+ * lowercase because Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ * The only bare literals are ones the token set does not model: font weights, `from-font`, the
+ * 2px underline offset (the offset `globals.css` already uses for the focus indicator), `0` and
+ * `currentColor`.
+ */
+
+.root {
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-md, 15px);
+  /* Semibold: a price is the most consequential value on the row and reads as such against the
+   * sans-serif label beside it. */
+  font-weight: 600;
+  /* The reason this primitive exists. Proportional digits shift a column by a fraction of an em
+   * per glyph, which is exactly enough to make a totals column look approximate. */
+  font-variant-numeric: tabular-nums;
+  /* Stated rather than inherited: tracking applied to a figure by an enclosing heading or label
+   * would undo the fixed advance width above. */
+  letter-spacing: 0;
+  /* A figure is one token to a reader, so it never wraps between its digits and its symbol. Long
+   * product names wrap; money does not. */
+  white-space: nowrap;
+}
+
+/* Sizes
+ * -----------------------------------------------------------------------------------------------
+ * Three steps from the shared type scale, chosen by where the figure appears rather than by how
+ * large it should look: `sm` for a secondary or compare-at figure, `md` (the base) for cart lines,
+ * table cells and catalog cards, `lg` for the one headline figure on a page. */
+
+.root[data-size='sm'] {
+  font-size: var(--ls-text-sm, 13px);
+}
+
+.root[data-size='lg'] {
+  font-size: var(--ls-text-xl, 24px);
+}
+
+/* Tones
+ * -----------------------------------------------------------------------------------------------
+ * `default` is the base above: the primary text colour at semibold. */
+
+/* The secondary figure - a unit price under a line total, a was-price, a subtotal that is not the
+ * amount being paid. Lighter weight as well as a lighter colour, so it recedes without the colour
+ * doing the work on its own; the muted colour clears WCAG AA on both surfaces (7.6:1 and 7.2:1).
+ * A muted figure carries no line through it unless `data-strike="true"` asks for one. */
+.root[data-tone='muted'] {
+  color: var(--ls-text-muted, #475569);
+  font-weight: 400;
+}
+
+/* The highlighted figure - a promotional price, the amount a savings callout is about.
+ *
+ * Ink text with an amber underline, because amber is a fill and accent colour, not a text colour
+ * on a light surface. The underline is a non-colour indicator, so the tone does not rely on hue
+ * alone, and its thickness comes from the font so it scales with `data-size`. */
+.root[data-tone='accent'] {
+  color: var(--ls-ink, #0f172a);
+  text-decoration-line: underline;
+  text-decoration-color: var(--ls-accent, #f59e0b);
+  text-decoration-thickness: from-font;
+  text-underline-offset: 2px;
+}
+
+/* Compare-at
+ * -----------------------------------------------------------------------------------------------
+ * The struck figure: the price that is not being charged. `from-font` takes the line's thickness
+ * and position from the font's own metrics, so it sits across the digits at every size instead of
+ * drifting up into them at `lg`. The line inherits `currentColor`, which means it is drawn in the
+ * tone's colour without this rule having to know which tone is in play. */
+.root[data-strike='true'] {
+  text-decoration: line-through;
+  text-decoration-thickness: from-font;
+}
+
+/* Attribute combinations
+ * -----------------------------------------------------------------------------------------------
+ * Both attributes are independent, so both combinations are stated rather than left to the order
+ * the rules happen to appear in. */
+
+/* The canonical compare-at pairing - a small, muted, struck figure beside the current price. The
+ * line is pinned to the muted text colour so the two read as one value. */
+.root[data-tone='muted'][data-strike='true'] {
+  text-decoration-color: currentColor;
+}
+
+/* A figure cannot legibly carry an underline and a line-through at once, and of the two marks the
+ * strike is the one that carries meaning: it says this is not the amount being charged. So the
+ * accent underline yields here, and the struck figure is drawn in the text colour. */
+.root[data-tone='accent'][data-strike='true'] {
+  text-decoration-line: line-through;
+  text-decoration-color: currentColor;
+}
